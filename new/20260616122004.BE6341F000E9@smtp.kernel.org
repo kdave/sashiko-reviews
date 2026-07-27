@@ -1,0 +1,117 @@
+From sashiko-bot@kernel.org Tue Jun 16 14:20:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 5/5] btrfs: deny freezing devices undergoing a
+ replace
+Date: Tue, 16 Jun 2026 12:20:04 +0000
+Message-Id: <20260616122004.BE6341F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [Critical] Race condition with unmount causes NULL pointer dereference or UAF on target device's bdev in `btrfs_dev_replace_finishing()`.
+- [High] Missing jump to `leave` error handling label in `btrfs_dev_replace_start()` leaks freeze deny counts and the target device.
+
+Pre-existing issues:
+- [High] Synchronous failure in `btrfs_dev_replace_finishing()` leaves the replace state as `STARTED` with no active replace thread, creating a dangling `replace_task` pointer and permanently leaking freeze denies.
+--
+
+commit fbef791ab8c49487434dcafcf9d0ff947f7447a2
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: deny freezing devices undergoing a replace
+
+This commit adds logic to deny freezing of devices during a device replace 
+operation. It makes both the source and target devices unfreezable for the 
+whole replace process by holding a deny on each device while in the STARTED 
+state.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 8f8fa14886ded..4ae34acb89e83 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -622,6 +623,15 @@ static int btrfs_dev_replace_start(struct btrfs_fs_info *fs_info,
+>  	if (ret)
+>  		return ret;
+>  
+> +	/* Deny the source before mark, so every 'leave' unwinds both denied. */
+> +	if (src_device->bdev) {
+> +		ret = bdev_deny_freeze(src_device->bdev);
+> +		if (ret) {
+> +			btrfs_destroy_dev_replace_tgtdev(tgt_device, true);
+> +			return ret;
+> +		}
+> +	}
+> +
+>  	ret = mark_block_group_to_copy(fs_info, src_device);
+>  	if (ret)
+>  		return ret;
+
+[Severity: High]
+Does this early return bypass the cleanup logic? 
+
+The comment mentions that every leave unwind sees both denied, but if
+mark_block_group_to_copy() fails, the code returns directly instead of
+using the goto leave path.
+
+It seems this could leak the target device structure and leave the
+freeze deny counts elevated on both block devices, which would render
+them unfreezable until reboot. Should this be updated to jump to the
+leave label?
+
+[ ... ]
+> @@ -900,6 +913,7 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+>  	while (1) {
+>  		trans = btrfs_start_transaction(root, 0);
+>  		if (IS_ERR(trans)) {
+> +			/* Stays started/resumable; keep both denied. */
+>  			mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+>  			return PTR_ERR(trans);
+>  		}
+
+[Severity: High]
+This isn't a bug introduced by this patch, but if btrfs_start_transaction()
+fails synchronously, it leaves the replace state as STARTED while the
+kthread exits.
+
+Since btrfs_dev_replace_cancel() requires an active scrub to cancel, does
+this leave the replace permanently stuck in the STARTED state?
+
+The dev_replace->replace_task pointer isn't cleared, which might leave a
+dangling pointer to the freed task_struct.
+
+Additionally, with this patch, this error path now permanently leaks the
+freeze denies on both block devices, as they are intentionally kept denied
+here but cannot be cleaned up if the state is stuck.
+
+[ ... ]
+> @@ -1018,6 +1035,8 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+>  
+>  	mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+>  
+> +	/* The target is now a member; the source is freed (allow + release). */
+> +	bdev_allow_freeze(tgt_device->bdev);
+>  	btrfs_rm_dev_replace_free_srcdev(src_device);
+>  
+>  	return 0;
+
+[Severity: Critical]
+Could this introduce a race condition with concurrent unmount? 
+
+The bdev_allow_freeze() call is placed outside the
+lock_finishing_cancel_unmount mutex. 
+
+If the filesystem is concurrently unmounted,
+btrfs_dev_replace_suspend_for_unmount() might acquire the lock, see the
+state as FINISHED, and return without waiting.
+
+The unmount process would then call btrfs_close_devices() and
+btrfs_close_one_device(tgt_device), which closes the file and sets
+tgt_device->bdev to NULL.
+
+When the preempted kthread resumes and calls
+bdev_allow_freeze(tgt_device->bdev), could it dereference NULL or access
+a freed bdev?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616-work-super-freeze_deny_upstream-v2-0-b3567c7f994b@kernel.org?part=5
+

@@ -1,0 +1,124 @@
+From sashiko-bot@kernel.org Mon Jul  6 13:14:51 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: zoned: reset active_meta_bg on zone finish
+Date: Mon, 06 Jul 2026 11:14:49 +0000
+Message-Id: <20260706111449.F26981F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Concurrent metadata writebacks for inactive block groups can cause an ASSERT failure or a block group reference leak when pivoting active_meta_bg.
+- [High] If call_zone_finish() fails, do_zone_finish() returns early without clearing active_bg_list, ro count, or the newly added active_meta_bg pointer clearance, leaving the filesystem in a corrupted state.
+--
+
+commit 0d337e26f9975ed87d24c98525246b35d2c20251
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: reset active_meta_bg on zone finish
+
+This patch ensures that the active_meta_bg and active_system_bg pointers are
+properly reset when a block group finishes its zone. It adds cleanup logic to
+do_zone_finish() to prevent the pointers from becoming stale when zone
+finishing happens through paths other than the main pivot path.
+
+Fixes: 13bb483d32ab ("btrfs: zoned: activate metadata block group on write time")
+Cc: stable@vger.kernel.org
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 97f06dd016932..fd578bef1f4ff 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2213,6 +2213,7 @@ static bool check_bg_is_active(struct btrfs_eb_write_context *ctx,
+>  			}
+>  
+>  			/* Pivot active metadata/system block group. */
+> +			btrfs_get_block_group(tgt);
+>  			btrfs_zoned_meta_io_unlock(fs_info);
+>  			wait_eb_writebacks(tgt);
+>  			do_zone_finish(tgt, true);
+>  			btrfs_zoned_meta_io_lock(fs_info);
+
+[Severity: High]
+This is a pre-existing issue, but could concurrent metadata writebacks for
+inactive block groups cause an ASSERT failure or reference leak when pivoting?
+
+If two threads perform metadata writeback for different inactive metadata block
+groups (e.g., BG_A and BG_B) while the active metadata block group is full,
+could they both read the same target block group from *active_bg and then drop
+the lock to wait in check_bg_is_active():
+
+    btrfs_zoned_meta_io_unlock(fs_info);
+    wait_eb_writebacks(tgt);
+    do_zone_finish(tgt, true);
+    btrfs_zoned_meta_io_lock(fs_info);
+
+If Thread 1 reacquires the lock, pivots active_meta_bg to BG_A, and returns,
+what happens when Thread 2 reacquires the lock? Thread 2 might skip clearing
+*active_bg (since it now points to BG_A, not tgt) and later hit the assert
+lower down in check_bg_is_active():
+
+    if (*active_bg != block_group) {
+        ASSERT(*active_bg == NULL);
+        *active_bg = block_group;
+        ...
+
+If assertions are disabled, could this overwrite the pointer and leak the
+block group reference?
+
+>  			if (*active_bg == tgt) {
+>  				btrfs_put_block_group(tgt);
+>  				*active_bg = NULL;
+>  			}
+> +			btrfs_put_block_group(tgt);
+>  		}
+>  		if (!btrfs_zone_activate(block_group))
+>  			return false;
+
+[ ... ]
+
+> @@ -2632,6 +2635,20 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+>  	/* For active_bg_list */
+>  	btrfs_put_block_group(block_group);
+>  
+> +	if (block_group->flags & BTRFS_BLOCK_GROUP_SYSTEM)
+> +		active_bg = &fs_info->active_system_bg;
+> +	else if (block_group->flags & BTRFS_BLOCK_GROUP_METADATA)
+> +		active_bg = &fs_info->active_meta_bg;
+> +
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does the error handling higher
+up in this function skip this newly added cleanup code?
+
+If call_zone_finish() fails, do_zone_finish() returns early:
+
+    ret = call_zone_finish(block_group, &map->stripes[i]);
+    if (ret) {
+        up_read(&dev_replace->rwsem);
+        return ret;
+    }
+
+Since BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE is already cleared at the top of the
+function, wouldn't returning early skip executing this new code at the bottom
+of the function? 
+
+If an I/O error occurs, could this strand the block group in the active list,
+leak references, and leave active_meta_bg pointing to a stale block group?
+
+> +	if (active_bg) {
+> +		btrfs_zoned_meta_io_lock(fs_info);
+> +		if (*active_bg == block_group) {
+> +			btrfs_put_block_group(block_group);
+> +			*active_bg = NULL;
+> +		}
+> +		btrfs_zoned_meta_io_unlock(fs_info);
+> +	}
+> +
+>  	clear_and_wake_up_bit(BTRFS_FS_NEED_ZONE_FINISH, &fs_info->flags);
+>  
+>  	return 0;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260706110216.232055-1-johannes.thumshirn@wdc.com?part=1
+

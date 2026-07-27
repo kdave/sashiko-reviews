@@ -1,0 +1,136 @@
+From sashiko-bot@kernel.org Mon Jun 15 15:33:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 5/6] btrfs: deny freezing a device while it is being
+ added
+Date: Mon, 15 Jun 2026 13:33:39 +0000
+Message-Id: <20260615133340.227631F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [High] The custom wrapper `btrfs_open_device_deny_freeze()` bypasses the VFS/block layer check that prevents opening read-only block devices for writing, allowing read-only devices to be mistakenly added to read-write filesystems.
+
+Pre-existing issues:
+- [Critical] In-memory rollback logic for seeding devices tears down device structures even after the device addition has been successfully committed to disk, causing a critical Use-After-Free and data inconsistency.
+- [High] Error rollback paths in `btrfs_init_new_device` remove the device from the RCU-protected device list and immediately free it without waiting for an RCU grace period, causing a Use-After-Free for concurrent RCU readers.
+--
+
+commit 14c82cb8b5b4146402a177e63e93d85a604f4b8f
+Author: Christian Brauner <brauner@kernel.org>
+Subject: btrfs: deny freezing a device while it is being added
+
+This commit prevents a filesystem freeze from racing with a new device
+addition. It opens the device non-exclusively to take a freeze deny, then
+claims it using the same device number.
+
+Link: None
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 36f9835f65e3d..4558e018b53b7 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+[ ... ]
+> @@ -2822,6 +2822,36 @@ static int btrfs_finish_sprout(struct btrfs_trans_handle *trans)
+>  	return 0;
+>  }
+>  
+> +/*
+> + * Open @path for @sb with freezing denied before the holder claim is published,
+> + * so a racing bdev_freeze() can never reach a claim a device add or replace may
+> + * still abort.  The deny is taken on a throwaway non-holder probe open, then the
+> + * holder is opened by the probe's dev_t.  Balanced by the caller.
+> + */
+> +struct file *btrfs_open_device_deny_freeze(const char *path,
+> +					   struct super_block *sb)
+> +{
+> +	struct file *probe_file, *bdev_file;
+> +	int ret;
+> +
+> +	probe_file = bdev_file_open_by_path(path, BLK_OPEN_READ, NULL, NULL);
+> +	if (IS_ERR(probe_file))
+> +		return probe_file;
+> +
+> +	ret = bdev_deny_freeze(file_bdev(probe_file));
+> +	if (ret) {
+> +		bdev_fput(probe_file);
+> +		return ERR_PTR(ret);
+> +	}
+> +
+> +	bdev_file = bdev_file_open_by_dev(file_bdev(probe_file)->bd_dev,
+> +					  BLK_OPEN_WRITE, sb, &fs_holder_ops);
+
+[Severity: High]
+Does this direct call to bdev_file_open_by_dev() skip the bdev_read_only()
+validation that would normally happen during bdev_file_open_by_path() when
+BLK_OPEN_WRITE is requested?
+
+Since bdev_file_open_by_path() is only called with BLK_OPEN_READ above, it
+looks like a read-only block device could be successfully opened for writing
+here and added to a read-write filesystem. When Btrfs subsequently tries
+to write to this device, the block layer would reject the bio, causing
+transaction aborts and filesystem panics rather than gracefully failing
+the device add operation with -EACCES.
+
+> +	if (IS_ERR(bdev_file))
+> +		bdev_allow_freeze(file_bdev(probe_file));
+> +	bdev_fput(probe_file);
+> +	return bdev_file;
+> +}
+[ ... ]
+> @@ -3015,8 +3047,10 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  				    "Failed to relocate sys chunks after device initialization. This can be fixed using the \"btrfs balance\" command.");
+>  		trans = btrfs_attach_transaction(root);
+>  		if (IS_ERR(trans)) {
+> -			if (PTR_ERR(trans) == -ENOENT)
+> +			if (PTR_ERR(trans) == -ENOENT) {
+> +				bdev_allow_freeze(file_bdev(bdev_file));
+>  				return 0;
+> +			}
+>  			ret = PTR_ERR(trans);
+>  			trans = NULL;
+>  			goto error_sysfs;
+
+[Severity: Critical]
+This is a pre-existing issue, but does this error path tear down the
+device structure after it has already been durably committed to disk?
+
+In btrfs_init_new_device(), after a seeding device is fully processed,
+the transaction is committed via btrfs_commit_transaction() earlier in
+this block. At this point, the device is permanently embedded in the
+filesystem's chunk and device trees, and active btrfs_chunk_map
+structures hold pointers to it.
+
+If btrfs_attach_transaction() subsequently fails and takes this goto,
+the code unwinds through error_sysfs, unlinks the device, and frees it.
+Could this cause a use-after-free during subsequent I/O targeting those
+chunks, since the freed btrfs_device pointer is still referenced by
+the active maps?
+
+[ ... ]
+> @@ -3065,7 +3100,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  error_free_device:
+>  	btrfs_free_device(device);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does this error rollback
+free the device without waiting for an RCU grace period?
+
+During device addition, the new device is added to fs_devices->devices
+via list_add_rcu(). If a subsequent step fails and unwinds through the
+error_sysfs label, it unlinks the device using list_del_rcu() and cascades
+down to btrfs_free_device(), which immediately calls kfree().
+
+There are numerous places traversing fs_devices->devices under
+rcu_read_lock(). Without a synchronize_rcu() or kfree_rcu(), will
+these concurrent readers dereference the freed device pointer?
+
+>  error:
+> -	bdev_fput(bdev_file);
+> +	btrfs_release_device_allow_freeze(bdev_file);
+>  	if (locked) {
+>  		mutex_unlock(&uuid_mutex);
+>  		up_write(&sb->s_umount);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260615-work-super-freeze_deny_upstream-v1-0-a6c72b840e7d@kernel.org?part=5
+

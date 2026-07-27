@@ -1,0 +1,108 @@
+From sashiko-bot@kernel.org Mon Jun 15 15:37:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 1/6] btrfs: destroy the target device when
+ mark_block_group_to_copy() fails
+Date: Mon, 15 Jun 2026 13:37:07 +0000
+Message-Id: <20260615133708.0BB8F1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Use-After-Free of `tgt_device` due to missing I/O drain if `btrfs_start_transaction` fails.
+- [High] Dangling `replace_task` pointer and unconditional overwrite on error paths allow lock bypass, NULL pointer dereference, or lock recursion deadlocks.
+--
+
+commit 733778b646a0b0eda21e1595b70c91aa71a77b40
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: destroy the target device when mark_block_group_to_copy() fails
+
+btrfs_dev_replace_start() opens the replacement target with
+btrfs_init_dev_replace_tgtdev(), which adds it to the device list and opens
+its block device.  Every error path after that point reaches the 'leave'
+label to tear the target back down with btrfs_destroy_dev_replace_tgtdev() -
+except the mark_block_group_to_copy() failure, which returns directly.  The
+target is then leaked: it stays on the device list with its block device
+held until the filesystem is unmounted.
+
+Goto leave like the other post-open error paths so the target is destroyed.
+
+Fixes: 78ce9fc269af ("btrfs: zoned: mark block groups to copy for device-replace")
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 8f8fa14886ded..0112aa6d7ab1c 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -624,7 +624,7 @@ static int btrfs_dev_replace_start(struct btrfs_fs_info *fs_info,
+>  
+>  	ret = mark_block_group_to_copy(fs_info, src_device);
+>  	if (ret)
+> -		return ret;
+> +		goto leave;
+>  
+>  	down_write(&dev_replace->rwsem);
+>  	dev_replace->replace_task = current;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does assigning replace_task
+to current here leave a dangling pointer if an error occurs later in
+this function?
+
+If a subsequent step like btrfs_start_transaction() fails, the code jumps
+to the leave label and drops the lock, but fails to clear
+dev_replace->replace_task.
+
+Additionally, if the replace is resumed via btrfs_resume_dev_replace_async(),
+it spawns a kthread but fails to update replace_task to the new kthread:
+
+fs/btrfs/dev-replace.c:btrfs_resume_dev_replace_async() {
+        ...
+        task = kthread_run(btrfs_dev_replace_kthread, fs_info, "btrfs-devrepl");
+        ...
+}
+
+Could this cause the kthread doing the replace to see replace_task != current
+and attempt to acquire dev_replace->rwsem for read during I/O via
+btrfs_map_block(), leading to a deadlock?
+
+Could it also lead to lock bypass and use-after-free if a new task is
+allocated at the dangling pointer's address?
+
+[Severity: Critical]
+This is a pre-existing issue, but does the later error path for
+btrfs_start_transaction() lead to a use-after-free of tgt_device?
+
+Earlier in btrfs_dev_replace_start(), replace_state is set to
+BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED and dev_replace->rwsem is released,
+exposing tgt_device to concurrent I/O mapping operations.
+
+If btrfs_start_transaction() fails, the error path clears tgtdev and
+jumps to leave, which destroys tgt_device via
+btrfs_destroy_dev_replace_tgtdev():
+
+fs/btrfs/dev-replace.c:btrfs_dev_replace_start() {
+        ...
+        trans = btrfs_start_transaction(root, 1);
+        if (IS_ERR(trans)) {
+                ret = PTR_ERR(trans);
+                down_write(&dev_replace->rwsem);
+                dev_replace->replace_state =
+                        BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED;
+                dev_replace->srcdev = NULL;
+                dev_replace->tgtdev = NULL;
+                up_write(&dev_replace->rwsem);
+                goto leave;
+        }
+        ...
+}
+
+However, without calling btrfs_rm_dev_replace_blocked() first, are in-flight
+I/Os that were already duplicated to tgt_device left undrained?
+
+Could asynchronous completion handlers process these in-flight BIOs and
+access the freed tgt_device?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260615-work-super-freeze_deny_upstream-v1-0-a6c72b840e7d@kernel.org?part=1
+

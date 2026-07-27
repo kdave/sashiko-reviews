@@ -1,0 +1,110 @@
+From sashiko-bot@kernel.org Wed Jul 22 13:44:00 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/4] btrfs: zoned: flush active metadata block group at
+ btree_writepages() start
+Date: Wed, 22 Jul 2026 11:43:58 +0000
+Message-Id: <20260722114358.ACD431F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] flush_active_meta_bg() omits scheduling zone finish when an active metadata block group reaches capacity.
+- [High] flush_active_meta_bg() prematurely aborts on -EBUSY, preventing the active block group from being fully flushed.
+--
+
+--- Patch [1]: [PATCH 1/4] btrfs: zoned: flush active metadata block group at btree_writepages() start ---
+commit ede6c07e7106c5345d8a1212a9f10bfd87e525e3
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: flush active metadata block group at btree_writepages() start
+
+This patch flushes active metadata and system block groups at the start of
+btree_writepages() on zoned filesystems. It aims to prevent transaction
+aborts with -EAGAIN during block group pivoting when the active block group
+still has unsent IO.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index de5785117a47f..ccf0a70a7b917 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+
+[ ... ]
+
+> @@ -2354,6 +2354,52 @@ void btrfs_btree_wait_writeback_range(struct btrfs_fs_info *fs_info, u64 start,
+>  	}
+>  }
+>  
+> +/* Write out the dirty metadata extent buffers of a single block group. */
+> +static void flush_active_meta_bg(struct address_space *mapping,
+> +				 struct writeback_control *wbc,
+> +				 struct btrfs_eb_write_context *ctx,
+> +				 struct btrfs_block_group *bg)
+> +{
+> +	struct btrfs_fs_info *fs_info = inode_to_fs_info(mapping->host);
+> +	unsigned long index = bg->start >> fs_info->nodesize_bits;
+> +	unsigned long end = (btrfs_block_group_end(bg) - 1) >> fs_info->nodesize_bits;
+> +	struct eb_batch batch;
+> +	unsigned int nr_ebs;
+> +
+> +	ASSERT(btrfs_is_zoned(fs_info));
+> +	lockdep_assert_held(&fs_info->zoned_meta_io_lock);
+> +
+> +	eb_batch_init(&batch);
+> +	while (index <= end &&
+> +	       (nr_ebs = buffer_tree_get_ebs_tag(fs_info, &index, end,
+> +						 PAGECACHE_TAG_DIRTY, &batch))) {
+> +		struct extent_buffer *eb;
+> +
+> +		while ((eb = eb_batch_next(&batch)) != NULL) {
+> +			ctx->eb = eb;
+> +
+> +			/*
+> +			 * Best effort: if the eb is not writable at the write
+> +			 * pointer (e.g. a hole), stop flushing this bg and let
+> +			 * the main walk deal with it.
+> +			 */
+> +			if (btrfs_check_meta_write_pointer(eb->fs_info, ctx)) {
+
+[Severity: High]
+Does this prematurely abort the flush if btrfs_check_meta_write_pointer()
+returns -EBUSY?
+
+If another thread concurrently writes an extent buffer in the active block
+group, btrfs_check_meta_write_pointer() will return -EBUSY. By aborting
+the entire flush operation on any non-zero return, the remaining unwritten
+dirty extent buffers in the active block group will be left unflushed. This
+causes the later pivot in the main loop to fail with unsent IO and abort
+the transaction with -EAGAIN, circumventing the fix intended by this patch.
+
+Should we skip the already-written buffer and continue here, similar to the
+handling in the main btree_writepages() loop?
+
+> +				eb_batch_release(&batch);
+> +				return;
+> +			}
+> +
+> +			if (!lock_extent_buffer_for_io(eb, wbc))
+> +				continue;
+> +
+> +			if (ctx->zoned_bg)
+> +				ctx->zoned_bg->meta_write_pointer += eb->len;
+
+[Severity: High]
+Is a call to btrfs_schedule_zone_finish_bg() missing here?
+
+In the main loop of btree_writepages(), btrfs_schedule_zone_finish_bg() is
+called to mark the last extent buffer when a block group reaches its
+capacity. Because flush_active_meta_bg() duplicates the write submission
+logic but omits scheduling the zone finish, the dirty tags for these buffers
+will be cleared. The main loop will then skip these extent buffers, and the
+zone will never be scheduled for finishing. Could this lead to open/active
+zone leaks and eventual mount or allocation failures?
+
+> +			write_one_eb(eb, wbc);
+> +		}
+> +		eb_batch_release(&batch);
+> +		cond_resched();
+> +	}
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260722113016.1896990-1-johannes.thumshirn@wdc.com?part=1
+

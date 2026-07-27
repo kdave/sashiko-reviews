@@ -1,0 +1,55 @@
+From sashiko-bot@kernel.org Tue Jun  9 14:19:29 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: fix assertion in
+ btrfs_zoned_reserve_data_reloc_bg
+Date: Tue, 09 Jun 2026 12:19:22 +0000
+Message-Id: <20260609121923.45A1A1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Incorrect subtraction of `bg->zone_unusable` from `space_info->disk_total` instead of `bytes_zone_unusable` during block group migration.
+--
+
+commit 1e09efd82b2d442b83531db1f6df3415419f8ab6
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: fix assertion in btrfs_zoned_reserve_data_reloc_bg
+
+This commit removes an invalid assertion about a non-empty block-group
+list when picking the second empty block-group in 
+btrfs_zoned_reserve_data_reloc_bg().
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2803,8 +2803,6 @@ void btrfs_zoned_reserve_data_reloc_bg(struct btrfs_fs_info *fs_info)
+>  
+>  			down_write(&space_info->groups_sem);
+>  			list_del_init(&bg->list);
+> -			/* We can assume this as we choose the second empty one. */
+> -			ASSERT(!list_empty(&space_info->block_groups[index]));
+>  			up_write(&space_info->groups_sem);
+>  
+>  			spin_lock(&space_info->lock);
+>  			space_info->total_bytes -= bg->length;
+>  			space_info->disk_total -= bg->length * factor;
+>  			space_info->disk_total -= bg->zone_unusable;
+
+[Severity: High]
+This is a pre-existing issue, but does this space accounting code correctly
+update the unusable zone bytes?
+
+Looking at btrfs_zoned_reserve_data_reloc_bg() during block group migration,
+it appears bg->zone_unusable is subtracted from space_info->disk_total. Since
+disk_total tracks physical capacity and was already decremented by
+bg->length * factor on the previous line, would this double-decrement
+shrink disk_total too much and potentially underflow?
+
+Also, by not decrementing space_info->bytes_zone_unusable (e.g., via
+btrfs_space_info_update_bytes_zone_unusable), could this leak unusable
+zone bytes in the original data_sinfo and lead to premature ENOSPC?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260609115251.49325-1-johannes.thumshirn@wdc.com?part=1
+

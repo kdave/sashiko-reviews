@@ -1,0 +1,115 @@
+From sashiko-bot@kernel.org Tue Jun  2 12:44:02 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 3/8] fs: refuse to claim any frozen block device
+Date: Tue, 02 Jun 2026 10:43:58 +0000
+Message-Id: <20260602104358.D38F11F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] Concurrent block device freeze and mount failure causes an unrecoverable deadlock.
+- [High] Bypass of block device freeze check and loss of block device tracking due to a zombie entry in `fs_bdev_supers`.
+- [Low] Loss of diagnostic warning when a mount fails due to a frozen block device.
+--
+
+commit 85bdb60e895e513a963c39804e3f7a79af51b294
+Author: Christian Brauner <brauner@kernel.org>
+
+fs: refuse to claim any frozen block device
+
+setup_bdev_super() already refuses to bring a filesystem up on a frozen
+block device but only for the primary device. Now that filesystems claim
+every device through fs_bdev_file_open_by_{dev,path}(), do that check
+once in the registration helper so it covers all of them.
+
+> diff --git a/fs/super.c b/fs/super.c
+> index e0174d5819a02..cea743f699e42 100644
+> --- a/fs/super.c
+> +++ b/fs/super.c
+> @@ -1690,6 +1690,17 @@ static int fs_bdev_register(struct file *bdev_file, struct super_block *sb)
+>  	sb->s_count++;
+>  	spin_unlock(&sb_lock);
+>  
+> +	/*
+> +	 * Don't bring a filesystem up on a frozen device.  The entry is already
+> +	 * published, so a freeze either is seen here or finds it and waits in
+> +	 * super_lock() until this mount is born or (on -EBUSY) dies.  The mount
+> +	 * aborts, so the entry is torn down without rebalancing @fs_bdev_active.
+> +	 */
+> +	if (atomic_read(&file_bdev(bdev_file)->bd_fsfreeze_count) > 0) {
+
+[Severity: High]
+Can a concurrent block device freeze and mount failure cause a deadlock here?
+
+The nascent superblock is inserted into the hash table before checking if the
+device is frozen. A concurrent fs_bdev_freeze() can find this superblock,
+elevate its s_active reference count, and call fs_super_freeze().
+
+fs_super_freeze() subsequently calls freeze_super(), which blocks waiting
+for the superblock to become SB_BORN or SB_DYING:
+
+fs/super.c:super_lock() {
+    ...
+    wait_var_event(&sb->s_flags, super_flags(sb, SB_BORN | SB_DYING));
+}
+
+Meanwhile, fs_bdev_register() detects the elevated freeze count and aborts
+the mount. The mount failure path calls deactivate_locked_super(). Because
+the freeze thread elevated s_active to 2, atomic_dec_and_test() drops it to
+1 and returns false.
+
+This causes deactivate_locked_super() to skip kill_sb(), meaning SB_DYING
+is never set. Since the mount aborted, SB_BORN is also never set. Does
+this leave the freeze thread blocked forever?
+
+> +		fs_bdev_holder_put(h);
+
+[Severity: High]
+Does this error path handle concurrent RCU walkers correctly?
+
+fs_bdev_holder_put() only unlinks the entry if fs_bdev_passive drops to 0.
+If a concurrent RCU walker pinned the entry, passive drops to 1, leaving
+the entry in the hash table with fs_bdev_active still set to 1.
+
+If a retry occurs, fs_bdev_register() finds this zombie entry, increments
+fs_bdev_active to 2, and returns 0, bypassing the freeze check. When the
+RCU walker later drops its pin, the entry is freed, leaving the device
+actively used but untracked.
+
+> +		return -EBUSY;
+> +	}
+> +
+>  	return 0;
+>  }
+>  
+
+[ ... ]
+
+> @@ -1801,16 +1812,6 @@ int setup_bdev_super(struct super_block *sb, int sb_flags,
+>  		return -EACCES;
+>  	}
+>  
+> -	/*
+> -	 * It is enough to check bdev was not frozen before we set
+> -	 * s_bdev as freezing will wait until SB_BORN is set.
+> -	 */
+> -	if (atomic_read(&bdev->bd_fsfreeze_count) > 0) {
+> -		if (fc)
+> -			warnf(fc, "%pg: Can't mount, blockdev is frozen", bdev);
+> -		fs_bdev_file_release(bdev_file, sb);
+> -		return -EBUSY;
+> -	}
+
+[Severity: Low]
+Is it intentional to remove the diagnostic warning here?
+
+The patch moves the freeze check into fs_bdev_register(), which lacks access
+to the fs_context. This removes the warnf() call. When a mount fails because
+the device is frozen, users will only see a generic error without knowing
+the actual cause.
+
+>  	spin_lock(&sb_lock);
+>  	sb->s_bdev_file = bdev_file;
+>  	sb->s_bdev = bdev;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260602-work-super-bdev_holder_global-v1-0-bb0fd82f3861@kernel.org?part=3
+

@@ -1,0 +1,111 @@
+From sashiko-bot@kernel.org Thu Jul 16 00:47:17 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: generic: add a basic cachestat test case
+Date: Wed, 15 Jul 2026 22:47:14 +0000
+Message-Id: <20260715224714.B02C11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] The script uses a non-existent bash command `_exit 0` which will cause a test failure.
+- [Medium] Splitting the buffered write and cachestat check into two separate xfs_io invocations introduces a race condition with background writeback.
+- [Medium] The test lacks a runtime check to ensure the underlying kernel actually supports the cachestat syscall, leading to false-positive failures on older kernels.
+- [Low] The test script is missing the standard `_supported_fs generic` declaration.
+--
+
+--- Patch [1]: [PATCH] fstests: generic: add a basic cachestat test case ---
+commit 7446b5d9fcdb73ab43bc1c4066482095e07cd7b0
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: generic: add a basic cachestat test case
+
+This commit adds a new fstests generic test case to verify cachestat()
+behavior. It performs buffered writes of varying sizes and uses cachestat
+to ensure the dirtied page counts match, then fsyncs and verifies the dirty
+count drops to 0.
+
+Link: https://bugzilla.suse.com/show_bug.cgi?id=1270397
+
+> diff --git a/tests/generic/798 b/tests/generic/798
+> new file mode 100755
+> index 0000000000000..0fe37646595c6
+> --- /dev/null
+> +++ b/tests/generic/798
+> @@ -0,0 +1,39 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 798
+> +#
+> +# Basic tests for cachestat()
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick
+
+[Severity: Low]
+This isn't a bug, but should this test include the standard _supported_fs
+generic declaration here to follow standard fstests conventions?
+
+> +
+> +_require_xfs_io_command "cachestat"
+
+[Severity: Medium]
+Will this fail on kernels older than 6.5?
+
+The _require_xfs_io_command checks if the xfs_io binary supports the command,
+but doesn't guarantee the underlying kernel implements the cachestat syscall.
+
+Should there be a runtime probe to verify kernel support and skip the test
+with _notrun if it returns ENOSYS?
+
+> +_require_scratch
+> +# Any mount option that writes data back synchronously should be rejected.
+> +# Or it will screw up the dirtied page reporting for buffered writes.
+> +_exclude_scratch_mount_option "dax"
+> +_exclude_scratch_mount_option "sync"
+> +
+> +pagesize=$(_get_page_size)
+> +
+> +_scratch_mkfs > /dev/null
+> +_scratch_mount
+> +
+> +for num_page in 1 2 4 8 16; do
+> +	size=$(($pagesize * $num_page))
+> +
+> +	echo "=== Test with $num_page pages ==="
+> +
+> +	rm -f $SCRATCH_MNT/foobar
+> +	$XFS_IO_PROG -f -c "pwrite -b $pagesize 0 $size" $SCRATCH_MNT/foobar > /dev/null
+> +	# Basic cached number reporting
+> +	$XFS_IO_PROG -c "cachestat 0 $size" $SCRATCH_MNT/foobar
+
+[Severity: Medium]
+Does splitting the buffered write and cachestat check into two separate xfs_io
+invocations introduce a race condition?
+
+When the first xfs_io process exits, the file descriptor is closed. Before
+the second xfs_io process executes cachestat, kernel background writeback
+could flush the dirtied pages to disk. This would cause cachestat to report
+fewer dirty pages than expected and fail the test. 
+
+Could these be combined into a single xfs_io invocation?
+
+> +
+> +	# Test dirty page number reporting after a fsync.
+> +	$XFS_IO_PROG -c "fsync" -c "cachestat 0 $size" $SCRATCH_MNT/foobar
+> +done
+> +
+> +_scratch_unmount
+> +_exit 0
+
+[Severity: High]
+Is _exit 0 a valid bash command?
+
+It looks like this will print "_exit: command not found" to stderr, which
+will cause the test to systematically fail since fstests strictly compares
+stderr output against the golden file.
+
+Should this be exit 0 or just omitted?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260715223716.5965-1-wqu@suse.com?part=1
+

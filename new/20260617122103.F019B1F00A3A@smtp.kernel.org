@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Wed Jun 17 14:21:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix RAID stripe-tree lookup across leaf
+ boundaries
+Date: Wed, 17 Jun 2026 12:21:03 +0000
+Message-Id: <20260617122103.F019B1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Missing bounds check after re-search path allows reading stale deleted items, risking silent data corruption.
+
+Pre-existing issues:
+- [High] Missing btree item type validation leads to type confusion and denial of service via massive out-of-bounds reads.
+--
+
+commit b088d1c0638ef5adbf2692f355744e62d7433565
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: fix RAID stripe-tree lookup across leaf boundaries
+
+btrfs_get_raid_extent_offset() resolves the stripe extent containing a
+logical address by searching for that address and stepping back if there
+is no exact match. This patch changes the step-back to use
+btrfs_previous_item() to correctly cross leaf boundaries.
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 454a95bf542a0..192bcad8282f0 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+> @@ -430,9 +430,26 @@ int btrfs_get_raid_extent_offset(struct btrfs_fs_info *fs_info,
+>  	ret = btrfs_search_slot(NULL, stripe_root, &stripe_key, path, 0, 0);
+>  	if (ret < 0)
+>  		return ret;
+> -	if (ret) {
+> -		if (path->slots[0] != 0)
+> -			path->slots[0]--;
+> +	if (ret > 0) {
+> +		/*
+> +		 * The exact key is not present, so the stripe extent that may
+> +		 * contain @logical is the previous item.
+> +		 *
+> +		 * If there is no previous item, the covering extent (if any) is
+> +		 * the one we landed on (its objectid == logical), so re-search
+> +		 * to position there for the forward scan below.
+> +		 */
+> +		ret = btrfs_previous_item(stripe_root, path, 0,
+> +					  BTRFS_RAID_STRIPE_KEY);
+> +		if (ret < 0)
+> +			return ret;
+> +		if (ret > 0) {
+> +			btrfs_release_path(path);
+> +			ret = btrfs_search_slot(NULL, stripe_root, &stripe_key,
+> +						path, 0, 0);
+> +			if (ret < 0)
+> +				return ret;
+> +		}
+
+[Severity: High]
+If the re-search returns greater than 0, is it possible for path->slots[0]
+to equal btrfs_header_nritems(leaf)?
+
+The previous code had a fallback decrement (path->slots[0]--) when the exact
+key wasn't found, but the new re-search path omits this. If the search key is
+larger than all items in the leaf, the loop below could read past the valid
+items.
+
+Since btrfs does not zero memory when deleting items, could this result in
+parsing stale item headers and mapping I/O to a deleted physical extent?
+
+>  	}
+>  
+>  	while (1) {
+
+[Severity: High]
+This is a pre-existing issue, but does this loop need to validate that
+found_key.type == BTRFS_RAID_STRIPE_KEY?
+
+Looking at the forward scan in btrfs_get_raid_extent_offset(), it accepts
+the parsed key based on objectid and offset without checking the item type:
+
+    btrfs_item_key_to_cpu(leaf, &found_key, slot);
+    found_logical = found_key.objectid;
+    found_length = found_key.offset;
+
+If a corrupted filesystem contains an unexpected item type here,
+btrfs_item_size(leaf, slot) might be smaller than 16 bytes. Does this cause
+btrfs_num_raid_stripes() to underflow to an enormous value, resulting in
+millions of out-of-bounds read_extent_buffer() calls and a soft lockup?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260617120431.381916-1-johannes.thumshirn@wdc.com?part=1
+

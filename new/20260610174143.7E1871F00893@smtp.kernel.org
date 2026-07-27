@@ -1,0 +1,89 @@
+From sashiko-bot@kernel.org Wed Jun 10 19:41:45 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH btrfs v2] btrfs: reject free space cache with more
+ entries than pages
+Date: Wed, 10 Jun 2026 17:41:42 +0000
+Message-Id: <20260610174143.7E1871F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Integer underflow and massive out-of-bounds read in `io_ctl_check_crc()` due to missing bounds check on `num_pages`.
+- [Medium] Memory leak of free space cache nodes if `copy_free_space_cache()` fails.
+--
+
+commit 48c5b1c3281f7363097d8ac09abcc4f5da8ebe2c
+Author: Xiang Mei <xmei5@asu.edu>
+
+btrfs: reject free space cache with more entries than pages
+
+When loading a v1 free space cache, __load_free_space_cache() takes
+num_entries and num_bitmaps straight from the on-disk
+btrfs_free_space_header. That header is stored in the tree_root under a key
+with type 0, which the tree-checker has no case for, so neither count is
+validated before the load trusts it.
+
+> diff --git a/fs/btrfs/free-space-cache.c b/fs/btrfs/free-space-cache.c
+> index ab22e4f9ffdde..bbc4db7fe74bb 100644
+> --- a/fs/btrfs/free-space-cache.c
+> +++ b/fs/btrfs/free-space-cache.c
+> @@ -555,6 +555,9 @@ static int io_ctl_check_crc(struct btrfs_io_ctl *io_ctl, int index)
+>  	u32 crc = ~(u32)0;
+>  	unsigned offset = 0;
+>  
+> +	if (index >= io_ctl->num_pages)
+> +		return -EIO;
+> +
+>  	if (index == 0)
+>  		offset = sizeof(u32) * io_ctl->num_pages;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but could an attacker crafting a
+cache inode with a massive i_size underflow the length passed to crc32c()
+and cause an out-of-bounds read here?
+
+In fs/btrfs/free-space-cache.c:io_ctl_init(), the bounds check ensuring that
+the CRC array and generation header fit within a single page is restricted to
+the write path:
+
+    if (write && (num_pages * sizeof(u32) + sizeof(u64)) > PAGE_SIZE)
+            return -ENOSPC;
+
+On the read path, an arbitrarily large i_size produces a massive num_pages
+that bypasses this validation.
+
+When offset is calculated as sizeof(u32) * io_ctl->num_pages in
+io_ctl_check_crc(), it can exceed PAGE_SIZE. This causes PAGE_SIZE - offset
+to underflow to a massive unsigned value when passed as the length parameter
+to crc32c(), triggering an immediate out-of-bounds memory read of unmapped
+memory.
+
+[Severity: Medium]
+This is a pre-existing issue, but does the error path in
+fs/btrfs/free-space-cache.c:load_free_space_cache() leak memory if
+copy_free_space_cache() fails?
+
+In load_free_space_cache(), the free space cache is read from disk into a
+stack-allocated temporary structure tmp_ctl. Once verified,
+copy_free_space_cache() is called to drain entries from tmp_ctl and insert
+them into the block group using btrfs_add_free_space().
+
+If btrfs_add_free_space() returns an error, the copying loop terminates
+early and returns the error code.
+
+Back in load_free_space_cache(), the code jumps to the out label on error:
+
+    out:
+        if (ret < 0) {
+            /* This cache is bogus, make sure it gets cleared */
+
+Unlike the else branch for mismatched free space, the error path handles
+the disk cache state clearing but fails to call
+__btrfs_remove_free_space_cache(&tmp_ctl).
+
+As a result, all dynamically allocated nodes remaining in tmp_ctl's rbtree
+are permanently leaked.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260610172926.844265-1-xmei5@asu.edu?part=1
+

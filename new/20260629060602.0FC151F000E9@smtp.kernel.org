@@ -1,0 +1,119 @@
+From sashiko-bot@kernel.org Mon Jun 29 08:06:06 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: use kvmalloc() for stripe buffer of
+ scrub_stripe
+Date: Mon, 29 Jun 2026 06:05:50 +0000
+Message-Id: <20260629060602.0FC151F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] In `scrub_bio_add_sector`, `offset_in_page(offset)` is used instead of `offset_in_page(stripe->buffer + offset)` for kmalloc-backed buffers. If the buffer is not perfectly page-aligned (e.g., when SLUB redzones or KASAN is enabled), this causes incorrect DMA memory targets and fatal out-of-bounds array accesses in I/O completion handlers.
+--
+
+commit c00c7ed1fa63fa06cfa3ce09438ed8207f643fec
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: use kvmalloc() for stripe buffer of scrub_stripe
+
+This commit replaces the scrub_stripe folios array with a single kvmalloc'd
+buffer to cover the full stripe. This aims to simplify checksum verification,
+RAID56 data caching, and bio assembly by avoiding cross-page handling when
+possible.
+
+> diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+> index d2f7ac5b6e961..d466203ed579c 100644
+> --- a/fs/btrfs/scrub.c
+> +++ b/fs/btrfs/scrub.c
+[ ... ]
+> @@ -872,10 +830,20 @@ static void scrub_verify_one_stripe(struct scrub_stripe *stripe, unsigned long b
+>  
+>  static int calc_sector_number(struct scrub_stripe *stripe, struct bio_vec *first_bvec)
+>  {
+> +	struct btrfs_fs_info *fs_info = stripe->bg->fs_info;
+>  	int i;
+>  
+>  	for (i = 0; i < stripe->nr_sectors; i++) {
+> -		if (scrub_stripe_get_kaddr(stripe, i) == bvec_virt(first_bvec))
+> +		const void *vaddr = stripe->buffer + (i << fs_info->sectorsize_bits);
+> +		void *kaddr;
+> +
+> +		if (is_vmalloc_addr(vaddr))
+> +			kaddr = page_address(vmalloc_to_page(vaddr));
+> +		else
+> +			kaddr = page_address(virt_to_page(vaddr));
+> +		kaddr += offset_in_page(vaddr);
+> +
+> +		if (kaddr == bvec_virt(first_bvec))
+>  			break;
+>  	}
+>  	ASSERT(i < stripe->nr_sectors);
+
+[Severity: Critical]
+If bvec_virt(first_bvec) lacks the base page offset of the buffer, won't this
+loop finish without breaking?
+
+This would happen because of the bug below in scrub_bio_add_sector(). If the 
+loop does not break, it returns an out-of-bounds index (stripe->nr_sectors) 
+which could corrupt memory when used by the caller.
+
+[ ... ]
+> @@ -921,30 +893,36 @@ static void scrub_bio_add_sector(struct btrfs_bio *bbio, struct scrub_stripe *st
+>  				 int sector_nr)
+>  {
+[ ... ]
+> +	if (is_vmalloc_addr(stripe->buffer)) {
+> +		ret = bio_add_vmalloc(&bbio->bio, stripe->buffer + offset,
+> +				      fs_info->sectorsize);
+> +		ASSERT(ret == true);
+> +		return;
+> +	}
+> +	ret = bio_add_page(&bbio->bio, virt_to_page(stripe->buffer + offset),
+> +			   fs_info->sectorsize, offset_in_page(offset));
+>  	ASSERT(ret == fs_info->sectorsize);
+>  }
+
+[Severity: Critical]
+Could this code compute the wrong page offset when setting up the bio vector?
+
+If kvmalloc falls back to kmalloc (which is possible since GFP_NOFS is used),
+the allocation might not be perfectly page-aligned if KASAN or SLUB redzones
+are enabled.
+
+By passing offset_in_page(offset) instead of 
+offset_in_page(stripe->buffer + offset), the bio vector will miss the base 
+offset of the kmalloc'd buffer.
+
+This could cause DMA to read or write the wrong data at the beginning of the
+underlying physical page, potentially corrupting adjacent SLUB metadata or
+memory.
+
+[ ... ]
+> @@ -1245,6 +1223,7 @@ static void scrub_stripe_read_repair_worker(struct work_struct *work)
+>  static void scrub_read_endio(struct btrfs_bio *bbio)
+>  {
+>  	struct scrub_stripe *stripe = bbio->private;
+> +	struct btrfs_fs_info *fs_info = stripe->bg->fs_info;
+>  	int sector_nr = calc_sector_number(stripe, bio_first_bvec_all(&bbio->bio));
+>  	int num_sectors;
+>  	const u32 bio_size = bio_get_size(&bbio->bio);
+> @@ -1252,6 +1231,10 @@ static void scrub_read_endio(struct btrfs_bio *bbio)
+>  	ASSERT(sector_nr < stripe->nr_sectors);
+>  	num_sectors = bio_size >> stripe->bg->fs_info->sectorsize_bits;
+>  
+> +	if (is_vmalloc_addr(stripe->buffer))
+> +		invalidate_kernel_vmap_range(
+> +			stripe->buffer + (sector_nr << fs_info->sectorsize_bits),
+> +			bio_size);
+>  	if (bbio->bio.bi_status) {
+>  		scrub_bitmap_set_io_error(stripe, sector_nr, num_sectors);
+>  		scrub_bitmap_set_error(stripe, sector_nr, num_sectors);
+
+[Severity: Critical]
+Because the sector index returned from calc_sector_number() can be out of
+bounds due to the missing offset in the bio vector, won't these bitmap
+updates silently corrupt memory?
+
+When sector_nr is equal to stripe->nr_sectors, scrub_bitmap_set_io_error() 
+will write past the intended bounds of the scrub_stripe struct.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/ae19a873c0d3fc170ca206d3df26cbe4d42fce60.1782712192.git.wqu@suse.com?part=1
+

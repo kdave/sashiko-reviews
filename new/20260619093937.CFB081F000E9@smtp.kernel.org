@@ -1,0 +1,88 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:39:42 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 10/15] btrfs: fix RAID stripe-tree lookup across leaf
+ boundaries
+Date: Fri, 19 Jun 2026 09:39:37 +0000
+Message-Id: <20260619093937.CFB081F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Unchecked slot index after the fallback `btrfs_search_slot()` leads to an out-of-bounds leaf item array read in `btrfs_get_raid_extent()`.
+--
+
+commit e183a98b797a1c86aafb022f0c87dca5a852528d
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: fix RAID stripe-tree lookup across leaf boundaries
+
+A stripe-tree lookup resolves the stripe extent containing a logical
+address by searching for that address and stepping back to the preceding
+item, since the containing extent begins at or before it. That step-back
+was confined to a single leaf, so when the search landed on the first
+slot of a leaf the containing extent - the last item of the previous
+leaf - was never examined and a perfectly valid address returned
+-ENODATA.
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index ebf4162812749..30ea066161f62 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+
+[ ... ]
+
+> @@ -450,13 +450,30 @@ static int btrfs_get_raid_extent(struct btrfs_fs_info *fs_info,
+>  	ret = btrfs_search_slot(NULL, stripe_root, &stripe_key, path, 0, 0);
+>  	if (ret < 0)
+>  		return ret;
+> -	if (ret) {
+> -		if (path->slots[0] != 0)
+> -			path->slots[0]--;
+> -
+> -		btrfs_item_key_to_cpu(path->nodes[0], &found_key, path->slots[0]);
+> -		if (found_key.type != type && path->slots[0] > 0)
+> -			path->slots[0]--;
+> +	if (ret > 0) {
+
+[ ... ]
+
+> +		ret = btrfs_previous_item(stripe_root, path, 0, type);
+> +		if (ret < 0)
+> +			return ret;
+> +		if (ret > 0) {
+> +			btrfs_release_path(path);
+> +			ret = btrfs_search_slot(NULL, stripe_root, &stripe_key,
+> +						path, 0, 0);
+> +			if (ret < 0)
+> +				return ret;
+> +		}
+>  	}
+>  
+>  	while (1) {
+
+[Severity: High]
+Does this new fallback logic introduce an out-of-bounds read in the leaf's
+item array?
+
+When the fallback btrfs_search_slot() is called for stripe_key and the
+key is greater than all items in the leaf (or the leaf is empty), it
+returns > 0 and sets path->slots[0] to the insertion index, which equals
+btrfs_header_nritems(leaf).
+
+The code then unconditionally enters the while (1) loop and immediately
+calls btrfs_item_key_to_cpu() on the new slot:
+
+    while (1) {
+        leaf = path->nodes[0];
+        slot = path->slots[0];
+        btrfs_item_key_to_cpu(leaf, &found_key, slot);
+
+Since the pre-patch logic that safely decremented the slot was removed,
+there is no check to ensure slot < btrfs_header_nritems(leaf) before the
+item is accessed.
+
+Could this read uninitialized or unrelated memory into found_key, causing
+it to be incorrectly parsed as a valid raid extent if the garbage data
+happens to satisfy the range checks?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=10
+

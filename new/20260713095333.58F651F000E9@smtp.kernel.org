@@ -1,0 +1,57 @@
+From sashiko-bot@kernel.org Mon Jul 13 11:53:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: test POSIX ACL changes for RO btrfs property
+Date: Mon, 13 Jul 2026 09:53:32 +0000
+Message-Id: <20260713095333.58F651F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] The patch incorrectly submits an xfstests script to the Linux kernel repository, creating orphaned files that cannot be executed.
+--
+
+--- Patch [1]: [PATCH v2] btrfs: test POSIX ACL changes for RO btrfs property ---
+commit b432ba738a2dec6ac58da77a106f095cbf412908
+Author: Sun YangKai <sunyangkai@fnnas.com>
+
+btrfs: test POSIX ACL changes for RO btrfs property
+
+This commit adds a test to verify that POSIX ACLs cannot be modified on a btrfs
+subvolume when the read-only property is set to true. It attempts to set and
+remove access ACLs, expecting failure while read-only and success once writable.
+
+> diff --git a/tests/btrfs/353 b/tests/btrfs/353
+> new file mode 100755
+> index 0000000000000..586f722abdd14
+> --- /dev/null
+> +++ b/tests/btrfs/353
+> @@ -0,0 +1,97 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (C) 2026 Fygo OS. All Rights Reserved.
+> +#
+> +# FS QA Test No. 353
+> +#
+> +# Test that POSIX ACLs cannot be changed once a btrfs subvolume has the
+> +# read-only property set.
+> +#
+> +# Setting or removing a POSIX ACL goes through the ->set_acl inode
+> +# operation, which is a different code path from the generic ->setxattr
+> +# one covered by btrfs/275.  It used to be allowed on a read-only
+> +# subvolume and thus bypassed the RO protection.  Such modifications must
+> +# fail with EROFS, just like any other xattr.
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick acl attr
+
+[Severity: Medium]
+Is this patch intended for the xfstests repository rather than the Linux
+kernel tree?
+
+This script relies on the xfstests framework functions like _begin_fstest
+and _require_acls, which are not present in the kernel source tree. Without
+that framework, this test cannot be executed here and will remain orphaned.
+Tests intended to live directly in the kernel tree typically belong under
+tools/testing/selftests/.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260713094611.19703-1-sunk67188@gmail.com?part=1
+

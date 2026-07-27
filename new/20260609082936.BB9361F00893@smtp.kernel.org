@@ -1,0 +1,114 @@
+From sashiko-bot@kernel.org Tue Jun  9 10:29:41 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH btrfs] btrfs: reject free space cache with more entries
+ than pages
+Date: Tue, 09 Jun 2026 08:29:36 +0000
+Message-Id: <20260609082936.BB9361F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] The patch bounds `index` to `io_ctl->num_pages` in `io_ctl_check_crc()`, but fails to validate `num_pages` itself on the read path. A crafted `i_size` causes `num_pages` to become arbitrarily large, leading to massive out-of-bounds reads in `crc32c()` and `io_ctl_check_generation()` due to integer underflows.
+- [Critical] Missing bounds check before reading/writing `struct btrfs_free_space_entry` causes page boundary crossing and integer underflow, leading to linear memory corruption.
+- [High] A crafted `num_bitmaps` value triggers a kernel panic via `ASSERT`.
+--
+
+commit 0039fe0fd1d834f11ca1d3a89db701f6feee7f12
+Author: Xiang Mei <xmei5@asu.edu>
+
+btrfs: reject free space cache with more entries than pages
+
+__load_free_space_cache() reads num_entries/num_bitmaps from the on-disk
+struct btrfs_free_space_header, which the tree-checker does not validate.
+The load loops consume that many records, remapping each exhausted page via
+io_ctl_check_crc() -> io_ctl_map_page(). This patch bounds io_ctl->index
+in io_ctl_check_crc().
+
+> diff --git a/fs/btrfs/free-space-cache.c b/fs/btrfs/free-space-cache.c
+> index ab22e4f9ffdde..bbc4db7fe74bb 100644
+> --- a/fs/btrfs/free-space-cache.c
+> +++ b/fs/btrfs/free-space-cache.c
+> @@ -555,6 +555,9 @@ static int io_ctl_check_crc(struct btrfs_io_ctl *io_ctl, int index)
+>  	u32 crc = ~(u32)0;
+>  	unsigned offset = 0;
+>  
+> +	if (index >= io_ctl->num_pages)
+> +		return -EIO;
+> +
+>  	if (index == 0)
+>  		offset = sizeof(u32) * io_ctl->num_pages;
+
+[Severity: Critical]
+This isn't a bug introduced by this patch, but does the read path validate
+io_ctl->num_pages itself?
+
+In io_ctl_init(), the bounds validation skips the read path:
+
+	if (write && (num_pages * sizeof(u32) + sizeof(u64)) > PAGE_SIZE)
+		return -ENOSPC;
+
+If write is 0, num_pages can be arbitrarily large. Later in
+io_ctl_check_crc(), this calculation occurs:
+
+	if (index == 0)
+		offset = sizeof(u32) * io_ctl->num_pages;
+
+And then:
+
+	crc = crc32c(crc, io_ctl->orig + offset, PAGE_SIZE - offset);
+
+Can this cause an integer underflow in PAGE_SIZE - offset, causing crc32c()
+to read out of bounds?
+
+Similarly, in io_ctl_check_generation():
+
+	io_ctl->cur += sizeof(u32) * io_ctl->num_pages;
+	io_ctl->size -= sizeof(u64) + (sizeof(u32) * io_ctl->num_pages);
+
+Can this advance io_ctl->cur out of bounds and underflow io_ctl->size?
+
+[Severity: Critical]
+This is a pre-existing issue, but do io_ctl_add_entry() and
+io_ctl_read_entry() cross the page boundary before validating io_ctl->size?
+
+In io_ctl_add_entry():
+
+	entry = io_ctl->cur;
+	put_unaligned_le64(offset, &entry->offset);
+	put_unaligned_le64(bytes, &entry->bytes);
+	entry->type = (bitmap) ? BTRFS_FREE_SPACE_BITMAP :
+		BTRFS_FREE_SPACE_EXTENT;
+	io_ctl->cur += sizeof(struct btrfs_free_space_entry);
+	io_ctl->size -= sizeof(struct btrfs_free_space_entry);
+
+And similarly in io_ctl_read_entry():
+
+	e = io_ctl->cur;
+	entry->offset = get_unaligned_le64(&e->offset);
+	entry->bytes = get_unaligned_le64(&e->bytes);
+	*type = e->type;
+	io_ctl->cur += sizeof(struct btrfs_free_space_entry);
+	io_ctl->size -= sizeof(struct btrfs_free_space_entry);
+
+If io_ctl->size is less than the struct size but greater than 0, do these
+operations cross the page boundary? Could io_ctl->size then underflow to a
+large positive value, causing the subsequent size check to succeed and skip
+mapping a new page?
+
+[Severity: High]
+This is a pre-existing issue, but can a crafted num_bitmaps value trigger a
+regression via an assert?
+
+In __load_free_space_cache(), the value is read from the on-disk header
+and later used in the processing loop:
+
+			ASSERT(num_bitmaps);
+			num_bitmaps--;
+
+If the header sets num_bitmaps to 0 but includes entries of type
+BTRFS_FREE_SPACE_BITMAP, could this trigger the assertion and cause a local
+denial of service when compiled with CONFIG_BTRFS_ASSERT?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260609081135.2972081-1-xmei5@asu.edu?part=1
+

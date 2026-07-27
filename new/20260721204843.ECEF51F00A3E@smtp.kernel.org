@@ -1,0 +1,147 @@
+From sashiko-bot@kernel.org Tue Jul 21 22:48:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 16/23] xfs: add fs-verity support
+Date: Tue, 21 Jul 2026 20:48:43 +0000
+Message-Id: <20260721204843.ECEF51F00A3E@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] AB-BA deadlock in `xfs_fsverity_delete_metadata` due to transaction allocation and XFS_ILOCK_EXCL acquisition prior to page-cache truncation.
+- [High] Data fork delalloc blocks leak during fsverity enablement, causing kernel panics on inode eviction and breaking descriptor retrieval.
+- [High] Merkle tree reads fetch incorrect file data on architectures with PAGE_SIZE > 65536, breaking verity verification.
+--
+
+--- Patch [16]: [PATCH v13 16/23] xfs: add fs-verity support ---
+commit d2fe2d07fcfd1a5560ef15e15b7f3a8d5ce8ff46
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+Subject: xfs: add fs-verity support
+
+This commit adds integration with fs-verity for XFS. It stores the fs-verity
+descriptor and Merkle tree in the inode data fork aligned to 64k past EOF,
+and uses the iomap interface for reading and writing the tree.
+
+> diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+> index 3b9f262f8e912..943719828c4f7 100644
+> --- a/fs/xfs/xfs_bmap_util.c
+> +++ b/fs/xfs/xfs_bmap_util.c
+[ ... ]
+> @@ -553,6 +554,14 @@ xfs_can_free_eofblocks(
+>  	if (last_fsb <= end_fsb)
+>  		return false;
+>  
+> +	/*
+> +	 * Nothing to clean on fsverity inodes as they don't use prealloc and
+> +	 * there no delalloc as only written data is fsverity metadata
+> +	 */
+> +	if (IS_VERITY(VFS_I(ip)) ||
+> +	    xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		return false;
+
+[Severity: High]
+Does skipping EOF block cleanup here permanently leak speculative delayed
+allocation blocks in the data fork?
+
+When the Merkle tree is written via buffered I/O, it can create delalloc
+blocks past EOF. Since the new cleanup code in xfs_fsverity_end_enable()
+only drops COW fork delallocs and misses the data fork, disabling blockgc
+for verity inodes here means those data fork delalloc blocks could leak.
+Will this cause a panic on inode eviction when xfs_inode_free() hits the
+ASSERT(ip->i_delayed_blks == 0) check?
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index e3c8ac51c43fc..d3d4ba3edfc16 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+[ ... ]
+> +static int
+> +xfs_fsverity_delete_metadata(
+> +	struct xfs_inode	*ip)
+> +{
+> +	struct xfs_trans	*tp;
+> +	struct xfs_mount	*mp = ip->i_mount;
+> +	int			error;
+> +
+> +	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate, 0, 0, 0, &tp);
+> +	if (error)
+> +		return error;
+> +
+> +	xfs_ilock(ip, XFS_MMAPLOCK_EXCL | XFS_ILOCK_EXCL);
+> +	truncate_inode_pages(VFS_I(ip)->i_mapping, XFS_ISIZE(ip));
+
+[Severity: High]
+Can this sequence cause an AB-BA deadlock with background writeback?
+
+By holding XFS_ILOCK_EXCL while calling truncate_inode_pages(), the code
+attempts to acquire the Folio Lock. However, the background writeback path
+acquires the Folio Lock first and then attempts to acquire XFS_ILOCK_SHARED
+(e.g., via xfs_map_blocks()). If background writeback is operating on a
+folio at the same time, this lock inversion could lead to a deadlock.
+
+[ ... ]
+> +static int
+> +xfs_fsverity_end_enable(
+> +	struct file		*file,
+> +	const void		*desc,
+> +	size_t			desc_size,
+> +	u64			merkle_tree_size)
+> +{
+[ ... ]
+> +	/*
+> +	 * Proactively drop any delayed allocations in COW fork, the fsverity
+> +	 * files are read-only
+> +	 */
+> +	if (xfs_is_cow_inode(ip)) {
+> +		xfs_ilock(ip, XFS_ILOCK_EXCL);
+> +		xfs_ifork_init_cow(ip);
+> +		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+> +		xfs_bmap_punch_delalloc_range(ip, XFS_COW_FORK, 0, LLONG_MAX,
+> +				NULL);
+> +	}
+
+[Severity: High]
+Are we missing the cleanup of data fork delalloc blocks here?
+
+As mentioned earlier, if the data fork delalloc blocks aren't punched out
+alongside the COW fork, they will be left intact and permanently leak once
+the verity flag is set. Could this also cause xfs_fsverity_get_descriptor()
+to calculate an incorrect offset based on the leaked delalloc extent?
+
+[ ... ]
+> +static struct page *
+> +xfs_fsverity_read_merkle(
+> +	struct inode		*inode,
+> +	pgoff_t			index)
+> +{
+> +	index += xfs_fsverity_metadata_offset(XFS_I(inode)) >> PAGE_SHIFT;
+
+[Severity: High]
+Will this bitwise shift incorrectly truncate the metadata offset on
+architectures with a PAGE_SIZE larger than 64KB?
+
+Because the metadata offset is aligned to 65536 bytes, if this code runs on
+an architecture where PAGE_SIZE is greater than 65536 (e.g., 256KB on
+PowerPC), the shift evaluates to 0. Would this result in
+generic_read_merkle_tree_page() reading regular file data from page 0
+instead of the Merkle tree hashes, causing verity verification to fail?
+
+> +
+> +	return generic_read_merkle_tree_page(inode, index);
+> +}
+> +
+> +/*
+> + * Retrieve a merkle tree block.
+> + */
+> +static void
+> +xfs_fsverity_readahead_merkle_tree(
+> +	struct inode		*inode,
+> +	pgoff_t			index,
+> +	unsigned long		nr_pages)
+> +{
+> +	index += xfs_fsverity_metadata_offset(XFS_I(inode)) >> PAGE_SHIFT;
+
+[Severity: High]
+Does this have the same PAGE_SIZE > 64KB truncation issue as
+xfs_fsverity_read_merkle() above?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=16
+

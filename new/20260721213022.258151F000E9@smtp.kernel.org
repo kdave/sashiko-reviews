@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Tue Jul 21 23:30:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 22/23] xfs: introduce health state for corrupted
+ fsverity metadata
+Date: Tue, 21 Jul 2026 21:30:21 +0000
+Message-Id: <20260721213022.258151F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Missing fsverity metadata is a corruption but fails to be reported to the health system.
+--
+
+--- Patch [22]: [PATCH v13 22/23] xfs: introduce health state for corrupted fsverity metadata ---
+commit 40f5e8e35da77fd0bf7a7914ea2e7d4a3dd344ac
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: introduce health state for corrupted fsverity metadata
+
+This commit adds a new health state flag to track and report corrupted
+fsverity metadata in XFS. It updates xfs_fsverity_get_descriptor() to mark
+the inode sick when the fsverity descriptor size or position is invalid.
+
+[ ... ]
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index 5dcbdf20e4743..462223b4619b0 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+> @@ -84,16 +84,23 @@ xfs_fsverity_get_descriptor(
+>  		return error;
+>  
+
+[Severity: Medium]
+Since this patch introduces health reporting for corrupted fsverity metadata,
+should we also call xfs_inode_mark_sick() for the earlier error paths in
+xfs_fsverity_get_descriptor() when the descriptor blocks are completely
+missing?
+
+For example, when checking if the inode is empty or if the last block offset
+is invalid:
+
+	if (is_empty)
+		return -ENODATA;
+
+	last_block_offset =
+		XFS_FSB_TO_B(mp, rec.br_startoff + rec.br_blockcount);
+	if (last_block_offset <= xfs_fsverity_metadata_offset(ip))
+		return -ENODATA;
+
+If missing fsverity metadata on a verity-enabled inode is considered a
+corruption, wouldn't returning -ENODATA without reporting it to the health
+system delay detection and repair?
+
+>  	desc_size = be32_to_cpu(d_desc_size);
+> -	if (XFS_IS_CORRUPT(mp, desc_size > FS_VERITY_MAX_DESCRIPTOR_SIZE))
+> +	if (XFS_IS_CORRUPT(mp, desc_size > FS_VERITY_MAX_DESCRIPTOR_SIZE)) {
+> +		xfs_inode_mark_sick(XFS_I(inode), XFS_SICK_INO_FSVERITY);
+>  		return -ERANGE;
+> -	if (XFS_IS_CORRUPT(mp, desc_size > desc_size_pos))
+> +	}
+> +
+> +	if (XFS_IS_CORRUPT(mp, desc_size > desc_size_pos)) {
+> +		xfs_inode_mark_sick(XFS_I(inode), XFS_SICK_INO_FSVERITY);
+>  		return -ERANGE;
+> +	}
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=22
+

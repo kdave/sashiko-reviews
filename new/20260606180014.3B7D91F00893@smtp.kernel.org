@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Sat Jun  6 20:00:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: lzo: reject compressed segment that overflows
+ the compressed input
+Date: Sat, 06 Jun 2026 18:00:13 +0000
+Message-Id: <20260606180014.3B7D91F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] lzo_decompress_bio() incorrectly returns success (0) without decompressing any data if the len_in header value is <= LZO_LEN (4).
+--
+
+commit 853abe67e48aa2638c5f5e90081b827d68015213
+Author: Weiming Shi <bestswngs@gmail.com>
+
+btrfs: lzo: reject compressed segment that overflows the compressed input
+
+This commit adds a check in lzo_decompress_bio() to ensure the segment length
+does not exceed the available compressed input. This prevents a null pointer
+dereference when copy_compressed_segment() walks off the last folio.
+
+> diff --git a/fs/btrfs/lzo.c b/fs/btrfs/lzo.c
+> index 2de18c7b563af..887d740b27aa1 100644
+> --- a/fs/btrfs/lzo.c
+> +++ b/fs/btrfs/lzo.c
+
+[Severity: High]
+This is a pre-existing issue, but I noticed a potential flaw in how the overall
+compressed extent length (len_in) is validated earlier in lzo_decompress_bio().
+
+When len_in is read, the validation check looks like this:
+
+fs/btrfs/lzo.c:lzo_decompress_bio() {
+    ...
+	if (unlikely(len_in > min_t(size_t, BTRFS_MAX_COMPRESSED, compressed_len) ||
+		     round_up(len_in, sectorsize) < compressed_len)) {
+    ...
+}
+
+Does this check fail to reject structurally invalid extents where len_in
+is <= 4 when compressed_len is exactly 1 sector? For example, round_up(4, 4096)
+is 4096, which is not less than 4096, so the check passes.
+
+If len_in <= LZO_LEN (4), the decompression loop condition evaluates to false
+immediately because cur_in is initialized to LZO_LEN (4):
+
+fs/btrfs/lzo.c:lzo_decompress_bio() {
+    ...
+	/* Go through each lzo segment */
+	while (cur_in < len_in) {
+    ...
+}
+
+Could this cause lzo_decompress_bio() to return 0 (success) without
+decompressing any data, resulting in silent data corruption on read when the
+uncompressed bio is subsequently zero-filled instead of returning an I/O error?
+
+> @@ -491,6 +491,10 @@ int lzo_decompress_bio(struct list_head *ws, struct compressed_bio *cb)
+>  			return -EIO;
+>  		}
+>  
+> +		/* The segment must not extend beyond the compressed input. */
+> +		if (unlikely(cur_in + seg_len > compressed_len))
+> +			return -EIO;
+> +
+>  		/* Copy the compressed segment payload into workspace */
+>  		copy_compressed_segment(cb, &fi, &cur_folio_index, workspace->cbuf,
+>  					seg_len, &cur_in);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260606174816.723525-2-bestswngs@gmail.com?part=1
+

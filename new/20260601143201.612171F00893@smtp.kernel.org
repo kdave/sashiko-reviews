@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Mon Jun  1 16:32:04 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix inline reflink deadlock at non-zero offset
+Date: Mon, 01 Jun 2026 14:32:00 +0000
+Message-Id: <20260601143201.612171F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] A TOCTOU race window exists between unlocking the folio in `copy_inline_to_page()` and updating `i_size` in its caller, which can trigger the exact deadlock the patch attempts to fix.
+--
+
+commit 190e55cf0a809e2642d196ca40bf7f2a7861a2ed
+Author: Guangshuo Li <lgs201920130244@gmail.com>
+
+btrfs: fix inline reflink deadlock at non-zero offset
+
+This patch attempts to resolve a deadlock where an inline extent copied
+into a page beyond the end of a file gets invalidated by concurrent writeback.
+It does this by updating i_size after the early non-zero offset path calls
+copy_inline_to_page(), matching the behavior of the existing copy_to_page
+path.
+
+> diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+> index 49865a4637809..5722cccb53eb7 100644
+> --- a/fs/btrfs/reflink.c
+> +++ b/fs/btrfs/reflink.c
+> @@ -185,6 +185,8 @@ static int clone_copy_inline_extent(struct btrfs_inode *inode,
+>  	if (new_key->offset > 0) {
+>  		ret = copy_inline_to_page(inode, new_key->offset,
+>  					  inline_data, size, datal, comp_type);
+> +		if (ret == 0 && new_key->offset + datal > i_size_read(&inode->vfs_inode))
+> +			i_size_write(&inode->vfs_inode, new_key->offset + datal);
+
+[Severity: High]
+This is a pre-existing issue, but does this create a race window that can
+still trigger the deadlock?
+
+In copy_inline_to_page(), the dirtied folio is unlocked before returning:
+
+copy_inline_to_page() {
+    ...
+    btrfs_folio_set_dirty(fs_info, folio, file_offset, block_size);
+out_unlock:
+    if (!IS_ERR(folio)) {
+        folio_unlock(folio);
+        folio_put(folio);
+    ...
+}
+
+Once unlocked, the folio becomes immediately visible to concurrent writeback
+tasks. If writeback locks the folio before the reflink task updates i_size
+here, could it read the old i_size and incorrectly conclude the folio is
+past the end of the file?
+
+If this happens, extent_writepage() calls folio_invalidate(), which then
+attempts to lock the extent range already held by the reflink task:
+
+extent_writepage() {
+    ...
+    if (folio->index > end_index ||
+       (folio->index == end_index && !pg_offset)) {
+        folio_invalidate(folio, 0, folio_size(folio));
+    ...
+}
+
+The reflink task then updates i_size too late, and attempts to start a
+transaction which blocks on the commit waiting for writeback, resulting in
+a deadlock.
+
+Could i_size be updated inside copy_inline_to_page() before folio_unlock()
+is called to prevent this race?
+
+>  		goto out;
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260601140958.1333017-1-lgs201920130244@gmail.com?part=1
+

@@ -1,0 +1,88 @@
+From sashiko-bot@kernel.org Wed Jul 22 14:51:48 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/7] btrfs: do an initial lockless committed log
+ transaction check during log syncing
+Date: Wed, 22 Jul 2026 12:51:45 +0000
+Message-Id: <20260722125146.688C51F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Lockless fast-path in `btrfs_sync_log` lacks memory barriers, leading to silent data loss and stack use-after-free.
+--
+
+--- Patch [3]: [PATCH 3/7] btrfs: do an initial lockless committed log transaction check during log syncing ---
+commit 4d4423f7eb46c34b8f4a59c30a656c40d1c08a43
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: do an initial lockless committed log transaction check during log syncing
+
+This commit adds an initial lockless check in btrfs_sync_log() to see if
+the log transaction was already committed. This is intended to reduce lock
+contention on root->log_mutex during concurrent fsync operations.
+
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+[ ... ]
+> @@ -3306,15 +3306,21 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
+>  	struct btrfs_root *log = root->log_root;
+>  	struct btrfs_root *log_root_tree = fs_info->log_root_tree;
+>  	struct btrfs_root_item new_root_item;
+> -	int log_transid = 0;
+> +	int log_transid = ctx->log_transid;
+>  	struct btrfs_log_ctx root_log_ctx;
+>  	struct blk_plug plug;
+>  	u64 log_root_start;
+>  	u64 log_root_level;
+>  
+> +	/* Avoid fist taking root->log_mutex, reduce lock contention. */
+> +	if (data_race(root->log_transid_committed) >= log_transid) {
+
+[Severity: Low]
+This isn't a bug, but there is a typo in the comment: "fist" instead of
+"first".
+
+> +		trace_btrfs_sync_log_enter(trans, root, ctx);
+> +		trace_btrfs_sync_log_exit(trans, root, ctx, ctx->log_ret);
+> +		return ctx->log_ret;
+> +	}
+> +
+
+[Severity: Critical]
+Does this lockless fast-path require memory barriers to prevent stack
+corruption and data loss?
+
+When a concurrent fsync workload occurs, the writer thread updating the log
+modifies the ctx structure (which is allocated on the reader's stack) inside
+btrfs_remove_all_log_ctxs(), and then increments root->log_transid_committed
+using a plain store:
+
+btrfs_sync_log() {
+    ...
+    btrfs_remove_all_log_ctxs(root, index1, ret);
+        // sets ctx->log_ret = error;
+        // modifies ctx->list
+    root->log_transid_committed++;
+}
+
+Since the reader thread checks root->log_transid_committed here using a
+plain load via data_race(), could the CPU or compiler reorder these
+memory operations?
+
+If reordered on weakly-ordered architectures, the reader might observe the
+updated log_transid_committed but read a stale ctx->log_ret, which would
+mask real commit errors like -EIO.
+
+Additionally, could this cause a stack use-after-free? The reader could
+return immediately, popping the ctx struct off its stack in btrfs_sync_file(),
+while the writer's delayed stores to ctx->list and ctx->log_ret later
+overwrite the reader's recycled stack frame.
+
+>  	mutex_lock(&root->log_mutex);
+>  	trace_btrfs_sync_log_enter(trans, root, ctx);
+> -	log_transid = ctx->log_transid;
+>  	if (root->log_transid_committed >= log_transid) {
+>  		trace_btrfs_sync_log_exit(trans, root, ctx, ctx->log_ret);
+>  		mutex_unlock(&root->log_mutex);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1784656641.git.fdmanana@suse.com?part=3
+

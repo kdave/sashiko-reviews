@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Tue Jun  2 07:36:42 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: output a message when a missing device re-appear
+Date: Tue, 02 Jun 2026 05:36:39 +0000
+Message-Id: <20260602053640.3D5081F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [Medium] Spurious logging of 'missing devid re-appeared' for unmounted devices.
+
+Pre-existing issues:
+- [High] Clearing `BTRFS_DEV_STATE_MISSING` on re-appearing devices without opening the block device leads to a kernel panic in concurrent operations.
+--
+
+commit 7251b7c110c462c319fa71e836fb18dec3370def
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: output a message when a missing device re-appear
+
+This patch adds an informational log message when a previously missing
+device re-appears during device scanning. This is intended to aid debugging
+situations where a missing device shows up but has no block device pointer.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index a88e68f905646..bf42c829af100 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -963,6 +963,11 @@ static noinline struct btrfs_device *device_list_add(const char *path,
+>  					  devid, btrfs_dev_name(device),
+>  					  path, current->comm,
+>  					  task_pid_nr(current));
+> +		} else {
+> +			btrfs_info(NULL,
+> +	"missing devid %llu re-appeared at %s scanned by %s (%d)",
+> +				   devid, path, current->comm,
+> +				   task_pid_nr(current));
+>  		}
+
+[Severity: Medium]
+Will this unconditionally log spurious messages for normal unmounted devices?
+
+For unmounted filesystems, device->bdev is NULL for all scanned devices
+because the block device isn't opened yet. If an existing, unmounted device
+is scanned again via a different path, such as udev discovering multiple
+symlinks:
+
+!is_same_device(device, path) branch is taken
+device->bdev is NULL
+
+Could this incorrectly trigger the "re-appeared" log message and spam the
+kernel log with false messages during normal system boot?
+
+[Severity: High]
+This is a pre-existing issue, but does clearing the missing state without
+opening the block device lead to a kernel panic in concurrent operations?
+
+When a missing device is rescanned slightly later in device_list_add(), the
+state is updated:
+
+if (test_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state)) {
+    fs_devices->missing_devices--;
+    clear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);
+}
+
+By clearing the missing state while leaving device->bdev as NULL, concurrent
+operations like fstrim that iterate over devices might skip checking for the
+missing state. Will they then unconditionally dereference the NULL
+device->bdev pointer?
+
+>  
+>  		name = kstrdup(path, GFP_NOFS);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/c7860a5196a885c39e01676c4a1b3a4323f56590.1780377988.git.wqu@suse.com?part=1
+

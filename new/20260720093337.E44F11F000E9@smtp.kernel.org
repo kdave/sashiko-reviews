@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Mon Jul 20 11:33:42 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v12 13/21] xfs: use read ioend for fsverity data
+ verification
+Date: Mon, 20 Jul 2026 09:33:37 +0000
+Message-Id: <20260720093337.E44F11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Multiplexing fsverity data read and metadata read ioends onto a single per-inode work_struct causes a workqueue self-deadlock.
+--
+
+--- Patch [13]: [PATCH v12 13/21] xfs: use read ioend for fsverity data verification ---
+commit 3d7fb300de53a3b72f444bc9436ba04835f7f395
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: use read ioend for fsverity data verification
+
+This commit introduces read ioends for fsverity verification in XFS to avoid
+submitting fsverity metadata I/O through the same workqueue, mitigating the
+risk of deadlocks due to a filled workqueue. It passes fsverity_info from
+the iomap context down to the ioend and adds a helper to distinguish file
+data from fsverity metadata.
+
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index 27ff2b2404579..b0537c67e960e 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+[ ... ]
+> @@ -243,9 +260,14 @@ xfs_end_bio(
+>  	}
+>  
+>  	spin_lock_irqsave(&ip->i_ioend_lock, flags);
+> -	if (list_empty(&ip->i_ioend_list))
+> -		WARN_ON_ONCE(!queue_work(mp->m_unwritten_workqueue,
+> +	if (list_empty(&ip->i_ioend_list)) {
+> +		if (IS_ENABLED(CONFIG_FS_VERITY) && ioend->io_vi &&
+> +		    ioend->io_offset < xfs_fsverity_metadata_offset(ip))
+> +			fsverity_enqueue_verify_work(&ip->i_ioend_work);
+> +		else
+> +			WARN_ON_ONCE(!queue_work(mp->m_unwritten_workqueue,
+>  					 &ip->i_ioend_work));
+> +	}
+>  	list_add_tail(&ioend->io_list, &ip->i_ioend_list);
+>  	spin_unlock_irqrestore(&ip->i_ioend_lock, flags);
+>  }
+
+[Severity: High]
+Does this multiplexing of fsverity data read and metadata read ioends onto a
+single per-inode work_struct cause a workqueue self-deadlock?
+
+When the underlying block device has integrity csum support,
+xfs_get_iomap_read_ops() forces fsverity metadata reads to use xfs_end_bio():
+
+xfs_get_iomap_read_ops() {
+    if (bdev_has_integrity_csum(xfs_inode_buftarg(ip)->bt_bdev) ||
+            xfs_fsverity_is_file_data(ip, position))
+        return &xfs_iomap_read_ops;
+}
+
+If a data read and a metadata read on the same file complete concurrently,
+both ioends are appended to ip->i_ioend_list and scheduled via the shared
+ip->i_ioend_work.
+
+In xfs_end_io(), iomap_sort_ioends() sorts the data read (lower offset)
+before the metadata read. Processing the data read calls
+fsverity_verify_bio(), which synchronously waits for the metadata folio to
+unlock.
+
+However, the metadata folio is locked by the in-flight metadata read, and
+will only be unlocked when its ioend is processed by iomap_finish_ioends().
+Since the metadata ioend is queued further down the same list, won't the
+worker thread block forever waiting for itself?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260720090410.3487990-1-aalbersh@kernel.org?part=13
+

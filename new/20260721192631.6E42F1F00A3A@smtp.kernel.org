@@ -1,0 +1,35 @@
+From sashiko-bot@kernel.org Tue Jul 21 21:26:34 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH/RFC] btrfs: fix folio lock leak in writepage_delalloc()
+ for folios dirtied behind btrfs' back
+Date: Tue, 21 Jul 2026 19:26:31 +0000
+Message-Id: <20260721192631.6E42F1F00A3A@smtp.kernel.org>
+
+> A folio can carry the folio-level dirty flag while its btrfs subpage
+> dirty bitmap is empty: btrfs data mappings use filemap_dirty_folio(),
+> so a generic folio_mark_dirty() call sets only the folio flag and the
+> xarray tag, without setting any subpage dirty bit and without a
+> delalloc reservation.  The typical source is set_page_dirty_lock() on
+> a GUP pin, e.g. the s390 KVM irq adapter path
+> (adapter_indicators_set()) which pins guest indicator pages living in
+> a file-backed guest RAM file, sets a bit and marks the page dirty.
+> 
+> When writeback then picks up such a folio, writepage_delalloc()
+> copies the empty subpage dirty bitmap into
+> bio_ctrl->submit_bitmap, sets up no range locks (nr_locked stays 0),
+> finds no delalloc range, and finally hits
+> 
+> 	if (bitmap_empty(bio_ctrl->submit_bitmap, blocks_per_folio)) {
+> [ ... ]
+> filesystem was not informed about.
+> 
+> Fixes: bd610c0937aa ("btrfs: only unlock the to-be-submitted ranges inside a folio")
+> Assisted-by: Claude
+> Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721191152.101118-2-borntraeger@linux.ibm.com?part=1
+
+

@@ -1,0 +1,60 @@
+From sashiko-bot@kernel.org Mon Jul 20 11:30:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v12 15/21] xfs: remove unwritten extents after
+ preallocations in fsverity metadata
+Date: Mon, 20 Jul 2026 09:30:52 +0000
+Message-Id: <20260720093053.3A5131F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] ABBA deadlock between XFS_ILOCK_EXCL and Folio lock in xfs_fsverity_delete_metadata. This problem wasn't introduced by this patch, but by an earlier patch in the series.
+--
+
+--- Patch [15]: [PATCH v12 15/21] xfs: remove unwritten extents after preallocations in fsverity metadata ---
+commit 063638ca8d8b006db025047de6d04cad8eb2a2dc
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: remove unwritten extents after preallocations in fsverity metadata
+
+XFS preallocates spaces during writes. In normal I/O this space, if
+unused, is removed by truncate. For files with fsverity XFS does not use
+truncate as fsverity metadata is stored past EOF. After we're done with
+writing fsverity metadata iterate over extents in that region and remove
+any unwritten ones.
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index 4606354894e13..7dd7aec646cf3 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+[ ... ]
+> @@ -179,6 +182,74 @@ xfs_fsverity_delete_metadata(
+>  	return error;
+>  }
+
+[Severity: High]
+This isn't a bug introduced by this patch, but looking at the earlier part of
+xfs_fsverity_delete_metadata() in fs/xfs/xfs_fsverity.c:
+
+	xfs_ilock(ip, XFS_ILOCK_EXCL);
+	xfs_trans_ijoin(tp, ip, 0);
+
+	truncate_inode_pages(VFS_I(ip)->i_mapping, XFS_ISIZE(ip));
+
+Could this lock ordering cause an ABBA deadlock?
+
+If a background writeback thread is flushing dirty folios to disk, it acquires
+the folio lock first, and then xfs_map_blocks() waits to acquire
+XFS_ILOCK_SHARED.
+
+Concurrently, if a user interrupts the FS_IOC_ENABLE_VERITY ioctl (e.g., via
+SIGINT), the rollback path calls xfs_fsverity_delete_metadata(). This function
+acquires XFS_ILOCK_EXCL first, and then calls truncate_inode_pages(), which
+attempts to lock the same folio held by the writeback thread.
+
+Does this inversion (XFS_ILOCK -> Folio lock vs Folio lock -> XFS_ILOCK) risk
+hanging both the writeback flusher and the ioctl process?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260720090410.3487990-1-aalbersh@kernel.org?part=15
+

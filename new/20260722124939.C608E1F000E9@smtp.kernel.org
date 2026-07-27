@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Wed Jul 22 14:49:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/7] btrfs: check for log writers count first in
+ wait_for_writer()
+Date: Wed, 22 Jul 2026 12:49:39 +0000
+Message-Id: <20260722124939.C608E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Checking the sleep condition before calling `prepare_to_wait()` introduces a lost wakeup race condition, leading to an unkillable task hang.
+--
+
+--- Patch [4]: [PATCH 4/7] btrfs: check for log writers count first in wait_for_writer() ---
+commit bba4ae07ed04f41539d8ff4dd56582629b7a643f
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: check for log writers count first in wait_for_writer()
+
+This commit attempts to optimize wait_for_writer() by checking the
+number of log writers before adding the wait queue entry, avoiding
+unnecessary wait queue locking overhead when there are no log writers.
+
+> diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+> index 191308982e9c6..08af1e66c7589 100644
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+> @@ -3202,11 +3202,11 @@ static void wait_for_writer(struct btrfs_root *root)
+>  	DEFINE_WAIT(wait);
+>  
+>  	for (;;) {
+> -		prepare_to_wait(&root->log_writer_wait, &wait,
+> -				TASK_UNINTERRUPTIBLE);
+> -		if (!atomic_read(&root->log_writers))
+> +		if (atomic_read(&root->log_writers) == 0)
+>  			break;
+>  
+> +		prepare_to_wait(&root->log_writer_wait, &wait,
+> +				TASK_UNINTERRUPTIBLE);
+
+[Severity: High]
+Does this sequence open a race window that can result in a lost wakeup?
+
+By checking the sleep condition before calling prepare_to_wait(), if a
+concurrent lockless wakeup occurs between the check and prepare_to_wait(),
+the wakeup will be missed.
+
+For example, if Thread A in wait_for_writer() evaluates
+atomic_read(&root->log_writers) == 0 as false:
+
+Thread B concurrently completes its write in btrfs_end_log_trans():
+	if (atomic_dec_and_test(&root->log_writers)) {
+		/* atomic_dec_and_test implies a barrier */
+		cond_wake_up_nomb(&root->log_writer_wait);
+	}
+
+Because Thread A has not yet added itself to the wait queue with
+prepare_to_wait(), the waitqueue is inactive and the wakeup is lost.
+
+Thread A then calls prepare_to_wait(), unlocks the mutex, and calls
+schedule(), sleeping indefinitely since the condition is already met.
+
+Can this lead to a task performing btrfs_sync_log() hanging forever in
+TASK_UNINTERRUPTIBLE?
+
+>  		mutex_unlock(&root->log_mutex);
+>  		schedule();
+>  		mutex_lock(&root->log_mutex);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1784656641.git.fdmanana@suse.com?part=4
+

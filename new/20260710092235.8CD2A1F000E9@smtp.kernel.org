@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:23:29 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 10/20] xfs: don't report dio_mem_align and
+ dio_offset_align for fsverity files
+Date: Fri, 10 Jul 2026 09:22:35 +0000
+Message-Id: <20260710092235.8CD2A1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Direct I/O reads on XFS fs-verity files bypass Merkle tree verification, allowing unauthenticated data to be read.
+--
+
+--- Patch [10]: [PATCH v11 10/20] xfs: don't report dio_mem_align and dio_offset_align for fsverity files ---
+commit 429e8646130c34d870061782803f5bd40bcef708
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: don't report dio_mem_align and dio_offset_align for fsverity files
+
+This commit disables reporting of Direct I/O alignment in statx for
+fs-verity files on XFS. The change signals to user space that Direct
+I/O is not supported for these files.
+
+> xfs: don't report dio_mem_align and dio_offset_align for fsverity files
+> 
+> Sashiko.dev reported that while fsverity files falls back to the
+> buffered IO for Direct I/O, they should not report non-zero values in
+> dio_mem_align and dio_offset_align, meaning it's not supported.
+
+[Severity: Critical]
+Does XFS actually fall back to buffered I/O for fsverity files?
+
+Looking at xfs_file_read_iter() in fs/xfs/xfs_file.c, it doesn't appear
+to check fsverity_active() before routing the read to the direct I/O path:
+
+fs/xfs/xfs_file.c:xfs_file_read_iter() {
+        ...
+        else if (iocb->ki_flags & IOCB_DIRECT)
+                ret = xfs_file_dio_read(iocb, to);
+        ...
+}
+
+If an attacker opens an fs-verity protected file with O_DIRECT, won't this
+bypass the page cache and fsverity_verify_folio() entirely, allowing them
+to read unauthenticated data?
+
+While this patch correctly zeroes out the alignment fields in statx, it
+doesn't seem to stop an application from issuing an O_DIRECT read anyway.
+
+> diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+> index 55667cc762f8a..70637cdcc2997 100644
+> --- a/fs/xfs/xfs_iops.c
+> +++ b/fs/xfs/xfs_iops.c
+[ ... ]
+> @@ -580,6 +581,10 @@ xfs_report_dioalign(
+>  	struct block_device	*bdev = target->bt_bdev;
+>  
+>  	stat->result_mask |= STATX_DIOALIGN | STATX_DIO_READ_ALIGN;
+> +
+> +	if (fsverity_active(VFS_I(ip)))
+> +		return;
+> +
+>  	stat->dio_mem_align = bdev_dma_alignment(bdev) + 1;
+>  
+>  	/*
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=10
+

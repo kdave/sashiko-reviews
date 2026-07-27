@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Mon Jul 20 11:27:30 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v12 11/21] xfs: don't report dio_mem_align and
+ dio_offset_align for fsverity files
+Date: Mon, 20 Jul 2026 09:27:28 +0000
+Message-Id: <20260720092728.56F671F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The legacy XFS_IOC_DIOINFO ioctl will successfully return 0 for its alignment fields on fsverity files, potentially crashing legacy userspace applications.
+- [Medium] XFS does not report STATX_ATTR_VERITY in statx for fs-verity enabled files.
+--
+
+--- Patch [11]: [PATCH v12 11/21] xfs: don't report dio_mem_align and dio_offset_align for fsverity files ---
+commit b43af9581e85c8d1a628ad093838f437072494af
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: don't report dio_mem_align and dio_offset_align for fsverity files
+
+This commit updates the statx direct I/O alignment reporting to return early
+for fsverity files. This ensures non-zero alignment values are not reported
+when direct I/O falls back to buffered I/O.
+
+> diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+> --- a/fs/xfs/xfs_iops.c
+> +++ b/fs/xfs/xfs_iops.c
+> @@ -580,6 +581,10 @@ xfs_report_dioalign(
+>  	struct block_device	*bdev = target->bt_bdev;
+>  
+>  	stat->result_mask |= STATX_DIOALIGN | STATX_DIO_READ_ALIGN;
+> +
+> +	if (fsverity_active(VFS_I(ip)))
+> +		return;
+
+[Severity: High]
+If we return early here, dio_offset_align is left as 0. When the legacy
+XFS_IOC_DIOINFO ioctl queries these alignments via vfs_getattr(), it appears
+to blindly use this 0 value:
+
+fs/xfs/xfs_ioctl.c:xfs_file_ioctl() {
+    case XFS_IOC_DIOINFO: {
+        ...
+        error = vfs_getattr(&filp->f_path, &st, STATX_DIOALIGN, 0);
+        if (error)
+            return error;
+
+        da.d_mem = roundup(st.dio_mem_align, sizeof(void *));
+        da.d_miniosz = st.dio_offset_align;
+        da.d_maxiosz = INT_MAX & ~(da.d_miniosz - 1);
+        if (copy_to_user(arg, &da, sizeof(da)))
+            return -EFAULT;
+        return 0;
+    }
+}
+
+Because da.d_miniosz becomes 0, da.d_maxiosz is evaluated as 0 and successfully
+passed to userspace. Could this cause legacy userspace applications expecting
+positive alignment values to crash when performing modulo or division
+calculations?
+
+Would it make sense for xfs_file_ioctl() to return an error like -ENOTTY or
+-EOPNOTSUPP when direct I/O is unsupported?
+
+[Severity: Medium]
+As a related getattr issue, does xfs_vn_getattr() need an update to report
+fsverity attributes?
+
+When populating stat->attributes, xfs_vn_getattr() maps flags like
+XFS_DIFLAG_IMMUTABLE to STATX_ATTR_IMMUTABLE, but it seems to omit checking
+for XFS_DIFLAG2_VERITY and setting STATX_ATTR_VERITY.
+
+Does this omission prevent userspace utilities like lsattr or fsverity from
+detecting verity protection when querying statx on XFS?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260720090410.3487990-1-aalbersh@kernel.org?part=11
+

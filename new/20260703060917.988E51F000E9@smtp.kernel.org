@@ -1,0 +1,118 @@
+From sashiko-bot@kernel.org Fri Jul  3 08:09:20 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: reset meta_write_pointer on zone reset
+Date: Fri, 03 Jul 2026 06:09:16 +0000
+Message-Id: <20260703060917.988E51F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Use-After-Free when resetting unused block groups due to premature reference drop.
+- [Medium] Resource leak of unused block groups on error paths during zone reset.
+--
+
+commit d356915fe8812dc3442deb98698549658bc98853
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: reset meta_write_pointer on zone reset
+
+This commit updates btrfs_reset_unused_block_groups to reset the
+meta_write_pointer for metadata and system block groups when a zone is
+reset. This prevents newly allocated tree blocks from ending up behind a
+stale write pointer and pinning their folio indefinitely.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 97f06dd016932..45fa183c4e165 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+>  		list_del_init(&bg->bg_list);
+>  		btrfs_put_block_group(bg);
+>  		spin_unlock(&fs_info->unused_bgs_lock);
+
+[ ... ]
+
+>  		down_read(&fs_info->dev_replace.rwsem);
+>  		map = bg->physical_map;
+>  		for (int i = 0; i < map->num_stripes; i++) {
+>  			struct btrfs_io_stripe *stripe = &map->stripes[i];
+>  			unsigned int nofs_flags;
+>  			int ret;
+>  
+>  			nofs_flags = memalloc_nofs_save();
+>  			ret = blkdev_zone_mgmt(stripe->dev->bdev, REQ_OP_ZONE_RESET,
+>  					       stripe->physical >> SECTOR_SHIFT,
+>  					       zone_size_sectors);
+>  			memalloc_nofs_restore(nofs_flags);
+>  
+>  			if (ret) {
+>  				up_read(&fs_info->dev_replace.rwsem);
+>  				return ret;
+
+[Severity: Medium]
+This is a pre-existing issue, but I wanted to ask about the error path here.
+
+If blkdev_zone_mgmt fails and returns early, it looks like we don't add
+the block group back to the unused_bgs list.
+
+Does this leak the unused block group and prevent its space from being
+reclaimed or reused until unmount?
+
+>  			}
+>  		}
+>  		up_read(&fs_info->dev_replace.rwsem);
+>  
+>  		spin_lock(&space_info->lock);
+>  		spin_lock(&bg->lock);
+
+[Severity: High]
+This is also a pre-existing issue, but I wanted to ask about the reference
+management for the block group.
+
+The btrfs_put_block_group(bg) call earlier in this loop drops a reference
+to the block group before performing blocking I/O in blkdev_zone_mgmt,
+leaving it unprotected.
+
+If a concurrent operation like chunk removal drops the final reference and
+frees the memory while we are yielding, could accessing bg->lock here lead
+to a use-after-free?
+
+>  		ASSERT(!btrfs_is_block_group_used(bg));
+>  		if (bg->ro) {
+>  			spin_unlock(&bg->lock);
+>  			spin_unlock(&space_info->lock);
+>  			continue;
+
+[Severity: Medium]
+This is another pre-existing issue related to the error path above. 
+
+If the block group is concurrently marked read-only, we skip cleanup and
+continue without restoring it to the unused_bgs list.
+
+Does this code leak the block group permanently?
+
+>  		}
+>  
+>  		reclaimed = bg->alloc_offset;
+>  		bg->zone_unusable = bg->length - bg->zone_capacity;
+>  		bg->alloc_offset = 0;
+> +		/*
+> +		 * The zone was just reset to empty, so alloc_offset went back to
+> +		 * the start of the zone. For metadata/system block groups the
+> +		 * write pointer must follow it back to the start of the zone;
+> +		 * otherwise it stays stale at the previous (finished) zone end,
+> +		 * and metadata written into the reused zone would sit behind the
+> +		 * write pointer, could never be written out in sequential order,
+> +		 * and would be stranded (pinning its folio) until unmount.
+> +		 */
+> +		if (bg->flags & (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM))
+> +			bg->meta_write_pointer = bg->start;
+>  		/*
+>  		 * This holds because we currently reset fully used then freed
+>  		 * block group.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260703055445.117214-1-johannes.thumshirn@wdc.com?part=1
+

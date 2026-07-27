@@ -1,0 +1,89 @@
+From sashiko-bot@kernel.org Tue Jul  7 05:00:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix a regression where PAGECACHE_TAG_DIRTY is
+ never cleared
+Date: Tue, 07 Jul 2026 03:00:45 +0000
+Message-Id: <20260707030045.C765D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Early error paths in `extent_writepage()` permanently leak `PAGECACHE_TAG_DIRTY` and cause silent data loss due to premature clearing of `PG_dirty`.
+--
+
+--- Patch [1]: [PATCH] btrfs: fix a regression where PAGECACHE_TAG_DIRTY is never cleared ---
+commit 3aaeda68bdb2b733094173de07e8ec16ef3716a1
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: fix a regression where PAGECACHE_TAG_DIRTY is never cleared
+
+This commit reverts from using folio_test_dirty() back to
+folio_clear_dirty_for_io() inside extent_write_cache_pages(). This is intended
+to fix a regression where PAGECACHE_TAG_DIRTY is never cleared for subpage
+blocks.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 7d604524e83c3..1dda89e284b05 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+[ ... ]
+> @@ -2584,8 +2584,31 @@ static int extent_write_cache_pages(struct address_space *mapping,
+>  				folio_wait_writeback(folio);
+>  			}
+>  
+> +			/*
+> +			 * For folios that are under writeback or no longer dirty,
+> +			 * we can skip the folio.
+> +			 *
+> +			 * Here we have to call folio_clear_dirty_for_io() to clear
+> +			 * the folio dirty flag.
+> +			 *
+> +			 * Without that call, btrfs_folio_set_writeback() will call
+> +			 * folio_start_writeback() for the first block to be written back.
+> +			 * But since the folio can still be dirty, e.g. other
+> +			 * blocks inside the folio are still dirty,
+> +			 * PAGECACHE_TAG_DIRTY will not be cleared.
+> +			 *
+> +			 * On the other hand, for btrfs_folio_set_writeback() of the
+> +			 * last block, although the folio is no longer dirty,
+> +			 * btrfs_folio_set_writeback() won't call folio_start_writeback()
+> +			 * as the folio already has that flag.
+> +			 *
+> +			 * This means, if we only rely one btrfs_folio_*()
+> +			 * helpers for both dirty and writeback flags,
+> +			 * PAGECACHE_TAG_DIRTY will never be cleared for subpage cases.
+> +			 * The only way to break out is to clear folio dirty here.
+> +			 */
+>  			if (folio_test_writeback(folio) ||
+> -			    !folio_test_dirty(folio)) {
+> +			    !folio_clear_dirty_for_io(folio)) {
+
+[Severity: Critical]
+Can this premature clearing of the dirty flag cause data loss if an early
+error occurs in extent_writepage()?
+
+By calling folio_clear_dirty_for_io() here, the folio's dirty flag is
+cleared before writeback is guaranteed to start. If extent_writepage()
+subsequently fails early, for example when set_folio_extent_mapped()
+encounters a failure:
+
+fs/btrfs/extent_io.c:extent_writepage() {
+    ...
+	ret = set_folio_extent_mapped(folio);
+	if (ret < 0)
+		goto done;
+    ...
+}
+
+The code jumps to the done label and unlocks the folio without calling
+folio_start_writeback() or folio_redirty_for_writepage().
+
+Because the folio was already marked clean by folio_clear_dirty_for_io(),
+would it remain clean and allow its data to be silently dropped when it
+is reclaimed? Could this also leave the PAGECACHE_TAG_DIRTY tag permanently
+leaked?
+
+>  				folio_unlock(folio);
+>  				continue;
+>  			}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/02e6596cdba776b63528ead37324076dd664a11e.1783392018.git.wqu@suse.com?part=1
+

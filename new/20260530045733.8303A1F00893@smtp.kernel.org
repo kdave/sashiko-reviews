@@ -1,0 +1,100 @@
+From sashiko-bot@kernel.org Sat May 30 06:57:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/3] btrfs: retry faulting in the pages after a zero
+ sized short direct write
+Date: Sat, 30 May 2026 04:57:33 +0000
+Message-Id: <20260530045733.8303A1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] The modified retry loop for zero-sized short writes calls `fault_in_iov_iter_readable()` without checking for `IOCB_NOWAIT`, which causes non-blocking IO requests to block on page faults.
+
+Pre-existing issues:
+- [High] In `btrfs_direct_write()`, if a partial direct IO write succeeds but the subsequent buffered IO fallback encounters a hard error, the function returns the negative error code instead of the number of successfully written bytes.
+--
+
+commit 47a77f82a2aaf27a0c7ce523a450bfb7c30ba612
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: retry faulting in the pages after a zero sized short direct write
+
+This patch modifies the direct IO write path to retry faulting in user
+pages when a write returns zero bytes. It loosens the retry condition
+from ret > 0 to ret >= 0 to reduce the chance of falling back to buffered
+IO for zero-copy direct IO.
+
+> diff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c
+> index fd53fac7186e2..99c959be8de70 100644
+> --- a/fs/btrfs/direct-io.c
+> +++ b/fs/btrfs/direct-io.c
+> @@ -960,7 +960,7 @@ ssize_t btrfs_direct_write(struct kiocb *iocb, struct iov_iter *from)
+>  	if (ret > 0)
+>  		written = ret;
+>  
+> -	if (iov_iter_count(from) > 0 && (ret == -EFAULT || ret > 0)) {
+> +	if (iov_iter_count(from) > 0 && (ret == -EFAULT || ret >= 0)) {
+>  		const size_t left = iov_iter_count(from);
+
+[ ... ]
+
+>  		if (left == prev_left) {
+>  			ret = -ENOTBLK;
+>  		} else {
+>  			fault_in_iov_iter_readable(from, left);
+>  			prev_left = left;
+>  			goto again;
+>  		}
+>  	}
+
+[Severity: High]
+If an asynchronous io_uring request with IOCB_NOWAIT hits an unmapped
+buffer scenario, it will now enter this retry block because of the
+ret >= 0 change.
+
+Since fault_in_iov_iter_readable() triggers page faults, can it block
+on disk or network IO?
+
+Because the retry block lacks an explicit escape hatch for IOCB_NOWAIT,
+will non-blocking requests incorrectly stall here while holding the inode
+lock, and potentially stall io_uring worker threads?
+
+[ ... ]
+
+>  buffered:
+
+[ ... ]
+
+>  	pos = iocb->ki_pos;
+>  	written_buffered = btrfs_buffered_write(iocb, from);
+>  	if (written_buffered < 0) {
+>  		ret = written_buffered;
+>  		goto out;
+>  	}
+
+[ ... ]
+
+>  out:
+>  	return ret < 0 ? ret : written;
+>  }
+
+[Severity: High]
+This isn't a bug introduced by this patch, but if a direct IO write partially
+succeeds, written accumulates the bytes successfully handled and iocb->ki_pos
+is advanced internally by the iomap layer.
+
+If the remaining bytes fall back to btrfs_buffered_write() and it encounters
+an error like -ENOSPC, ret is set to the error code and the goto out path is
+taken.
+
+When the function evaluates ret < 0 ? ret : written, does this discard
+the successfully written count and return the error code instead?
+
+If the VFS propagates this error to user space without updating the
+application's file offset, could the application retry the identical write
+and overwrite the same logical offset, resulting in silent data corruption
+or duplication?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1780112003.git.wqu@suse.com?part=3
+

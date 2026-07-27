@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Tue Jul 14 18:23:52 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] fstests: btrfs/349: test if latest tree-log is
+ choosen at mount time on raid1 profile
+Date: Tue, 14 Jul 2026 16:23:28 +0000
+Message-Id: <20260714162328.73DC71F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Medium] The test modifies global and per-device error injection states but fails to provide a custom `_cleanup` function to restore them.
+- [Medium] The test intentionally fails all underlying block devices before unmounting, which will trigger Btrfs transaction aborts and spurious test failures.
+- [Low] The test hardcodes the `sha256` checksum algorithm without ensuring the kernel and userspace support it.
+--
+
+--- Patch [2]: [PATCH 2/2] fstests: btrfs/349: test if latest tree-log is choosen at mount time on raid1 profile ---
+commit 63958f4baa0b2c7b2d0274803f304f984a3e19ff
+Author: Zhang Boyang <zhangboyang.id@gmail.com>
+
+fstests: btrfs/349: test if latest tree-log is choosen at mount time on raid1 profile
+
+This test simulates a scenario where the tree-log only exists in a secondary
+device. It verifies whether the latest tree-log is correctly chosen at mount
+time.
+
+> diff --git a/tests/btrfs/349 b/tests/btrfs/349
+> new file mode 100755
+> --- /dev/null
+> +++ b/tests/btrfs/349
+> @@ -0,0 +1,53 @@
+
+[ ... ]
+
+> +_require_scratch_dev_pool 2
+> +
+> +_scratch_dev_pool_get 2
+> +_check_minimal_fs_size $(( 1024 * 1024 * 1024 ))
+> +# a strong checksum like sha256 can't protect you
+> +_scratch_pool_mkfs "-m raid1 -d raid1 -b 1G --csum sha256" >> $seqres.full 2>&1
+
+[Severity: Low]
+Does this need a prerequisite check for the sha256 checksum algorithm?
+
+If the test is executed on an older environment lacking btrfs-progs support or
+a kernel without CONFIG_CRYPTO_SHA256, mkfs or mount will fail. This results
+in a noisy hard failure instead of gracefully skipping the test on unsupported
+systems.
+
+> +dev2=`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $2}'`
+> +_allow_fail_make_request
+> +
+> +echo "Step 1: prepare filesystem"
+
+[ ... ]
+
+> +echo "Step 2: simulate failure"
+> +_scratch_mount -o treelog
+> +# simulate dev1 disappears before writing anything
+> +_bdev_fail_make_request $SCRATCH_DEV 1
+
+[Severity: Medium]
+Since this modifies the device error injection state, should the script provide
+a custom _cleanup function?
+
+If the test is interrupted or fails prematurely before the state is manually
+restored at the end of the script, the default cleanup runs. The default
+cleanup does not disable fail_make_request, meaning the device failure state
+will leak and cause spurious failures in subsequent tests.
+
+> +# this write should success
+> +$XFS_IO_PROG -f -c "pwrite -W -S 0xbb 0 8" $SCRATCH_MNT/foobar | _filter_xfs_io
+> +# simulate dev2 disappears after writing TREE_LOG
+> +_bdev_fail_make_request $dev2 1
+> +_scratch_unmount
+
+[Severity: Medium]
+Will this unmount trigger a transaction abort and cause the fstests dmesg
+checks to flag a spurious failure?
+
+Both $SCRATCH_DEV and $dev2 are actively rejecting I/O when _scratch_unmount
+is called, which guarantees a btrfs transaction abort. Because the expected
+kernel warnings are not explicitly filtered, the test harness will likely flag
+this run as a failure when checking dmesg output.
+
+> +_bdev_fail_make_request $SCRATCH_DEV 0
+> +_bdev_fail_make_request $dev2 0
+> +
+> +echo "Step 3: simulate recovery"
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260714161044.7330-1-zhangboyang.id@gmail.com?part=2
+

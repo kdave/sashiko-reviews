@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:11:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 08/20] xfs: initialize fs-verity on file open
+Date: Fri, 10 Jul 2026 09:09:24 +0000
+Message-Id: <20260710090924.A930C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Opening an fs-verity enabled file on an XFS filesystem causes a kernel panic because `inode->i_sb->s_vop` is NULL.
+--
+
+--- Patch [8]: [PATCH v11 08/20] xfs: initialize fs-verity on file open ---
+commit 01c01ce9d31b3bb019206e7d9af232c4a629be51
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: initialize fs-verity on file open
+
+This commit adds a call to fsverity_file_open() in the xfs_file_open path,
+intending to initialize fs-verity metadata for inodes that have fs-verity
+enabled.
+
+> diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+> index 845a97c9b0630..e3f4353b3b78b 100644
+> --- a/fs/xfs/xfs_file.c
+> +++ b/fs/xfs/xfs_file.c
+
+[ ... ]
+
+> @@ -1700,11 +1701,18 @@ xfs_file_open(
+>  	struct inode	*inode,
+>  	struct file	*file)
+>  {
+> +	int		error;
+> +
+>  	if (xfs_is_shutdown(XFS_M(inode->i_sb)))
+>  		return -EIO;
+>  	file->f_mode |= FMODE_NOWAIT | FMODE_CAN_ODIRECT;
+>  	if (xfs_get_atomic_write_min(XFS_I(inode)) > 0)
+>  		file->f_mode |= FMODE_CAN_ATOMIC_WRITE;
+> +
+> +	error = fsverity_file_open(inode, file);
+
+[Severity: High]
+Does calling fsverity_file_open() here trigger a NULL pointer dereference
+on inode->i_sb->s_vop?
+
+If a crafted XFS image is mounted containing an inode with the
+XFS_DIFLAG2_VERITY flag set, IS_VERITY(inode) will evaluate to true.
+This triggers the following path:
+
+xfs_file_open()
+  fsverity_file_open()
+    __fsverity_file_open()
+      fsverity_ensure_verity_info()
+        fsverity_get_descriptor()
+
+In fsverity_get_descriptor(), there is an unconditional dereference:
+
+fs/verity/open.c:fsverity_get_descriptor() {
+    ...
+    res = inode->i_sb->s_vop->get_verity_descriptor(inode, NULL, 0);
+    ...
+}
+
+Since the XFS superblock's s_vop pointer does not appear to be
+initialized in this patch, could this result in a panic when attempting
+to open the file?
+
+> +	if (error)
+> +		return error;
+> +
+>  	return generic_file_open(inode, file);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=8
+

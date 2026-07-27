@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Tue Jun  2 13:12:34 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 5/8] btrfs: open via dedicated fs bdev helpers
+Date: Tue, 02 Jun 2026 11:12:29 +0000
+Message-Id: <20260602111229.D66C01F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] NULL pointer dereference of uninitialized `fs_info` when closing block devices on early mount error paths and seed devices.
+--
+
+commit bd4171a1a4c29ea9366b8ed7cbe0c346a34da5e8
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: open via dedicated fs bdev helpers
+
+Route opens through fs_bdev_file_open_by_path() so each external device
+is registered against the correct superblock, and convert the matching
+releases.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index a88e68f905646..6f7d7afb4d66a 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+
+[ ... ]
+
+> @@ -1082,7 +1090,7 @@ static void __btrfs_free_extra_devids(struct btrfs_fs_devices *fs_devices,
+>  			continue;
+>  
+>  		if (device->bdev_file) {
+> -			bdev_fput(device->bdev_file);
+> +			fs_bdev_file_release(device->bdev_file, fs_devices->fs_info->sb);
+
+[Severity: High]
+Can fs_devices->fs_info be NULL here when handling seed devices?
+
+During the normal mount sequence, __btrfs_free_extra_devids() is executed
+for seed devices before btrfs_init_devices_late() initializes the fs_info
+pointers. Will accessing fs_devices->fs_info->sb trigger a NULL pointer
+dereference for filesystems utilizing seed devices?
+
+>  			device->bdev = NULL;
+>  			device->bdev_file = NULL;
+>  			fs_devices->open_devices--;
+
+[ ... ]
+
+> @@ -1129,7 +1137,7 @@ static void btrfs_close_bdev(struct btrfs_device *device)
+>  		invalidate_bdev(device->bdev);
+>  	}
+>  
+> -	bdev_fput(device->bdev_file);
+> +	fs_bdev_file_release(device->bdev_file, device->fs_info->sb);
+
+[Severity: High]
+Will this dereference a NULL pointer on early mount failure paths?
+
+When block devices are initially allocated and discovered (for example, via
+btrfs_scan_one_device()), device->fs_info is initialized to NULL. It is
+only assigned later in the mount sequence.
+
+If the mount fails early before this initialization happens (such as from
+an invalid superblock or a chunk tree read error), the cleanup path invokes
+btrfs_close_devices() which calls btrfs_close_bdev(). Does accessing
+device->fs_info->sb here cause a kernel panic on those error paths?
+
+>  }
+>  
+>  static void btrfs_close_one_device(struct btrfs_device *device)
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260602-work-super-bdev_holder_global-v1-0-bb0fd82f3861@kernel.org?part=5
+

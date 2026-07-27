@@ -1,0 +1,83 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:49:11 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 13/15] btrfs: implement delete of parity stripes
+Date: Fri, 19 Jun 2026 09:49:06 +0000
+Message-Id: <20260619094907.B77E51F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] __btrfs_delete_raid_extent silently aborts upon encountering holes or interleaved stripe types, failing to clean up disjoint retained items during sparse block group removal.
+--
+
+commit 8ad8471d4994d38dce345614ce23efb620d97054
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: implement delete of parity stripes
+
+This commit retains data and parity items for partially freed RAID56
+stripes to ensure degraded reads can still reconstruct correctly. It
+defers deleting these retained items until the entire block group is
+removed.
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index ab76a5173272a..aa41ca4f2e99f 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+[ ... ]
+> @@ -1167,6 +1168,20 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+>  	btrfs_free_ref_tree_range(fs_info, block_group->start,
+>  				  block_group->length);
+>  
+> +	/*
+> +	 * On RAID stripe-tree filesystems a partial-stripe free deliberately
+> +	 * keeps the stripe's data and parity items around (so degraded reads of
+> +	 * the surviving columns still reconstruct correctly). The block group
+> +	 * is now empty and about to go away, so this is where those retained
+> +	 * items are finally reclaimed.
+> +	 */
+> +	ret = btrfs_delete_raid_extent(trans, block_group->start,
+> +				       block_group->length);
+
+[ ... ]
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 513bb5bba2efb..310c5b906cfa8 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+[ ... ]
+> @@ -163,7 +166,7 @@ int btrfs_delete_raid_extent(struct btrfs_trans_handle *trans, u64 start, u64 le
+>  			}
+>  		}
+>  
+> -		if (key.type != BTRFS_RAID_STRIPE_KEY)
+> +		if (key.type != type)
+>  			break;
+>  
+>  		/* That stripe ends before we start, we're done. */
+>  		if (found_end <= start)
+>  			break;
+
+[Severity: Critical]
+Does this loop prematurely exit when it encounters a hole or an interleaved
+key type, preventing cleanup of subsequent fragmented partial stripes?
+
+Because the new caller in btrfs_remove_block_group() passes the full logical
+range of the block group, it expects this function to scan and delete all
+remaining sparse partial stripe items.
+
+However, if the block group has a hole at the start (e.g., the first few
+stripes were already fully deleted), the backwards step on the path slots
+will land on an item from a previous block group where found_end <= start.
+This causes the loop to break entirely.
+
+Similarly, when searching for the parity type, if a data stripe exists at
+the same objectid, stepping back can land on the data stripe instead of the
+parity stripe. This will trigger the key.type != type condition and also
+break the loop.
+
+Will breaking out of the loop in these cases instead of skipping ahead
+permanently leak all remaining partial stripe items in the deleted block
+group?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=13
+

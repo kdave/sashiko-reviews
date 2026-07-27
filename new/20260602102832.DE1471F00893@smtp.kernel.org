@@ -1,0 +1,218 @@
+From sashiko-bot@kernel.org Tue Jun  2 12:28:39 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 2/8] fs: add a global device to super block hash
+ table
+Date: Tue, 02 Jun 2026 10:28:32 +0000
+Message-Id: <20260602102832.DE1471F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 5 potential issue(s) to consider:
+
+New issues:
+- [Critical] Missing `SB_ACTIVE` and `s_root` check in `fs_bdev_freeze()` and `fs_bdev_thaw()` causes kernel crash and superblock leak.
+- [High] `fs_bdev_file_release()` unconditionally breaks out of its search loop upon finding a matching `(dev, sb)` entry, causing a resource leak and `refcount_t` warning if duplicates or logically dead entries exist.
+- [High] TOCTOU race in `fs_bdev_register()` allows concurrent creation of duplicate `fs_bdev_holder` entries.
+- [High] Block device walkers fail to verify `fs_bdev_active > 0`, applying events to logically closed claims.
+
+Pre-existing issues:
+- [Critical] Pre-existing double release of `struct file` in `setup_bdev_super()` error path leads to Use-After-Free.
+--
+
+commit 12e228ad9030680a7d2a16b92d7b762a1f7b5406
+Author: Christian Brauner <brauner@kernel.org>
+
+fs: add a global device to super block hash table
+
+This commit introduces a global dev_t-keyed rhltable mapping each block
+device to the superblock(s) using it. This allows multiple superblocks to
+share a single block device by using the block layer's exclusivity token
+rather than tying it to a single superblock.
+
+> diff --git a/fs/super.c b/fs/super.c
+> index 378e81efe643b..e0174d5819a02 100644
+> --- a/fs/super.c
+> +++ b/fs/super.c
+[ ... ]
+> @@ -1411,186 +1412,234 @@ EXPORT_SYMBOL(sget_dev);
+>  
+>  #ifdef CONFIG_BLOCK
+[ ... ]
+> +static int fs_bdev_freeze(struct block_device *bdev)
+>  {
+> -	struct super_block *sb;
+> -	int error = 0;
+> +	dev_t dev = bdev->bd_dev;
+> +	struct fs_bdev_holder *h;
+> +	unsigned int count = 0;
+> +	int error = 0, err;
+>  
+>  	lockdep_assert_held(&bdev->bd_fsfreeze_mutex);
+>  
+> -	sb = get_bdev_super(bdev);
+> -	if (!sb)
+> -		return -EINVAL;
+> +	mutex_unlock(&bdev->bd_holder_lock);
+>  
+> -	if (sb->s_op->freeze_super)
+> -		error = sb->s_op->freeze_super(sb,
+> -				FREEZE_MAY_NEST | FREEZE_HOLDER_USERSPACE, NULL);
+> -	else
+> -		error = freeze_super(sb,
+> -				FREEZE_MAY_NEST | FREEZE_HOLDER_USERSPACE, NULL);
+> +	for (h = fs_bdev_first(dev); h; h = fs_bdev_next(h)) {
+> +		if (!atomic_inc_not_zero(&h->sb->s_active))
+> +			continue;
+
+[Severity: High]
+Do block device walkers need to verify that fs_bdev_active > 0 before
+applying events to the superblock?
+
+When a filesystem releases a device, fs_bdev_active drops to 0, logically
+deleting the claim. However, the entry remains in the hash table as long as
+any walker holds a passive pin. If a device is removed from a filesystem,
+but the filesystem itself remains mounted, could a racing walker find this
+passively pinned dead entry and freeze the filesystem?
+
+If the dead entry is subsequently freed, a later fs_bdev_thaw() might fail
+to find it, potentially leaving the filesystem permanently frozen.
+
+[Severity: Critical]
+Are we missing checks for SB_ACTIVE and s_root here that were present in the
+original get_bdev_super() implementation?
+
+The previous code explicitly verified that sb->s_root and sb->s_flags &
+SB_ACTIVE were set. If a freeze races with a filesystem mount, s_active is
+incremented. If the mount then fails, deactivate_locked_super() sees the
+elevated s_active and skips calling kill_sb(), permanently leaking the
+superblock.
+
+Could this also result in fs_super_freeze() attempting to freeze and
+sync a failed, partially initialized superblock, resulting in a kernel crash?
+
+> +		err = fs_super_freeze(h->sb);
+> +		if (err && !error)
+> +			error = err;
+> +		deactivate_super(h->sb);
+> +		count++;
+> +	}
+[ ... ]
+> @@ -1602,6 +1651,131 @@ const struct blk_holder_ops fs_holder_ops = {
+>  };
+>  EXPORT_SYMBOL_GPL(fs_holder_ops);
+>  
+> +static int fs_bdev_register(struct file *bdev_file, struct super_block *sb)
+> +{
+> +	dev_t dev = file_bdev(bdev_file)->bd_dev;
+> +	struct rhlist_head *list, *pos;
+> +	struct fs_bdev_holder *h;
+> +	int err;
+> +
+> +	/*
+> +	 * A superblock may claim one device more than once (xfs with its log on
+> +	 * the data device).  Keep a single entry per (device, superblock) and
+> +	 * count the claims in @fs_bdev_active; the entry lives until the last one
+> +	 * is released.
+> +	 */
+> +	scoped_guard(rcu) {
+> +		list = rhltable_lookup(&fs_bdev_supers, &dev, fs_bdev_params);
+> +		rhl_for_each_entry_rcu(h, pos, list, node)
+> +			if (h->sb == sb && refcount_inc_not_zero(&h->fs_bdev_active))
+> +				return 0;
+> +	}
+> +
+> +	h = kmalloc(sizeof(*h), GFP_KERNEL);
+> +	if (!h)
+> +		return -ENOMEM;
+> +	h->dev = dev;
+> +	h->sb = sb;
+> +	refcount_set(&h->fs_bdev_passive, 1);
+> +	refcount_set(&h->fs_bdev_active, 1);
+> +
+> +	err = rhltable_insert(&fs_bdev_supers, &h->node, fs_bdev_params);
+
+[Severity: High]
+Is there a Time-of-Check to Time-of-Use (TOCTOU) race here since the lookup
+happens without mutual exclusion?
+
+Because the RCU read lock is dropped before memory allocation and insertion,
+could two threads concurrently opening a block device for the same superblock
+both fail the lookup and insert a new entry into the hash table?
+
+This might result in duplicate rhltable nodes for the same device and
+superblock, which could cause iterators to execute multiple times on the
+same superblock.
+
+> +	if (err) {
+> +		kfree(h);
+> +		return err;
+> +	}
+[ ... ]
+> +void fs_bdev_file_release(struct file *bdev_file, struct super_block *sb)
+> +{
+> +	dev_t dev = file_bdev(bdev_file)->bd_dev;
+> +	struct fs_bdev_holder *h, *found = NULL;
+> +	struct rhlist_head *list, *pos;
+> +
+> +	rcu_read_lock();
+> +	list = rhltable_lookup(&fs_bdev_supers, &dev, fs_bdev_params);
+> +	rhl_for_each_entry_rcu(h, pos, list, node) {
+> +		if (h->sb != sb)
+> +			continue;
+> +		/* At most one entry per (dev, sb); the last claim drops the bias. */
+> +		if (refcount_dec_and_test(&h->fs_bdev_active))
+> +			found = h;
+> +		break;
+
+[Severity: High]
+Does the unconditional break here prevent the loop from finding the correct
+active claim if duplicate or logically dead entries exist?
+
+If the hash bucket contains multiple entries for the same device and
+superblock (which can happen due to a race during registration or deferred
+unlinking), rhltable_insert() links duplicate keys by appending them.
+
+Could this cause the loop to hit the older, logically dead entry first
+(where fs_bdev_active is 0), triggering a decrement hit 0 warning, and
+exiting the loop before reaching the live entry? This would leave the live
+entry leaked and permanently pin the superblock.
+
+> +	}
+> +	rcu_read_unlock();
+> +	if (found)
+> +		fs_bdev_holder_put(found);
+> +	bdev_fput(bdev_file);
+> +}
+> +EXPORT_SYMBOL_GPL(fs_bdev_file_release);
+[ ... ]
+> @@ -1634,7 +1808,7 @@ int setup_bdev_super(struct super_block *sb, int sb_flags,
+>  	if (atomic_read(&bdev->bd_fsfreeze_count) > 0) {
+>  		if (fc)
+>  			warnf(fc, "%pg: Can't mount, blockdev is frozen", bdev);
+> -		bdev_fput(bdev_file);
+> +		fs_bdev_file_release(bdev_file, sb);
+>  		return -EBUSY;
+>  	}
+
+[Severity: Critical]
+This isn't a bug introduced by this patch, but is there a pre-existing
+double release of the file structure in this error path?
+
+If the block device is frozen, it calls fs_bdev_file_release() and returns
+-EBUSY. However, if the superblock device pointers (s_bdev and s_bdev_file)
+were already populated earlier in this function, the VFS teardown path will
+eventually reach kill_block_super():
+
+fs/super.c:kill_block_super() {
+    ...
+    if (bdev) {
+        sync_blockdev(bdev);
+        fs_bdev_file_release(sb->s_bdev_file, sb);
+    }
+}
+
+Since the device was already recorded in the superblock, does this cause a
+second release of the file structure, leading to a Use-After-Free of the file
+and block device memory?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260602-work-super-bdev_holder_global-v1-0-bb0fd82f3861@kernel.org?part=2
+

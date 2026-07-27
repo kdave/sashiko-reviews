@@ -1,0 +1,77 @@
+From sashiko-bot@kernel.org Mon Jul 20 08:41:07 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: retry verity reads for not-uptodate Merkle
+ folios
+Date: Mon, 20 Jul 2026 06:41:05 +0000
+Message-Id: <20260720064105.8DD701F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] On 32-bit Highmem systems, `folio_address()` can return NULL, causing `read_key_bytes()` to silently skip copying data, underflow the length counter, and return an uninitialized folio.
+--
+
+--- Patch [1]: [PATCH v3] btrfs: retry verity reads for not-uptodate Merkle folios ---
+commit 020ab4f62b19625c71defa9a4aa7f65972aef903
+Author: Yichong Chen <chenyichong@uniontech.com>
+
+btrfs: retry verity reads for not-uptodate Merkle folios
+
+This commit updates btrfs_read_merkle_tree_page() to retry the Merkle item
+read when a not-uptodate folio is found in the mapping. This prevents
+transient read failures from remaining sticky in the page cache.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index 983365a735416..25f021b04ce40 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+> [ ... ]
+> @@ -744,6 +747,7 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  		return ERR_PTR(ret);
+>  	}
+>  
+> +read_folio:
+>  	/*
+>  	 * Merkle item keys are indexed from byte 0 in the merkle tree.
+>  	 * They have the form:
+> @@ -753,6 +757,7 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  	ret = read_key_bytes(BTRFS_I(inode), BTRFS_VERITY_MERKLE_ITEM_KEY, off,
+>  			     folio_address(folio), PAGE_SIZE, folio);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but on 32-bit systems with
+highmem, does passing folio_address(folio) as the dest parameter break the
+read?
+
+folio_address() can return NULL for unmapped highmem folios. When it does,
+read_key_bytes() treats the NULL dest as a flag to only calculate the size
+without copying any data:
+
+fs/btrfs/verity.c:read_key_bytes() {
+...
+        /* desc = NULL to just sum all the item lengths */
+        if (!dest)
+                copy_end = item_end;
+        else
+                copy_end = min(offset + len, item_end);
+...
+}
+
+This skips the kmap_local_folio() block and data copy, leaving the folio
+uninitialized. It also causes the subsequent len -= copy_bytes to underflow
+the unsigned len variable, leading to an infinite loop over all b-tree items
+for the inode.
+
+Could we fix this by passing a dummy non-NULL value for dest, or by changing
+read_key_bytes() to check dest_folio != NULL instead of dest != NULL for
+the skipping behavior?
+
+>  	if (ret < 0) {
+> +		folio_unlock(folio);
+>  		folio_put(folio);
+>  		return ERR_PTR(ret);
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260720062820.1386340-1-chenyichong@uniontech.com?part=1
+

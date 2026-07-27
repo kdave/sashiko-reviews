@@ -1,0 +1,74 @@
+From sashiko-bot@kernel.org Tue Jul 21 22:18:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 13/23] xfs: handle fsverity I/O in write/read path
+Date: Tue, 21 Jul 2026 20:18:46 +0000
+Message-Id: <20260721201846.98DCE1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] IOMAP_F_FSVERITY is not propagated to srcmap during COW buffered writes in the non-zoned path, causing fsverity metadata to be mistakenly zeroed instead of read.
+--
+
+--- Patch [13]: [PATCH v13 13/23] xfs: handle fsverity I/O in write/read path ---
+commit 1346ac59338bd35092b0e69e62cb57a1650e100d
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: handle fsverity I/O in write/read path
+
+This commit adds IOMAP_F_FSVERITY support to XFS to handle reading and writing
+fsverity metadata past EOF without updating the inode size or skipping folios.
+It updates iomap begin and writepage functions to set this flag during
+fsverity construction.
+
+> diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+> index 225c3de88d03b..a4d5656619893 100644
+> --- a/fs/xfs/xfs_iomap.c
+> +++ b/fs/xfs/xfs_iomap.c
+[ ... ]
+> @@ -1803,9 +1811,12 @@ xfs_buffered_write_iomap_begin(
+>  	if (xfs_is_shutdown(mp))
+>  		return -EIO;
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: High]
+Does this code miss propagating IOMAP_F_FSVERITY to srcmap during COW
+buffered writes in the non-zoned path?
+
+When evaluating the COW path later in xfs_buffered_write_iomap_begin(),
+srcmap is populated with the data fork extent via xfs_bmbt_to_iomap():
+
+fs/xfs/xfs_iomap.c:xfs_buffered_write_iomap_begin() {
+    ...
+found_cow:
+	if (imap.br_startoff <= offset_fsb) {
+		error = xfs_bmbt_to_iomap(ip, srcmap, &imap, flags, 0,
+				xfs_iomap_inode_sequence(ip, 0));
+    ...
+}
+
+Because a hardcoded 0 is passed instead of iomap_flags, IOMAP_F_FSVERITY is
+dropped from srcmap.
+
+On always_cow mounts or if pre-existing COW extents are found, this can
+cause iomap_block_needs_zeroing() to evaluate
+srcmap->flags & IOMAP_F_FSVERITY as false. Since the write is past
+i_size_read, it returns true, skipping the disk read and zeroing the
+folio instead.
+
+Could this regression overwrite valid on-disk data with zeroes when a
+sub-folio write occurs (e.g., due to page eviction and subsequent
+read-modify-write)?
+
+>  	if (xfs_is_zoned_inode(ip))
+>  		return xfs_zoned_buffered_write_iomap_begin(inode, offset,
+> -				count, flags, iomap, srcmap);
+> +				count, flags, iomap, srcmap, iomap_flags);
+>  
+>  	/* we can't use delayed allocations when using extent size hints */
+>  	if (xfs_get_extsz_hint(ip))
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=13
+

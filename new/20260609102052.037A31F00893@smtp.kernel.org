@@ -1,0 +1,89 @@
+From sashiko-bot@kernel.org Tue Jun  9 12:20:54 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: disable v1 space cache
+Date: Tue, 09 Jun 2026 10:20:51 +0000
+Message-Id: <20260609102052.037A31F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Aliasing the legacy 'space_cache' and 'space_cache=v1' mount options to 'nospace_cache' silently and permanently destroys existing on-disk space caches, causing severe performance regressions.
+--
+
+commit de064389ac0f99cc205c2a5989d6cef7c032bb43
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: disable v1 space cache
+
+This commit deprecates the v1 space cache by modifying the mount option
+parser. It makes the "space_cache" and "space_cache=v1" options fall back
+to "nospace_cache" to prevent forcing v1 cache usage.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index b26aa9169e838..b9da2007ad4c8 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+
+[ ... ]
+
+> @@ -512,19 +512,20 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+>  		btrfs_clear_opt(ctx->mount_opt, NODISCARD);
+>  		break;
+>  	case Opt_space_cache:
+> -		if (result.negated) {
+> -			btrfs_set_opt(ctx->mount_opt, NOSPACECACHE);
+> -			btrfs_clear_opt(ctx->mount_opt, SPACE_CACHE);
+> -			btrfs_clear_opt(ctx->mount_opt, FREE_SPACE_TREE);
+> -		} else {
+> -			btrfs_clear_opt(ctx->mount_opt, FREE_SPACE_TREE);
+> -			btrfs_set_opt(ctx->mount_opt, SPACE_CACHE);
+> -		}
+> +		if (!result.negated)
+> +			btrfs_warn(NULL,
+> +				   "v1 space cache is deprecated, falling back to no space cache");
+> +		btrfs_set_opt(ctx->mount_opt, NOSPACECACHE);
+
+[Severity: High]
+Will setting NOSPACECACHE here actively destroy existing space caches
+on disk?
+
+Since space_cache was the standard recommended mount option for a long time,
+many users still have it in their /etc/fstab.
+
+In fs/btrfs/disk-io.c:btrfs_start_pre_rw_mount(), setting NOSPACECACHE
+acts as an active command to delete the free space trees:
+
+    if (btrfs_fs_compat_ro(fs_info, FREE_SPACE_TREE) &&
+        !btrfs_test_opt(fs_info, FREE_SPACE_TREE)) {
+            btrfs_info(fs_info, "disabling free space tree");
+            ret = btrfs_delete_free_space_tree(fs_info);
+    ...
+
+Could this cause severe performance regressions for users booting this
+kernel by silently deleting their existing space caches?
+
+Would it be safer to simply ignore the option (e.g., clear SPACE_CACHE and
+FREE_SPACE_TREE but NOT set NOSPACECACHE) so it falls back to the existing
+on-disk cache?
+
+> +		btrfs_clear_opt(ctx->mount_opt, SPACE_CACHE);
+> +		btrfs_clear_opt(ctx->mount_opt, FREE_SPACE_TREE);
+>  		break;
+>  	case Opt_space_cache_version:
+>  		switch (result.uint_32) {
+>  		case Opt_space_cache_v1:
+> -			btrfs_set_opt(ctx->mount_opt, SPACE_CACHE);
+> +			btrfs_warn(NULL,
+> +				   "v1 space cache is deprecated, falling back to no space cache");
+> +			btrfs_set_opt(ctx->mount_opt, NOSPACECACHE);
+
+[Severity: High]
+Similar to the above, does aliasing space_cache=v1 to NOSPACECACHE run the
+risk of actively destroying the cache rather than just passively
+deprecating the mount option?
+
+> +			btrfs_clear_opt(ctx->mount_opt, SPACE_CACHE);
+>  			btrfs_clear_opt(ctx->mount_opt, FREE_SPACE_TREE);
+>  			break;
+>  		case Opt_space_cache_v2:
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/0884d7707a725ce5a41ea3931d65dabc76a5c864.1780999298.git.wqu@suse.com?part=1
+

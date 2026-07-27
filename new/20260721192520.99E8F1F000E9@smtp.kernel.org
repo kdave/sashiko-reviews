@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Tue Jul 21 21:25:23 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 01/23] fsverity: report validation errors through
+ fserror to fsnotify
+Date: Tue, 21 Jul 2026 19:25:20 +0000
+Message-Id: <20260721192520.99E8F1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] ABBA deadlock between fsverity read completion, fserror_worker, and inode eviction.
+--
+
+--- Patch [1]: [PATCH v13 01/23] fsverity: report validation errors through fserror to fsnotify ---
+commit 95ebb34df74492b2d41c145363a2ee53db9b3001
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+fsverity: report validation errors through fserror to fsnotify
+
+This commit reports verification errors to fsnotify through the recently
+added fserror interface.
+
+> diff --git a/fs/verity/verify.c b/fs/verity/verify.c
+> index 4004a1d428751..db8c350234bb7 100644
+> --- a/fs/verity/verify.c
+> +++ b/fs/verity/verify.c
+> @@ -9,6 +9,7 @@
+>  
+>  #include <linux/bio.h>
+>  #include <linux/export.h>
+> +#include <linux/fserror.h>
+>  
+>  #define FS_VERITY_MAX_PENDING_BLOCKS 2
+>  
+> @@ -205,6 +206,8 @@ static bool verify_data_block(struct fsverity_info *vi,
+>  		if (memchr_inv(dblock->data, 0, params->block_size)) {
+>  			fsverity_err(inode,
+>  				     "FILE CORRUPTED!  Data past EOF is not zeroed");
+> +			fserror_report_data_lost(inode, data_pos,
+> +						 params->block_size, GFP_NOFS);
+
+[Severity: High]
+Could this lead to a deadlock between the fsverity read completion worker
+and the fserror_worker?
+
+When an fsverity file has corrupted blocks, the read completion verity worker
+holds the folio lock and calls fserror_report_data_lost(), which allocates
+from a mempool. If the pool is exhausted by concurrent errors, the verity
+worker will block waiting for an element while still holding the folio lock.
+
+Meanwhile, fserror_worker processes the queued events and calls iput() on
+the inode before freeing the event. If the file has been unlinked and this
+is the final reference, iput() triggers synchronous eviction:
+
+fserror_worker()
+  -> iput(event->inode)
+    -> evict_inode()
+      -> truncate_inode_pages_final() (waits on the locked folio)
+  -> fserror_free_event() (never reached)
+  
+Because the fserror_worker blocks in eviction waiting on the folio lock
+held by the verity worker, it cannot reach fserror_free_event() to replenish
+the mempool. The verity worker is in turn blocked waiting for the mempool,
+resulting in a deadlock.
+
+>  			return false;
+>  		}
+>  		return true;
+> @@ -312,6 +315,7 @@ static bool verify_data_block(struct fsverity_info *vi,
+>  		data_pos, level - 1, params->hash_alg->name, hsize, want_hash,
+>  		params->hash_alg->name, hsize,
+>  		level == 0 ? dblock->real_hash : real_hash);
+> +	fserror_report_data_lost(inode, data_pos, params->block_size, GFP_NOFS);
+>  error:
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=1
+

@@ -1,0 +1,74 @@
+From sashiko-bot@kernel.org Thu Jun 11 23:36:06 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: validate root ref item size and name length
+Date: Thu, 11 Jun 2026 21:36:03 +0000
+Message-Id: <20260611213603.E0F751F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Pre-existing stack buffer overflow in btrfs_get_name due to missing name_len limit check in check_inode_ref and check_inode_extref.
+--
+
+commit 568589a4eed3d9864f054b259ff9e0808033ca06
+Author: Kyle Zeng <kylebot@openai.com>
+
+btrfs: validate root ref item size and name length
+
+ROOT_REF and ROOT_BACKREF items contain a struct btrfs_root_ref followed
+by one variable-length name. This commit adds root ref validation to the
+tree checker before other Btrfs code consumes them. It rejects items that
+are too small, names larger than BTRFS_NAME_LEN, and sizes that do not
+match the expected size.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 1f15d0793a9c9..fb072045ca183 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -1915,6 +1915,40 @@ static int check_inode_extref(struct extent_buffer *leaf,
+>  	return 0;
+>  }
+>  
+
+[Severity: Critical]
+This is a pre-existing issue, but while adding the bounds check for root ref
+names, does check_inode_ref() and check_inode_extref() in
+fs/btrfs/tree-checker.c have a similar vulnerability?
+
+The tree checker currently validates that the namelen fits within the item
+boundary, but does not verify that the length is within BTRFS_NAME_LEN:
+
+fs/btrfs/tree-checker.c:check_inode_extref() {
+    ...
+    namelen = btrfs_inode_extref_name_len(leaf, extref);
+    if (unlikely(ptr + sizeof(*extref) + namelen > end)) {
+    ...
+}
+
+If a maliciously crafted image contains an inode reference with a large
+namelen (e.g., up to the leaf size), could this overflow the 256-byte stack
+buffer in exportfs_get_name() when exported via NFS?
+
+fs/btrfs/export.c:btrfs_get_name() {
+    ...
+    read_extent_buffer(leaf, name, name_ptr, name_len);
+
+    /*
+     * have to add the null termination to make sure that reconnect_path
+     * gets the right len for strlen
+     */
+    name[name_len] = '\0';
+    ...
+}
+
+Since name points to a local fixed-size array in the caller, it seems an
+unchecked namelen here could lead to a stack buffer overflow.
+
+> +static int check_root_ref(struct extent_buffer *leaf, int slot)
+> +{
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260611212445.4848-1-kylebot@openai.com?part=1
+

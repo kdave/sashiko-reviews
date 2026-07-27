@@ -1,0 +1,106 @@
+From sashiko-bot@kernel.org Tue Jul 14 13:43:29 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix a lockdep caused by path resolution
+ during device scan
+Date: Tue, 14 Jul 2026 11:43:23 +0000
+Message-Id: <20260714114324.685871F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [High] Block device renames are ignored, leaving stale paths that cause mount failures because the simple `dev_t` check replaced `is_same_device()`.
+- [Medium] The logic for updating the device path of a mounted device contains structurally unreachable dead code due to a redundant and tautological condition.
+
+Pre-existing issues:
+- [Critical] Unprotected traversal of RCU list fs_devices->devices leads to use-after-free.
+--
+
+--- Patch [1]: [PATCH v2] btrfs: fix a lockdep caused by path resolution during device scan ---
+commit fb77001c4d85cb8bcb039a04e6326c55bd12694b
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: fix a lockdep caused by path resolution during device scan
+
+This commit avoids a full path lookup during device scan by comparing the
+device dev_t instead. This prevents a circular locking dependency between
+device_list_mutex and the VFS inode locks during kern_path().
+
+Link: https://lore.kernel.org/linux-btrfs/5a9d9847-4ae6-43c4-afdc-6e5fa51d6117@linux.ibm.com/
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 6eab4cc73ce44..8bcc6cb837695 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+
+[ ... ]
+
+> @@ -895,7 +860,7 @@ static noinline struct btrfs_device *device_list_add(const char *path,
+>  				MAJOR(path_devt), MINOR(path_devt),
+>  				current->comm, task_pid_nr(current));
+>  
+> -	} else if (!device->name || !is_same_device(device, path)) {
+> +	} else if (!device->name || device->devt != path_devt) {
+
+[Severity: High]
+Does changing this to a simple dev_t check break block device rename
+tracking?
+
+If a block device node is renamed or moved (e.g. via udev symlink changes
+or LVM lvrename) and the old path is deleted, the new path will still have
+the same dev_t.
+
+Because device->devt == path_devt in this scenario, the condition evaluates
+to false, and device_list_add() will skip updating device->name to the new
+path. During a subsequent mount, will btrfs_open_devices() fail with -ENOENT
+when it tries to open the cached, stale path?
+
+[Severity: Medium]
+Does this change also introduce unreachable code for mounted devices later in
+this same block?
+
+For a mounted device, device->name is non-NULL, so we only enter this
+if-block when device->devt != path_devt.
+
+Later in this block in device_list_add(), the code does:
+
+    if (device->bdev) {
+        if (device->devt != path_devt) {
+            mutex_unlock(&fs_devices->device_list_mutex);
+            btrfs_warn(NULL, ... duplicate device ...);
+            return ERR_PTR(-EEXIST);
+        }
+        btrfs_info(NULL, "devid %llu device path %s changed to %s ...
+
+Since device->bdev is true for mounted devices, and we only entered the
+outer block because device->devt != path_devt, the inner condition is
+mathematically guaranteed to be true.
+
+Will this unconditionally return -EEXIST, making the btrfs_info() log and
+the subsequent path replacement logic completely unreachable dead code?
+
+>  		const char *old_name;
+>  
+>  		/*
+
+[Severity: Critical]
+This isn't a bug introduced by this patch, but there appears to be an RCU
+list traversal issue in find_fsid_by_device() which is called by
+device_list_add() during the device scan.
+
+In fs/btrfs/volumes.c:find_fsid_by_device():
+
+    list_for_each_entry(device, &devt_fs_devices->devices, dev_list) {
+        if (device->devt == devt) {
+
+The devt_fs_devices->devices list is RCU-protected, with elements freed
+after an RCU grace period via synchronize_rcu() in btrfs_rm_device().
+
+Since find_fsid_by_device() iterates this list using the non-RCU-safe
+list_for_each_entry() instead of list_for_each_entry_rcu(), and does so
+without holding rcu_read_lock() or the device_list_mutex, could a
+concurrent device removal result in a use-after-free when the freed
+device pointer is dereferenced?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/49654338e775adb4b40124ea5a3abeb0dc6fdb42.1784027853.git.wqu@suse.com?part=1
+

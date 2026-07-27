@@ -1,0 +1,56 @@
+From sashiko-bot@kernel.org Tue Jun 16 02:06:38 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: log swapfile activation/deactivation and warn
+ about pinned block groups
+Date: Tue, 16 Jun 2026 00:06:35 +0000
+Message-Id: <20260616000635.A504E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Unpaired increment of block group `swap_extents` counter permanently pins the block group if `btrfs_add_swapfile_pin` fails.
+--
+
+commit 7d924bc4c69260ee660a544868b0a15ee8d2936d
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: log swapfile activation/deactivation and warn about pinned block groups
+
+This commit adds logging for swapfile activation and deactivation on btrfs.
+It prints warnings that block groups with swapfile extents won't be scrubbed
+or balanced, and logs the size and number of pinned block groups.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 509042adee078..63775be2c7416 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -10554,6 +10567,9 @@ static int btrfs_swap_activate(struct swap_info_struct *sis, struct file *file,
+>  				ret = 0;
+>  			else
+>  				goto out;
+
+[Severity: High]
+This is a pre-existing issue, but if btrfs_add_swapfile_pin() fails here,
+does this error path leak the bg->swap_extents counter?
+
+The counter is incremented via btrfs_inc_block_group_swap_extents(bg) prior
+to calling btrfs_add_swapfile_pin(). If btrfs_add_swapfile_pin() returns an
+error (e.g. -ENOMEM) and the code jumps to out, btrfs_swap_deactivate() is
+invoked for cleanup.
+
+Since btrfs_swap_deactivate() iterates over fs_info->swapfile_pins to
+decrement swap_extents, and this block group was never added to the tree
+due to the failure, the counter isn't decremented. Could this permanently
+pin the block group until unmount?
+
+> +		} else {
+> +			pinned_bg_size += bg->length;
+> +			pinned_bg_nr++;
+>  		}
+>  
+>  		if (bsi.block_len &&
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/19331955f516f43fd8da4bae49c7aaaea07e2379.1781567582.git.wqu@suse.com?part=1
+

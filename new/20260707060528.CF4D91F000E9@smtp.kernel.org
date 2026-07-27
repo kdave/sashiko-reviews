@@ -1,0 +1,94 @@
+From sashiko-bot@kernel.org Tue Jul  7 08:05:30 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: add verity Merkle folio to page cache after
+ reading it
+Date: Tue, 07 Jul 2026 06:05:28 +0000
+Message-Id: <20260707060528.CF4D91F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Data corruption and integer underflow on 32-bit HIGHMEM systems due to `folio_address()` returning NULL.
+--
+
+--- Patch [1]: [PATCH v2] btrfs: add verity Merkle folio to page cache after reading it ---
+commit e39437b5dba9a5b50007c21ad254c7dff0ac0e30
+Author: Yichong Chen <chenyichong@uniontech.com>
+
+btrfs: add verity Merkle folio to page cache after reading it
+
+This commit avoids installing the folio in the page cache until after the
+Merkle tree read has succeeded. This keeps the failure path simple and prevents
+later reads from finding a locked, not-uptodate folio if read_key_bytes()
+fails.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index 983365a735416..d705ce3b386a4 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+[ ... ]
+> @@ -759,6 +750,15 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  	if (ret < PAGE_SIZE)
+>  		folio_zero_segment(folio, ret, PAGE_SIZE);
+>  
+
+[Severity: High]
+This is a pre-existing issue, but can this lead to data corruption on 32-bit
+HIGHMEM systems?
+
+On systems with CONFIG_HIGHMEM, the folio allocated by filemap_alloc_folio()
+can be a highmem folio, in which case folio_address(folio) returns NULL.
+
+When NULL is passed as the dest parameter to read_key_bytes() just before this
+folio_zero_segment() call:
+
+    ret = read_key_bytes(BTRFS_I(inode), BTRFS_VERITY_MERKLE_ITEM_KEY, off,
+                         folio_address(folio), PAGE_SIZE, folio);
+
+It triggers the !dest fallback path intended for dry-run length calculations
+in read_key_bytes():
+
+fs/btrfs/verity.c:read_key_bytes() {
+    ...
+		/* desc = NULL to just sum all the item lengths */
+		if (!dest)
+			copy_end = item_end;
+		else
+			copy_end = min(offset + len, item_end);
+    ...
+		if (dest) {
+			if (dest_folio)
+				kaddr = kmap_local_folio(dest_folio, 0);
+
+			data = btrfs_item_ptr(leaf, path->slots[0], void);
+			read_extent_buffer(leaf, kaddr + dest_offset,
+					   (unsigned long)data + copy_offset,
+					   copy_bytes);
+    ...
+}
+
+This skips the kmap_local_folio() and data copy block entirely. Additionally,
+because copy_end is not clamped to len when dest is NULL, copy_bytes can
+exceed len, causing the unsigned len variable to underflow and creating an
+unbounded loop iterating over the btree.
+
+Ultimately, the function returns success without copying any data, leaving the
+uninitialized folio to be marked uptodate and inserted into the page cache,
+which could break fs-verity and potentially expose uninitialized memory.
+
+
+> +	ret = filemap_add_folio(inode->i_mapping, folio, index, GFP_NOFS);
+> +	if (ret) {
+> +		folio_put(folio);
+> +		/* Did someone else insert a folio here? */
+> +		if (ret == -EEXIST)
+> +			goto again;
+> +		return ERR_PTR(ret);
+> +	}
+> +
+>  	folio_mark_uptodate(folio);
+>  	folio_unlock(folio);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260707055517.570586-1-chenyichong@uniontech.com?part=1
+

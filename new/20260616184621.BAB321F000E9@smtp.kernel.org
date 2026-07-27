@@ -1,0 +1,66 @@
+From sashiko-bot@kernel.org Tue Jun 16 20:46:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: emit BTRFS_SEND_C_FILEATTR during full mode
+Date: Tue, 16 Jun 2026 18:46:21 +0000
+Message-Id: <20260616184621.BAB321F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Emitting BTRFS_SEND_C_FILEATTR before BTRFS_SEND_C_UTIMES and child creation causes btrfs receive to fail with -EPERM on immutable/append-only inodes.
+--
+
+commit ed701a8c63b980518e626d0326f309b2561fad87
+Author: Mateusz Poliwczak <mpoliwczak34@gmail.com>
+Subject: btrfs: emit BTRFS_SEND_C_FILEATTR during full mode
+
+This patch modifies the btrfs send mechanism to emit BTRFS_SEND_C_FILEATTR
+during full sends and for newly created inodes. Previously, this attribute
+was only emitted during incremental sends when file attributes changed
+between snapshots.
+
+> diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+> --- a/fs/btrfs/send.c
+> +++ b/fs/btrfs/send.c
+> @@ -6575,8 +6575,10 @@ static int finish_inode_if_needed(struct send_ctx *sctx, bool at_end)
+>  
+>  	if (!sctx->parent_root || sctx->cur_inode_new) {
+>  		need_chown = true;
+> -		if (!S_ISLNK(sctx->cur_inode_mode))
+> +		if (!S_ISLNK(sctx->cur_inode_mode)) {
+>  			need_chmod = true;
+> +			need_fileattr = true;
+> +		}
+
+[Severity: High]
+This is a pre-existing issue, but does forcing need_fileattr = true here
+break receiving full snapshots that contain immutable files or directories?
+
+Looking at finish_inode_if_needed(), send_fileattr() is called when
+need_fileattr is true:
+
+	if (need_fileattr) {
+		ret = send_fileattr(sctx, sctx->cur_ino, sctx->cur_inode_gen,
+				    left_fileattr);
+		...
+	}
+
+For regular files, send_utimes() is emitted shortly after this:
+
+		if (S_ISDIR(sctx->cur_inode_mode) && sctx->cur_inode_size > 0)
+			ret = cache_dir_utimes(sctx, sctx->cur_ino, ...);
+		else
+			ret = send_utimes(sctx, sctx->cur_ino, sctx->cur_inode_gen);
+
+If the fileattr contains restrictive flags like FS_IMMUTABLE_FL
+(BTRFS_INODE_IMMUTABLE), will the receiving side apply this attribute
+immediately, causing the subsequent utimes update to fail with -EPERM?
+
+Similarly, for directories, the sender finishes the parent directory and
+emits its file attributes before processing its child inodes. If the
+directory is made immutable at this point, will creating children inside it
+on the receiver also fail with -EPERM?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616183721.1400225-1-mpoliwczak34@gmail.com?part=1
+

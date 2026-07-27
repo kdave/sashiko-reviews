@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Thu Jul 16 10:43:13 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: skip fully truncated ordered extents at
+ zone finish
+Date: Thu, 16 Jul 2026 08:38:27 +0000
+Message-Id: <20260716083828.579DF1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] btrfs_finish_ordered_zoned() reads past the end of ordered->csum_list for partially truncated ordered extents.
+--
+
+--- Patch [1]: [PATCH] btrfs: zoned: skip fully truncated ordered extents at zone finish ---
+commit 68cc041d6c1580b4445e921a41533946b4c000e9
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: skip fully truncated ordered extents at zone finish
+
+This commit fixes an assertion failure in btrfs_finish_ordered_zoned() by
+returning early for fully truncated ordered extents. Since short or cancelled
+direct IO writes can finish the extent as truncated instead of setting an IO
+error, they reach this function with an empty csum_list.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2138,6 +2138,16 @@ void btrfs_finish_ordered_zoned(struct btrfs_ordered_extent *ordered)
+>  	if (test_bit(BTRFS_ORDERED_PREALLOC, &ordered->flags))
+>  		return;
+>  
+> +	/*
+> +	 * A fully truncated ordered extent wrote no data and so has
+> +	 * no zone append result to record.
+> +	 */
+> +	if (test_bit(BTRFS_ORDERED_TRUNCATED, &ordered->flags) &&
+> +	    ordered->truncated_len == 0) {
+> +		ASSERT(list_empty(&ordered->csum_list));
+> +		return;
+> +	}
+> +
+
+[Severity: High]
+This is a pre-existing issue, but since this patch handles fully truncated
+ordered extents, does it leave partially truncated extents vulnerable in
+btrfs_finish_ordered_zoned()?
+
+If an ordered extent is partially truncated (truncated_len is greater than
+zero but less than disk_num_bytes), the csum_list will only contain sums
+up to truncated_len.
+
+However, the loop immediately following this block uses disk_num_bytes for
+its bounds check:
+
+	while (len < ordered->disk_num_bytes) {
+		sum = list_next_entry(sum, list);
+		...
+	}
+
+If csum_list is exhausted before len reaches disk_num_bytes,
+list_next_entry() will return the list head. This would cause sum->logical
+and sum->len to be read from out-of-bounds memory, passing garbage data
+into btrfs_zoned_split_ordered().
+
+Could this be triggered during normal filesystem operations if page cache
+invalidation intersects with writeback, creating a partially truncated
+ordered extent?
+
+>  	ASSERT(!list_empty(&ordered->csum_list));
+>  	sum = list_first_entry(&ordered->csum_list, struct btrfs_ordered_sum, list);
+>  	logical = sum->logical;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260716082312.1252174-1-johannes.thumshirn@wdc.com?part=1
+

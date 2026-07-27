@@ -1,0 +1,50 @@
+From sashiko-bot@kernel.org Thu Jun  4 02:42:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 3/3] btrfs: retry faulting in the pages after a zero
+ sized short direct write
+Date: Thu, 04 Jun 2026 00:42:57 +0000
+Message-Id: <20260604004257.B1FCD1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] The relaxed retry condition introduces an unnecessary extra DIO attempt for compressed and inline extents, doubling their setup overhead.
+--
+
+commit 4cb9ee177655a8e298c5bd2be0df885966a0aa32
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: retry faulting in the pages after a zero sized short direct write
+
+This commit modifies the direct I/O write path to retry page faulting even
+after a zero-sized short write. By relaxing the retry condition, it reduces
+the chance of unnecessarily falling back to buffered IO when the first page
+cannot be faulted in.
+
+> diff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c
+> --- a/fs/btrfs/direct-io.c
+> +++ b/fs/btrfs/direct-io.c
+> @@ -978,7 +978,7 @@ ssize_t btrfs_direct_write(struct kiocb *iocb, struct iov_iter *from)
+>  	if (ret > 0)
+>  		written = ret;
+>  
+> -	if (iov_iter_count(from) > 0 && (ret == -EFAULT || ret > 0)) {
+> +	if (iov_iter_count(from) > 0 && (ret == -EFAULT || ret >= 0)) {
+
+[Severity: Medium]
+Does this change introduce a performance regression for compressed or inline
+extents?
+
+When btrfs_dio_iomap_begin() returns -ENOTBLK to intentionally reject direct
+I/O (such as for compressed or inline extents), __iomap_dio_rw() converts
+that error into a return value of 0.
+
+Since the condition is now relaxed to include ret >= 0, a ret == 0 from an
+-ENOTBLK fallback will trigger fault_in_iov_iter_readable() and jump back to
+the again: label.
+
+Can this result in a second pointless direct I/O attempt, re-acquiring locks
+and performing another B-tree extent lookup, only to fail with -ENOTBLK a
+second time before finally falling back to buffered I/O?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1780528155.git.wqu@suse.com?part=3
+

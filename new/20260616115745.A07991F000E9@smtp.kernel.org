@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Tue Jun 16 13:57:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 5/7] btrfs: don't leave dev-replace STARTED after an
+ early finishing failure
+Date: Tue, 16 Jun 2026 11:57:44 +0000
+Message-Id: <20260616115745.A07991F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The `dev_replace->replace_task` pointer is left dangling on early error returns, potentially causing a critical lock bypass, data race, and Use-After-Free/NULL pointer dereference upon task struct reuse.
+- [High] The device replace state is incorrectly persisted as FINISHED if target allocation state setup fails, corrupting the replace operation state machine.
+--
+
+commit 94e95549d4a76be064310f997fd7e597ea0bc49c
+Author: Christian Brauner <brauner@kernel.org>
+btrfs: don't leave dev-replace STARTED after an early finishing failure
+
+This patch ensures that btrfs_dev_replace_finishing() demotes the dev-replace
+state from STARTED to SUSPENDED when returning early due to failures in
+btrfs_start_delalloc_roots() or btrfs_start_transaction(). This prevents the
+operation from getting stuck in STARTED without an active scrub.
+
+Cc: stable@vger.kernel.org
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+
+[ ... ]
+
+> @@ -895,6 +910,7 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+>  	 */
+>  	ret = btrfs_start_delalloc_roots(fs_info, LONG_MAX, false);
+>  	if (ret) {
+> +		btrfs_dev_replace_set_suspended(fs_info);
+>  		mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+>  		return ret;
+>  	}
+
+[Severity: High]
+This isn't a bug introduced by this patch, but returning early here leaves the
+dev_replace->replace_task pointer dangling because it is not cleared.
+
+If the thread terminates and the slab allocator reuses its task_struct for a
+new thread performing btrfs I/O, btrfs_map_block() could match the
+replace_task pointer:
+
+if (dev_replace->replace_task != current)
+    down_read(&dev_replace->rwsem);
+
+Would this allow the new thread to bypass the read lock, potentially leading
+to a NULL pointer dereference on dev_replace->srcdev->devid if an administrator
+runs "btrfs replace cancel" while the rogue thread is executing?
+
+> @@ -908,6 +924,7 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+>  	while (1) {
+>  		trans = btrfs_start_transaction(root, 0);
+>  		if (IS_ERR(trans)) {
+> +			btrfs_dev_replace_set_suspended(fs_info);
+>  			mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+>  			return PTR_ERR(trans);
+>  		}
+
+[Severity: High]
+This is also a pre-existing issue, but further down in
+btrfs_dev_replace_finishing() the replace_state is eagerly set to FINISHED:
+
+	dev_replace->replace_state =
+		scrub_ret ? BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED
+			  : BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED;
+	...
+	dev_replace->item_needs_writeback = 1;
+
+Immediately after, if btrfs_set_target_alloc_state() fails, the code jumps
+to the error label:
+
+	if (!scrub_ret) {
+		scrub_ret = btrfs_set_target_alloc_state(src_device, tgt_device);
+		if (scrub_ret)
+			goto error;
+
+Since the error path does not revert replace_state back to CANCELED or
+SUSPENDED, and item_needs_writeback is already 1, will the next transaction
+commit permanently persist the FINISHED state to disk, even though the
+replacement was rolled back?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616-work-btrfs-preexisting-fixes-v1-0-c4abe2f6d4f0@kernel.org?part=5
+

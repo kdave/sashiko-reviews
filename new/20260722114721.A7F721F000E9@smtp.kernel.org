@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Wed Jul 22 13:47:26 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/4] btrfs: zoned: drop stranded dirty metadata buffers
+ at unmount
+Date: Wed, 22 Jul 2026 11:47:21 +0000
+Message-Id: <20260722114721.A7F721F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs_zoned_release_dirty_metadata() unconditionally clears the dirty state for all metadata extent buffers, rather than only those flagged with EXTENT_BUFFER_ZONED_ZEROOUT.
+--
+
+--- Patch [3]: [PATCH 3/4] btrfs: zoned: drop stranded dirty metadata buffers at unmount ---
+commit 38e081bb4622d9acfa9d7555d1e78115e831a283
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: drop stranded dirty metadata buffers at unmount
+
+This commit adds a call to btrfs_zoned_release_dirty_metadata() during
+unmount on zoned filesystems to drop stranded dirty metadata buffers from
+freed tree blocks. This prevents a hang in folio_wait_writeback() during
+the final iput() of the btree inode.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index e23273f6fca92..d4b91984c0a82 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -4525,6 +4525,13 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
+>  	free_root_pointers(fs_info, true);
+>  	btrfs_free_fs_roots(fs_info);
+>  
+> +	/*
+> +	 * Drop metadata left stranded ahead of a zone write pointer while the
+> +	 * endio workqueues are still up, so the final iput() of the btree inode
+> +	 * below does not hang submitting a write that can no longer complete.
+> +	 */
+> +	btrfs_zoned_release_dirty_metadata(fs_info);
+
+[Severity: High]
+Does this new call unconditionally clear the dirty state for all metadata
+extent buffers?
+
+Looking at btrfs_zoned_release_dirty_metadata() in fs/btrfs/extent_io.c, it
+appears to process every dirty extent buffer without checking if the
+EXTENT_BUFFER_ZONED_ZEROOUT bit is actually set:
+
+fs/btrfs/extent_io.c:btrfs_zoned_release_dirty_metadata() {
+    ...
+    while (buffer_tree_get_ebs_tag(fs_info, &index, ULONG_MAX,
+                                   PAGECACHE_TAG_DIRTY, &batch)) {
+        struct extent_buffer *eb;
+
+        while ((eb = eb_batch_next(&batch)) != NULL) {
+            btrfs_tree_lock(eb);
+            clear_bit(EXTENT_BUFFER_ZONED_ZEROOUT, &eb->bflags);
+            clear_extent_buffer_dirty(eb);
+            btrfs_tree_unlock(eb);
+        }
+    ...
+}
+
+Will exposing the normal unmount path to this unconditional clearing allow
+valid dirty data that failed to write to be silently dropped? 
+
+This seems like it would bypass the checks in
+invalidate_and_check_btree_folios() called immediately after this,
+potentially masking data loss or filesystem corruption bugs.
+
+> +
+>  	/*
+>  	 * We must make sure there is not any read request to
+>  	 * submit after we stop all workers.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260722113016.1896990-1-johannes.thumshirn@wdc.com?part=3
+

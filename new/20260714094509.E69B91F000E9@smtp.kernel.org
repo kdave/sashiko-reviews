@@ -1,0 +1,105 @@
+From sashiko-bot@kernel.org Tue Jul 14 11:45:12 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] block: do not warn when doing greedy allocation in
+ folio_alloc_greedy()
+Date: Tue, 14 Jul 2026 09:45:09 +0000
+Message-Id: <20260714094509.E69B91F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Malformed bio construction in bio_iov_iter_bounce_read() causes bio_iov_iter_align_down() to corrupt refcounts and leak pinned pages.
+- [High] Bounce folios are leaked when bio_iov_iter_align_down() drops bvecs or returns an error.
+--
+
+--- Patch [1]: [PATCH] block: do not warn when doing greedy allocation in folio_alloc_greedy() ---
+commit 8b0948e382d48bce83cc1d495d5d16f519c5f4e4
+Author: Qu Wenruo <wqu@suse.com>
+
+block: do not warn when doing greedy allocation in folio_alloc_greedy()
+
+This commit adds the __GFP_NOWARN flag to folio_alloc() inside
+folio_alloc_greedy() for high-order allocations. This prevents unnecessary
+allocation failure warnings since the function naturally retries with
+smaller orders on failure.
+
+> diff --git a/block/bio.c b/block/bio.c
+> index f2a5f4d0a9672..5ac954c70dd01 100644
+> --- a/block/bio.c
+> +++ b/block/bio.c
+> @@ -1285,7 +1285,8 @@ static struct folio *folio_alloc_greedy(gfp_t gfp, size_t *size,
+>  	struct folio *folio;
+>  
+>  	while (*size > minsize) {
+> -		folio = folio_alloc(gfp | __GFP_NORETRY, get_order(*size));
+> +		folio = folio_alloc(gfp | __GFP_NORETRY | __GFP_NOWARN,
+> +				    get_order(*size));
+>  		if (folio)
+>  			return folio;
+>  		*size = rounddown_pow_of_two(*size - 1);
+
+[ ... ]
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does the malformed bio
+construction in bio_iov_iter_bounce_read() cause bio_iov_iter_align_down()
+to corrupt refcounts and leak pinned pages?
+
+When an unaligned read triggers bio_iov_iter_bounce_read(), it places a
+kernel bounce folio at index 0 and user bvecs starting at index 1, while
+bio->bi_vcnt only tracks the number of user bvecs:
+
+block/bio.c:bio_iov_iter_bounce_read() {
+        bvec_set_folio(&bio->bi_io_vec[0], folio, bio->bi_iter.bi_size, 0);
+        if (iov_iter_extract_will_pin(iter))
+                bio_set_flag(bio, BIO_PAGE_PINNED);
+        return bio_iov_iter_align_down(bio, iter, minsize - 1);
+}
+
+It then calls bio_iov_iter_align_down(), which incorrectly assumes the bvecs
+occupy indices 0 through bi_vcnt - 1:
+
+block/bio.c:bio_iov_iter_align_down() {
+        struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
+
+        if (nbytes < bv->bv_len) {
+                bv->bv_len -= nbytes;
+                break;
+        }
+
+        if (bio_flagged(bio, BIO_PAGE_PINNED))
+                unpin_user_page(bv->bv_page);
+}
+
+Could this access the wrong index due to the missing offset? If bi_vcnt is
+1, it appears this would truncate the wrong bvec and incorrectly unpin the
+kernel bounce folio, corrupting its refcount.
+
+[Severity: High]
+This is a pre-existing issue, but do bounce folios leak when
+bio_iov_iter_align_down() drops bvecs or returns an error?
+
+If bio_iov_iter_align_down() drops all bvecs because the total length is
+less than minsize, it returns -EFAULT. Both bio_iov_iter_bounce_read() and
+bio_iov_iter_bounce_write() directly return this error:
+
+block/bio.c:bio_iov_iter_bounce_read() {
+        ...
+        return bio_iov_iter_align_down(bio, iter, minsize - 1);
+}
+
+block/bio.c:bio_iov_iter_bounce_write() {
+        ...
+        return bio_iov_iter_align_down(bio, iter, minsize - 1);
+}
+
+Since the caller will go to the error path and call bio_put() without
+freeing the attached folios, does this leak the kernel-allocated folios?
+
+Furthermore, if bio_iov_iter_align_down() succeeds but decrements bi_vcnt
+(dropping a bvec entirely), would the dropped folio also leak because
+bio_free_folios() only iterates up to the modified bi_vcnt?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/d10571445ee505d95ba6eaad7558fc1f556d2921.1784020005.git.wqu@suse.com?part=1
+

@@ -1,0 +1,77 @@
+From sashiko-bot@kernel.org Wed Jul 22 05:08:13 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4] btrfs: retry verity reads for not-uptodate Merkle
+ folios
+Date: Wed, 22 Jul 2026 03:08:10 +0000
+Message-Id: <20260722030810.C1F841F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Uninitialized memory is incorrectly marked as uptodate due to skipped copying for highmem folios, causing fs-verity to deterministically fail.
+--
+
+--- Patch [1]: [PATCH v4] btrfs: retry verity reads for not-uptodate Merkle folios ---
+commit 84328df3577e25396473ce1b40fc8ab693b49c6a
+Author: Yichong Chen <chenyichong@uniontech.com>
+
+btrfs: retry verity reads for not-uptodate Merkle folios
+
+This patch modifies btrfs_read_merkle_tree_page() to retry reading the Merkle
+item when a not-uptodate folio is found in the mapping, instead of returning
+an error. It also unlocks the folio on read_key_bytes() failure so a later
+caller can retry the read.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index 983365a735416..1133a56c0568b 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+[ ... ]
+> @@ -744,6 +748,7 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  		return ERR_PTR(ret);
+>  	}
+>  
+> +read_folio:
+>  	/*
+>  	 * Merkle item keys are indexed from byte 0 in the merkle tree.
+>  	 * They have the form:
+> @@ -753,6 +758,7 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  	ret = read_key_bytes(BTRFS_I(inode), BTRFS_VERITY_MERKLE_ITEM_KEY, off,
+>  			     folio_address(folio), PAGE_SIZE, folio);
+
+[Severity: High]
+This is a pre-existing issue, but does passing folio_address(folio) as the
+dest pointer cause problems for highmem folios?
+
+On 32-bit highmem systems, folio_address() evaluates to NULL for highmem
+folios. Looking at read_key_bytes(), if dest is NULL, it skips the memory
+mapping and copying logic entirely:
+
+fs/btrfs/verity.c:read_key_bytes() {
+    ...
+		/* desc = NULL to just sum all the item lengths */
+		if (!dest)
+			copy_end = item_end;
+    ...
+		if (dest) {
+			if (dest_folio)
+				kaddr = kmap_local_folio(dest_folio, 0);
+    ...
+}
+
+Because read_key_bytes() will return success (PAGE_SIZE) without copying
+anything when dest is NULL, will btrfs_read_merkle_tree_page() then skip
+zeroing and mark an uninitialized folio as uptodate?
+
+Could this cause fs-verity to read invalid hashes and deterministically reject
+file access on systems with highmem?
+
+>  	if (ret < 0) {
+> +		folio_unlock(folio);
+>  		folio_put(folio);
+>  		return ERR_PTR(ret);
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260722025435.1493093-1-chenyichong@uniontech.com?part=1
+

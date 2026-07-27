@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Sun Jul  5 14:08:20 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 4/4] btrfs: use kvmalloc() for stripe buffer of
+ scrub_stripe
+Date: Sun, 05 Jul 2026 12:08:18 +0000
+Message-Id: <20260705120818.D7ED71F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Incorrect page offset calculation in `scrub_bio_add_sector()` for kmalloc buffers, leading to DMA out-of-bounds access and data corruption.
+--
+
+commit 6b52630e7f4e18688e2d42cd455ba8fca3b66236
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: use kvmalloc() for stripe buffer of scrub_stripe
+
+This commit replaces the per-page array for a stripe buffer with a single
+kvmalloc() allocation to cover the full stripe. This simplifies checksum
+verification, RAID56 caching, and removes the need for complex cross-page
+handling.
+
+> diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+> index 2224bca96a46f..1938288dd55fa 100644
+> --- a/fs/btrfs/scrub.c
+> +++ b/fs/btrfs/scrub.c
+
+[ ... ]
+
+> @@ -927,30 +898,36 @@ static void scrub_bio_add_sector(struct btrfs_bio *bbio, struct scrub_stripe *st
+>  				 int sector_nr)
+>  {
+>  	struct btrfs_fs_info *fs_info = bbio->inode->root->fs_info;
+> -	void *kaddr = scrub_stripe_get_kaddr(stripe, sector_nr);
+> +	const u32 offset = sector_nr << fs_info->sectorsize_bits;
+>  	int ret;
+>  
+> -	ret = bio_add_page(&bbio->bio, virt_to_page(kaddr), fs_info->sectorsize,
+> -			   offset_in_page(kaddr));
+
+[ ... ]
+
+> +	ASSERT(offset + fs_info->sectorsize <= BTRFS_STRIPE_LEN);
+> +
+> +	if (is_vmalloc_addr(stripe->buffer)) {
+> +		ret = bio_add_vmalloc(&bbio->bio, stripe->buffer + offset,
+> +				      fs_info->sectorsize);
+> +		ASSERT(ret == true);
+> +		return;
+> +	}
+> +	ret = bio_add_page(&bbio->bio, virt_to_page(stripe->buffer + offset),
+> +			   fs_info->sectorsize, offset_in_page(offset));
+
+[Severity: Critical]
+Is the page offset calculation correct here?
+
+The offset_in_page() macro is being called with just 'offset' rather than
+'stripe->buffer + offset'. If stripe->buffer was fulfilled by kmalloc() and
+isn't perfectly page-aligned (for example, on architectures with 64K pages
+or if SLUB debugging/KASAN adds redzones), this will drop the sub-page
+offset of the base pointer.
+
+When the block layer executes the bio, wouldn't this cause it to perform
+DMA at the wrong offset within the page, leading to memory corruption or 
+incorrect disk I/O?
+
+>  	ASSERT(ret == fs_info->sectorsize);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783252371.git.wqu@suse.com?part=4
+

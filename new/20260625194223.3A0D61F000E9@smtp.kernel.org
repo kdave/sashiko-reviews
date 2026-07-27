@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Thu Jun 25 21:42:26 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/6] btrfs: fix pending delayed iputs when using
+ autodefrag
+Date: Thu, 25 Jun 2026 19:42:22 +0000
+Message-Id: <20260625194223.3A0D61F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The patch fails to properly wait for asynchronous compressed writeback because `btrfs_wait_ordered_roots()` is called before flushing the `delalloc_workers` workqueue, leaving the syzbot bug unresolved for compressed extents.
+- [High] `writeback_inodes_sb()` uses `WB_SYNC_NONE`, which silently skips folios or inodes locked by other threads, leaving them dirty and allowing delayed iputs to escape the synchronization barrier.
+--
+
+commit 0003264029219724aa27443b0eb9e199ed3a37c2
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix pending delayed iputs when using autodefrag
+
+This commit attempts to fix an issue where delayed iputs are created after
+the file system state is marked with BTRFS_FS_STATE_NO_DELAYED_IPUT during
+unmount. It flushes delalloc and waits for ordered extents immediately after
+parking the cleaner kthread in close_ctree().
+
+Link: https://lore.kernel.org/linux-btrfs/6a1ee507.b4221f80.1326c5.0004.GAE@google.com/
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 274e2f0826b68..b61d6f23b08e9 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -4365,6 +4365,21 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
+>  	/* clear out the rbtree of defraggable inodes */
+>  	btrfs_cleanup_defrag_inodes(fs_info);
+>  
+> +	/*
+> +	 * After we entered close_ctree() autodefrag could be running and before
+> +	 * we parked the cleaner kthread, it dirtied folios of some inode.
+> +	 * We don't want to leave any delalloc here, it may be flushed any time
+> +	 * after this point and result in ordered extents that create delayed
+> +	 * iputs after flushed the ordered extent queues further below, run
+> +	 * delayed iputs and set BTRFS_FS_STATE_NO_DELAYED_IPUT. If we are
+> +	 * mounted with flushoncommit, then btrfs_commit_super() called below
+> +	 * will flush delalloc and wait for ordered extents but we end up
+> +	 * getting delayed iputs than are never run. So flush delalloc and wait
+> +	 * for ordered extents.
+> +	 */
+> +	writeback_inodes_sb(fs_info->sb, WB_REASON_SYNC);
+
+[Severity: High]
+Does writeback_inodes_sb() use WB_SYNC_NONE internally, skipping folios locked
+by other threads or inodes with I_SYNC set?
+
+If concurrent async reclaim or page faults hold these locks, the skipped
+folios might remain dirty. Could they be flushed later by btrfs_commit_super()
+with flushoncommit, creating new ordered extents that generate delayed iputs
+after the BTRFS_FS_STATE_NO_DELAYED_IPUT flag is set?
+
+> +	btrfs_wait_ordered_roots(fs_info, U64_MAX, NULL);
+
+[Severity: High]
+Is this wait occurring before the deferred compressed writes are processed?
+
+For compressed writes, cow_file_range_async() defers the creation of ordered
+extents and IO submission to the fs_info->delalloc_workers workqueue. Since
+btrfs_wait_ordered_roots() is called here before
+btrfs_flush_workqueue(fs_info->delalloc_workers) executes further down in
+close_ctree(), will it miss checking for these ordered extents?
+
+If the ordered extents are created later when the workqueue is flushed,
+could their completion generate delayed iputs and trigger the same warning
+this regression intends to resolve?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1782321584.git.fdmanana@suse.com?part=2
+

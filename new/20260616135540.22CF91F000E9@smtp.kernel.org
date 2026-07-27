@@ -1,0 +1,83 @@
+From sashiko-bot@kernel.org Tue Jun 16 15:55:43 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/7] btrfs: drain replace writes before freeing the
+ target on cancel
+Date: Tue, 16 Jun 2026 13:55:39 +0000
+Message-Id: <20260616135540.22CF91F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The drain logic using btrfs_rm_dev_replace_blocked() is insufficient to prevent a Use-After-Free of the target device when an I/O error occurs.
+--
+
+commit 9d5978befbc49a641ffcc29360610fea76e5f7ce
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: drain replace writes before freeing the target on cancel
+
+A device replace can be left SUSPENDED while the filesystem stays mounted
+and writable. If the replace is then canceled, the cancel path frees the
+target device but does not wait for the duplicated write bios to drain,
+leading to a use-after-free. This patch mirrors the finishing error path
+by draining the in-flight bios before destroying the target.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+[ ... ]
+> @@ -1161,8 +1161,11 @@ int btrfs_dev_replace_cancel(struct btrfs_fs_info *fs_info)
+>  			btrfs_dev_name(src_device), src_device->devid,
+>  			btrfs_dev_name(tgt_device));
+>  
+> +		/* Drain writes still duplicated to tgtdev before freeing it. */
+> +		btrfs_rm_dev_replace_blocked(fs_info);
+>  		if (tgt_device)
+>  			btrfs_destroy_dev_replace_tgtdev(tgt_device);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does this drain logic fully
+prevent the use-after-free of the target device when an I/O error occurs?
+
+In the bio completion handlers for the target device, such as
+orig_write_end_io_work() for normal mirrored writes, btrfs_bio_counter_dec()
+is called before the handler has finished using the device:
+
+fs/btrfs/bio.c:orig_write_end_io_work() {
+    ...
+	btrfs_bio_counter_dec(bioc->fs_info);
+
+	if (bio->bi_status) {
+		atomic_inc(&bioc->error);
+		btrfs_log_dev_io_error(bio, stripe->dev);
+	}
+    ...
+}
+
+If the decrement drops the bio_counter to zero, could the cancel thread
+wake up and immediately free the target device before btrfs_log_dev_io_error()
+dereferences stripe->dev?
+
+A similar pattern exists in btrfs_simple_end_io() for single-mirror
+repair writes:
+
+fs/btrfs/bio.c:btrfs_simple_end_io() {
+    ...
+	btrfs_bio_counter_dec(fs_info);
+
+	if (bio->bi_status)
+		btrfs_log_dev_io_error(bio, dev);
+    ...
+}
+
+Should the decrement in these completion handlers be deferred until after
+all device accesses are complete?
+
+> +		btrfs_rm_dev_replace_unblocked(fs_info);
+>  		break;
+>  	default:
+>  		up_write(&dev_replace->rwsem);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616-work-btrfs-preexisting-fixes-v1-0-c4abe2f6d4f0@kernel.org?part=4
+

@@ -1,0 +1,156 @@
+From sashiko-bot@kernel.org Fri Jun 12 12:25:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: don't force read-only on transient
+ -EAGAIN from reloc merge
+Date: Fri, 12 Jun 2026 10:25:41 +0000
+Message-Id: <20260612102542.9C5DD1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [Critical] Treating -EAGAIN as a soft error in merge_reloc_roots() bypasses transaction abort but leaves dangling root->reloc_root references, leading to skipped merges on retry and silent data corruption.
+- [Critical] btrfs_relocate_sys_chunks() will panic via BUG_ON() if btrfs_relocate_chunk() returns -EAGAIN.
+- [High] Propagating -EAGAIN from btrfs_recover_relocation() causes read-write mounts to fail persistently.
+- [High] Memory leak of btrfs_root structures on the error path of btrfs_recover_relocation().
+--
+
+commit 24f5e3d4ee2a57f7a8dcab8cee675edb359723ad
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't force read-only on transient -EAGAIN from reloc merge
+
+On a zoned FS, btrfs_delayed_refs_rsv_refill() returns -EAGAIN whenever
+the over-committed metadata plus the zone_unusable bytes exceeds the
+usable size in a metadata block-group to avoid heavy over-commit of
+metadata and early ENOSPC in one transaction.
+
+If this happens while doing reclaim, the transaction is getting aborted.
+Treat -EAGAIN as a soft, retryable condition in case of block-group
+reclaim.
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index fb85bc8b345c7..a356161ee60c6 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+
+[ ... ]
+
+> @@ -1946,7 +1946,8 @@ void merge_reloc_roots(struct reloc_control *rc)
+>  	}
+>  out:
+>  	if (ret) {
+> -		btrfs_handle_fs_error(fs_info, ret, NULL);
+> +		if (ret != -EAGAIN)
+> +			btrfs_handle_fs_error(fs_info, ret, NULL);
+>  		free_reloc_roots(&reloc_roots);
+>  
+>  		/* new reloc root may be added */
+
+[Severity: Critical]
+If merge_reloc_roots() fails early with -EAGAIN and bypasses
+btrfs_handle_fs_error(), it frees the reloc roots but bypasses adding them
+to rc->dirty_subvol_roots. Does this mean clean_dirty_subvols() will skip
+clearing their reloc_root pointers?
+
+When background reclaim retries the block group relocation,
+btrfs_init_reloc_root() will see that root->reloc_root is already set:
+
+fs/btrfs/relocation.c:btrfs_init_reloc_root() {
+	...
+	if (root->reloc_root) {
+		btrfs_set_root_last_trans(root->reloc_root, trans->transid);
+		goto out;
+	}
+	...
+}
+
+Will this cause the subsequent merge_reloc_roots() to do nothing and result
+in data corruption since the subvolume trees are never updated to point to
+the new blocks?
+
+[ ... ]
+
+> @@ -3700,7 +3702,9 @@ static noinline_for_stack int relocate_block_group(struct reloc_control *rc)
+>  	 */
+>  	err = prepare_to_merge(rc, err);
+>  
+> -	merge_reloc_roots(rc);
+> +	ret = merge_reloc_roots(rc);
+> +	if (ret && !err)
+> +		err = ret;
+>  
+>  	rc->merge_reloc_tree = false;
+
+[Severity: Critical]
+Because merge_reloc_roots() can now return -EAGAIN, relocate_block_group()
+will propagate this error up to btrfs_relocate_chunk().
+
+If btrfs_relocate_sys_chunks() encounters this during a user-initiated
+device addition:
+
+fs/btrfs/volumes.c:btrfs_relocate_sys_chunks() {
+	...
+	ret = btrfs_relocate_chunk(fs_info, found_key.offset, true);
+	if (ret == -ENOSPC)
+		failed++;
+	else
+		BUG_ON(ret);
+	...
+}
+
+Could this trigger the BUG_ON() and panic the kernel instead of gracefully
+failing?
+
+[ ... ]
+
+> @@ -5669,7 +5673,9 @@ int btrfs_recover_relocation(struct btrfs_fs_info *fs_info)
+>  	if (ret)
+>  		goto out_unset;
+>  
+> -	merge_reloc_roots(rc);
+> +	ret = merge_reloc_roots(rc);
+> +	if (ret)
+> +		goto out_unset;
+
+[Severity: High]
+If btrfs_recover_relocation() propagates -EAGAIN during the mount process
+via btrfs_start_pre_rw_mount():
+
+fs/btrfs/disk-io.c:btrfs_start_pre_rw_mount() {
+	...
+	ret = btrfs_recover_relocation(fs_info);
+	mutex_unlock(&fs_info->cleaner_mutex);
+	if (ret < 0) {
+		btrfs_warn(fs_info, "failed to recover relocation: %d", ret);
+		return ret;
+	}
+	...
+}
+
+Could this cause the VFS mount operation to abort, turning a transient
+metadata condition into a persistent failure where the user cannot mount the
+filesystem read-write?
+
+[Severity: High]
+Does jumping directly to out_unset bypass the out_clean label?
+
+fs/btrfs/relocation.c:btrfs_recover_relocation() {
+	...
+out_clean:
+	ret2 = clean_dirty_subvols(rc);
+	if (ret2 < 0 && !ret)
+		ret = ret2;
+out_unset:
+	unset_reloc_control(rc);
+	...
+}
+
+Since put_reloc_control() does not free the dirty_subvol_roots list, does
+this permanently leak any root items that were successfully processed and
+moved to rc->dirty_subvol_roots before the -EAGAIN failure occurred?
+
+>  
+>  	unset_reloc_control(rc);
+>
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260612100429.214341-1-johannes.thumshirn@wdc.com?part=1
+

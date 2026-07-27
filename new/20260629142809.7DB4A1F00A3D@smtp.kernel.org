@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Mon Jun 29 16:28:13 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: don't pass tree_id in
+ btrfs_search_path_in_tree()
+Date: Mon, 29 Jun 2026 14:28:09 +0000
+Message-Id: <20260629142809.7DB4A1F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] Early exit paths drop a reference on the original, caller-provided root, leading to an exploitable refcount underflow and use-after-free.
+- [High] The newly acquired btrfs_root reference is leaked if copy_to_user() fails.
+--
+
+commit d4008799f8b794b4ee41ea2114be60573ef0fbb8
+Author: Miquel Sabaté Solà <mssola@mssola.com>
+
+btrfs: don't pass tree_id in btrfs_search_path_in_tree()
+
+The 'tree_id' parameter in btrfs_search_path_in_tree() was only being
+used in order to fetch the root tree to be considered for the search.
+This commit replaces it with a single 'struct btrfs_root' parameter,
+letting the caller handle the root allocation.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 9d47d16394fc5..4cb6938ba4f89 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+[ ... ]
+> @@ -1871,6 +1856,7 @@ static int btrfs_search_path_in_tree_user(struct mnt_idmap *idmap,
+>  static noinline int btrfs_ioctl_ino_lookup(struct btrfs_root *root,
+>  					   void __user *argp)
+>  {
+> +	bool new_root = false;
+>  	struct btrfs_ioctl_ino_lookup_args AUTO_KFREE(args);
+>  	int ret = 0;
+>  
+> @@ -1884,6 +1870,8 @@ static noinline int btrfs_ioctl_ino_lookup(struct btrfs_root *root,
+>  	 */
+>  	if (args->treeid == 0)
+>  		args->treeid = btrfs_root_id(root);
+> +	else
+> +		new_root = true;
+
+[Severity: Critical]
+If args->treeid is non-zero, new_root is set to true here. If an
+unprivileged user calls this ioctl, the subsequent capable(CAP_SYS_ADMIN)
+check fails and jumps to the out label:
+
+fs/btrfs/ioctl.c:btrfs_ioctl_ino_lookup() {
+    ...
+    if (!capable(CAP_SYS_ADMIN)) {
+        ret = -EPERM;
+        goto out;
+    }
+    ...
+}
+
+Since the jump to out happens before btrfs_get_fs_root() is called, does
+the cleanup code at the out label end up dropping a reference on the
+original, caller-provided root? This appears to cause a refcount underflow
+on the original btrfs_root structure.
+
+[ ... ]
+>  out:
+>  	if (ret == 0 && copy_to_user(argp, args, sizeof(*args)))
+>  		return -EFAULT;
+> +	if (new_root)
+> +		btrfs_put_root(root);
+>  
+>  	return ret;
+>  }
+
+[Severity: High]
+If copy_to_user() fails, the function directly returns -EFAULT. Does this
+early return bypass the new_root cleanup entirely, causing the newly
+acquired btrfs_root reference to leak?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260629142056.309300-1-mssola@mssola.com?part=1
+

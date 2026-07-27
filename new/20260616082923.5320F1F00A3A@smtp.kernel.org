@@ -1,0 +1,81 @@
+From sashiko-bot@kernel.org Tue Jun 16 10:29:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 2/3] block: respect iov_iter::nofault flag in
+ bio_iov_iter_bounce_write()
+Date: Tue, 16 Jun 2026 08:29:22 +0000
+Message-Id: <20260616082923.5320F1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] bio_iov_iter_align_down silently drops bvecs without freeing their associated folios, causing a memory leak during unaligned bounce buffer writes.
+--
+
+commit a614ee5324793ff44eb8ef3c92c5f0c9411e299c
+Author: Qu Wenruo <wqu@suse.com>
+
+block: respect iov_iter::nofault flag in bio_iov_iter_bounce_write()
+
+This commit modifies bio_iov_iter_bounce_write to use
+copy_folio_from_iter_atomic when the iov_iter nofault flag is set. This
+prevents deadlocks in btrfs when a page fault is needed to read the buffer.
+
+> diff --git a/block/bio.c b/block/bio.c
+> index d2fdfcb016c15..7fd7c35f9a289 100644
+> --- a/block/bio.c
+> +++ b/block/bio.c
+> @@ -1335,7 +1335,11 @@ static int bio_iov_iter_bounce_write(struct bio *bio, struct iov_iter *iter,
+>  			break;
+>  		bio_add_folio_nofail(bio, folio, this_len, 0);
+>  
+> -		copied = copy_from_iter(folio_address(folio), this_len, iter);
+> +		if (iter->nofault)
+> +			copied = copy_folio_from_iter_atomic(folio, 0, this_len,
+> +							     iter);
+> +		else
+> +			copied = copy_folio_from_iter(folio, 0, this_len, iter);
+>  		if (copied < this_len) {
+>  			/*
+>  			 * Need to revert the iov iter for all bytes we have
+
+[Severity: High]
+This isn't a bug introduced by this patch, but while reviewing the bounce
+buffer changes, I noticed a potential memory leak in how unaligned writes
+are handled at the end of this function.
+
+When bio_iov_iter_bounce_write allocates kernel folios via
+folio_alloc_greedy, they are added to the bio. If the total write size
+is unaligned, the function calls bio_iov_iter_align_down before returning:
+
+block/bio.c:bio_iov_iter_bounce_write() {
+    ...
+    if (!bio->bi_iter.bi_size)
+        return -ENOMEM;
+    return bio_iov_iter_align_down(bio, iter, minsize - 1);
+}
+
+If bio_iov_iter_align_down needs to remove bytes that span an entire
+bvec, it silently drops the bvec by decrementing bio->bi_vcnt:
+
+block/bio.c:bio_iov_iter_align_down() {
+    ...
+    if (bio_flagged(bio, BIO_PAGE_PINNED))
+        unpin_user_page(bv->bv_page);
+
+    bio->bi_vcnt--;
+    ...
+}
+
+Because BIO_PAGE_PINNED is not set for these kernel bounce buffers, the
+underlying folio reference is never put. 
+
+Furthermore, since bio->bi_vcnt is reduced, subsequent cleanup routines
+like bio_free_folios will iterate up to the new bi_vcnt and miss the
+dropped bvec entirely.
+
+Does this code leak the allocated kernel folio when an unaligned direct I/O
+write causes a bvec to be fully truncated?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1781597506.git.wqu@suse.com?part=2
+

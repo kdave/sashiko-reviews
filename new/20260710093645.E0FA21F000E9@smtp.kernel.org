@@ -1,0 +1,54 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:37:28 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 20/20] xfs: enable ro-compat fs-verity flag
+Date: Fri, 10 Jul 2026 09:36:45 +0000
+Message-Id: <20260710093645.E0FA21F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Unconditional inclusion of XFS_SB_FEAT_RO_COMPAT_VERITY allows corrupting verity files when CONFIG_FS_VERITY is disabled.
+--
+
+--- Patch [20]: [PATCH v11 20/20] xfs: enable ro-compat fs-verity flag ---
+commit 857585eaa5193d5c63932cf80ceca1728af957c3
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: enable ro-compat fs-verity flag
+
+Finalize fs-verity integration in XFS by making kernel fs-verity
+aware with ro-compat flag.
+
+> diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+> index 7b0511eb03d03..2878bc9cb6564 100644
+> --- a/fs/xfs/libxfs/xfs_format.h
+> +++ b/fs/xfs/libxfs/xfs_format.h
+> @@ -378,8 +378,9 @@ xfs_sb_has_compat_feature(
+>  #define XFS_SB_FEAT_RO_COMPAT_ALL \
+>  		(XFS_SB_FEAT_RO_COMPAT_FINOBT | \
+>  		 XFS_SB_FEAT_RO_COMPAT_RMAPBT | \
+> -		 XFS_SB_FEAT_RO_COMPAT_REFLINK| \
+> -		 XFS_SB_FEAT_RO_COMPAT_INOBTCNT)
+> +		 XFS_SB_FEAT_RO_COMPAT_REFLINK | \
+> +		 XFS_SB_FEAT_RO_COMPAT_INOBTCNT | \
+> +		 XFS_SB_FEAT_RO_COMPAT_VERITY)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[Severity: High]
+Does this unconditional inclusion allow modifying verity files when
+CONFIG_FS_VERITY is disabled?
+
+When a kernel is built without CONFIG_FS_VERITY, XFS will mount the filesystem
+read-write instead of falling back to read-only mode, because
+XFS_SB_FEAT_RO_COMPAT_VERITY is unconditionally included here.
+
+If a user with write permissions calls truncate() on a verity file,
+open(O_WRONLY) is blocked by a fallback returning -EOPNOTSUPP, but truncate()
+bypasses this and reaches setattr_prepare(). 
+
+Because CONFIG_FS_VERITY is disabled, setattr_prepare() skips the IS_VERITY()
+check. XFS would then proceed with the truncate, freeing all blocks past EOF,
+which could silently destroy the verity Merkle tree and descriptor.
+
+>  #define XFS_SB_FEAT_RO_COMPAT_UNKNOWN	~XFS_SB_FEAT_RO_COMPAT_ALL
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=20
+

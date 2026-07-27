@@ -1,0 +1,50 @@
+From sashiko-bot@kernel.org Wed Jul 22 01:16:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: use %pe for error code output
+Date: Tue, 21 Jul 2026 23:16:07 +0000
+Message-Id: <20260721231608.56BEC1F00A3E@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Using `%pe` with `ERR_PTR(ret)` in `iterate_leaf_refs` obscures expected positive return codes by printing them as hashed pointer strings.
+--
+
+--- Patch [1]: [PATCH] btrfs: use %pe for error code output ---
+commit b5b8d927aea242411edc69096582ddc2a1c877f0
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: use %pe for error code output
+
+This commit converts numeric error codes to human-readable strings across
+various btrfs logging sites by utilizing the %pe format specifier combined
+with ERR_PTR().
+
+> diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+> index 23c3eeb58dc1d..ad08ce4d3d781 100644
+> --- a/fs/btrfs/backref.c
+> +++ b/fs/btrfs/backref.c
+> @@ -2393,8 +2393,8 @@ static int iterate_leaf_refs(struct btrfs_fs_info *fs_info,
+>  		ret = iterate(eie->inum, eie->offset, eie->num_bytes, root, ctx);
+>  		if (ret) {
+>  			btrfs_debug(fs_info,
+> -				    "stopping iteration for %llu due to ret=%d",
+> -				    extent_item_objectid, ret);
+> +				    "stopping iteration for %llu due to ret=%pe",
+> +				    extent_item_objectid, ERR_PTR(ret));
+
+[Severity: Medium]
+Since the iterate callback in iterate_leaf_refs() can return positive
+control-flow constants to signal an early exit, such as
+BTRFS_ITERATE_EXTENT_INODES_STOP which evaluates to 5, does this cast to
+ERR_PTR() cause a loss of debug information?
+
+The commit message notes that positive numbers will be output as a hashed
+pointer value. However, in this specific btrfs_debug() call, logging the
+exact positive control-flow value was the intended behavior. Will formatting
+this positive value as a hashed pointer string obscure the actual reason the
+iteration stopped?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/08c4b7fe0087c6a04abf313a4e52d88c0666249d.1784675107.git.wqu@suse.com?part=1
+

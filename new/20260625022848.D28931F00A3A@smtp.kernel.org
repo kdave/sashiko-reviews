@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Thu Jun 25 04:28:51 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: wait for ordered extents before buffered write
+ fallback in direct IO
+Date: Thu, 25 Jun 2026 02:28:48 +0000
+Message-Id: <20260625022848.D28931F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Time-Of-Check to Time-Of-Use (TOCTOU) race condition in the buffered fallback loop leaves the BUG_ON unfixed.
+
+Pre-existing issues:
+- [High] Failed direct IO writes returning to userspace leave pending asynchronous ordered extents, exposing subsequent operations to the BUG_ON.
+--
+
+commit f137c9bdc2215202713aaf2ced8b895afe075760
+Author: Yun Zhou <yun.zhou@windriver.com>
+
+btrfs: wait for ordered extents before buffered write fallback in direct IO
+
+When btrfs_direct_write() falls back to buffered IO after a failed DIO
+attempt, it may race with the asynchronous completion of DIO ordered
+extents. This patch waits for pending ordered extents before starting
+the buffered write to prevent overlapping extents.
+
+Reported-by: syzbot+ba2afde329fc27e3f22e@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=ba2afde329fc27e3f22e
+Fixes: acf9ed3a6c00 ("btrfs: retry faulting in the pages after a zero sized short direct write")
+
+> diff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c
+> --- a/fs/btrfs/direct-io.c
+> +++ b/fs/btrfs/direct-io.c
+[ ... ]
+> @@ -1025,6 +1026,29 @@ ssize_t btrfs_direct_write(struct kiocb *iocb, struct iov_iter *from)
+>  	}
+>  
+>  	pos = iocb->ki_pos;
+
+[Severity: High]
+This is a pre-existing issue, but does the error path just above this block
+bypass the newly added ordered extent wait logic?
+
+If a failed DIO returns directly to userspace (e.g. returning -EIO or
+-ENOMEM) via the "goto out" check before this label, the ordered extent
+may still be finishing asynchronously.
+
+If userspace immediately retries with buffered I/O, could it still collide
+with the pending extent and trigger the BUG_ON in insert_ordered_extent()?
+
+> +
+> +	/*
+> +	 * The DIO path may have created ordered extent(s) that are still being
+> +	 * processed asynchronously in a work queue.  We must wait for them to
+> +	 * be fully completed and removed from the rb-tree before doing a
+> +	 * buffered write to the same or overlapping range; otherwise the
+> +	 * buffered writeback path (run_delalloc_nocow -> fallback_to_cow ->
+> +	 * cow_file_range) may try to insert a new ordered extent that conflicts
+> +	 * with the still-pending DIO one, triggering a BUG_ON in
+> +	 * insert_ordered_extent().
+> +	 *
+> +	 * This happens when DIO creates an ordered extent but has a short write
+> +	 * (submitted < length in btrfs_dio_iomap_end()), which truncates and
+> +	 * finishes the ordered extent asynchronously while we fall back to
+> +	 * buffered IO for the same range.
+> +	 */
+> +	while ((ordered = btrfs_lookup_ordered_range(BTRFS_I(inode),
+> +				(u64)(pos - written),
+> +				(u64)written + iov_iter_count(from))) != NULL) {
+
+[Severity: High]
+Does this introduce a Time-Of-Check to Time-Of-Use (TOCTOU) race?
+
+Because this while loop executes after dropping the VFS inode lock, a
+concurrent thread could issue a direct IO write, acquire the lock, create a
+new ordered extent, and drop the lock before btrfs_buffered_write()
+reacquires it.
+
+If this sequence occurs, could the concurrent thread's pending asynchronous
+ordered extent collide with the buffered writeback, triggering the same
+BUG_ON in insert_ordered_extent() that this patch intends to fix?
+
+> +		btrfs_start_ordered_extent(ordered);
+> +		btrfs_put_ordered_extent(ordered);
+> +	}
+> +
+>  	written_buffered = btrfs_buffered_write(iocb, from);
+>  	if (written_buffered < 0) {
+>  		ret = written_buffered;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260625021456.724803-1-yun.zhou@windriver.com?part=1
+

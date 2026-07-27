@@ -1,0 +1,89 @@
+From sashiko-bot@kernel.org Thu Jul 23 18:19:32 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/4] btrfs: zoned: drop stranded dirty metadata on
+ transaction abort
+Date: Thu, 23 Jul 2026 16:19:15 +0000
+Message-Id: <20260723161920.0FBDD1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Incomplete fix: Dirty metadata extents that fail writeback during transaction commit remain dirty and will still hang unmount.
+--
+
+--- Patch [2]: [PATCH v2 2/4] btrfs: zoned: drop stranded dirty metadata on transaction abort ---
+commit 8e68494db181e9b66dfb5256bf83226bfa7b3827
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: drop stranded dirty metadata on transaction abort
+
+This patch addresses an issue on zoned filesystems where freed tree blocks are
+kept dirty and flagged for zero-out. If a transaction aborts before writeback,
+these stranded dirty metadata buffers survive to the final iput() and hang
+unmount. The fix introduces a cleanup step to clear the dirty state of such
+buffers during transaction cleanup.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 66a2e9fd59c1a..3589b404ec06c 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+
+[ ... ]
+
+> @@ -3841,26 +3867,42 @@ void btrfs_clear_buffer_dirty(struct btrfs_trans_handle *trans,
+
+[ ... ]
+
+> +void btrfs_zoned_release_dirty_metadata(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct eb_batch batch;
+> +	unsigned long index = 0;
+> 
+> +	if (!btrfs_is_zoned(fs_info))
+> +		return;
+> 
+> +	btrfs_zoned_meta_io_lock(fs_info);
+> +	eb_batch_init(&batch);
+> +	while (buffer_tree_get_ebs_tag(fs_info, &index, ULONG_MAX,
+> +				       PAGECACHE_TAG_DIRTY, &batch)) {
+> +		struct extent_buffer *eb;
+> +
+> +		while ((eb = eb_batch_next(&batch)) != NULL) {
+> +			btrfs_tree_lock(eb);
+> +			if (test_and_clear_bit(EXTENT_BUFFER_ZONED_ZEROOUT,
+> +					       &eb->bflags))
+
+[Severity: High]
+Does this check miss dirty metadata extents that failed writeback mid-commit?
+
+If an I/O error causes a transaction abort during
+btrfs_write_and_wait_transaction(), btrfs_write_marked_extents() breaks out
+early. At that point, it has already converted the extent's tracking bit from
+EXTENT_DIRTY to EXTENT_NEED_WAIT:
+
+fs/btrfs/transaction.c:btrfs_write_marked_extents() {
+	...
+	ret = btrfs_convert_extent_bit(dirty_pages, start, end,
+				       EXTENT_NEED_WAIT,
+				       mark, &cached_state);
+	...
+}
+
+During the subsequent cleanup_transaction(), btrfs_destroy_marked_extents()
+only processes EXTENT_DIRTY bits, skipping the failed extent. As a result,
+btrfs_clear_buffer_dirty() is never called, and the extent never receives the
+EXTENT_BUFFER_ZONED_ZEROOUT flag.
+
+Because this new logic explicitly requires EXTENT_BUFFER_ZONED_ZEROOUT, will it
+bypass these extents, leaving them stranded and still hanging the unmount?
+
+> +				clear_extent_buffer_dirty(eb);
+> +			btrfs_tree_unlock(eb);
+> +		}
+> +		eb_batch_release(&batch);
+> +		cond_resched();
+>  	}
+> +	btrfs_zoned_meta_io_unlock(fs_info);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260723155428.94187-1-johannes.thumshirn@wdc.com?part=2
+

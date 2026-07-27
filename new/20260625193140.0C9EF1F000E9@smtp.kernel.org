@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Thu Jun 25 21:31:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 5/6] btrfs: defrag: use simple list_del() in
+ defrag_collect_targets()
+Date: Thu, 25 Jun 2026 19:31:39 +0000
+Message-Id: <20260625193140.0C9EF1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] defrag_collect_targets incorrectly compares em->len against max_inline for inline extents, causing all inline extents to be spuriously defragged into regular extents.
+--
+
+commit 0582581193ed581d6bf803158d2f9a90c7ca09fa
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: defrag: use simple list_del() in defrag_collect_targets()
+
+This commit updates defrag_collect_targets() to use list_del() instead of
+list_del_init(). Since the list entry is freed immediately after removal,
+initializing it is unnecessary.
+
+> diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+> --- a/fs/btrfs/defrag.c
+> +++ b/fs/btrfs/defrag.c
+[ ... ]
+> @@ -950,20 +950,20 @@ static int defrag_collect_targets(struct btrfs_inode *inode,
+[ ... ]
+>  		/*
+>  		 * If the file extent is an inlined one, we may still want to
+>  		 * defrag it (fallthrough) if it will cause a regular extent.
+>  		 * This is for users who want to convert inline extents to
+>  		 * regular ones through max_inline= mount option.
+>  		 */
+>  		if (em->disk_bytenr == EXTENT_MAP_INLINE &&
+>  		    em->len <= inode->root->fs_info->max_inline)
+
+[Severity: High]
+This isn't a bug introduced by this patch, but looking at the earlier logic
+in defrag_collect_targets(), does this size check correctly skip small
+inline extents?
+
+For inline extents, em->len represents the sector size rather than the
+actual data size. If max_inline is smaller than the sector size, this
+condition will evaluate to false.
+
+Could this cause all inline extents to bypass the skip check, becoming
+spuriously targeted for defragmentation and converted into regular extents?
+
+Would it be more accurate to compare against em->ram_bytes instead of
+em->len here to prevent unnecessary space consumption and I/O?
+
+>  			goto next;
+[ ... ]
+> @@ -1093,7 +1093,7 @@ static int defrag_collect_targets(struct btrfs_inode *inode,
+>  		struct defrag_target_range *tmp;
+>  
+>  		list_for_each_entry_safe(entry, tmp, target_list, list) {
+> -			list_del_init(&entry->list);
+> +			list_del(&entry->list);
+>  			kfree(entry);
+>  		}
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1782321584.git.fdmanana@suse.com?part=5
+

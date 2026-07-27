@@ -1,0 +1,52 @@
+From sashiko-bot@kernel.org Sat Jul  4 10:59:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: new test case for leaking
+ BTRFS_FS_STATE_REMOUNTING flag
+Date: Sat, 04 Jul 2026 08:59:33 +0000
+Message-Id: <20260704085934.24B8F1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] This patch is intended for the external 'fstests' (xfstests) repository, but was incorrectly applied to the Linux kernel tree.
+--
+
+commit 48fdbc514b5ed91007a75ad55a86f68c70445380
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: new test case for leaking BTRFS_FS_STATE_REMOUNTING flag
+
+This commit adds a regression test to verify that a failed remount does
+not leave the BTRFS_FS_STATE_REMOUNTING flag set. The test uses btrfs
+qgroup rescan to ensure features are not interrupted.
+
+> diff --git a/tests/btrfs/352 b/tests/btrfs/352
+> new file mode 100755
+> index 0000000000000..2ccf7fabdb713
+> --- /dev/null
+> +++ b/tests/btrfs/352
+> @@ -0,0 +1,53 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 352
+> +#
+> +# A regression test to make sure failed remount won't leave
+> +# BTRFS_FS_STATE_REMOUNTING flag set, which can interrupt several features,
+> +# one of them is btrfs qgroup rescan.
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick remount
+
+[Severity: Medium]
+Is this patch intended for the external fstests (xfstests) repository rather
+than the Linux kernel tree?
+
+The file structure (tests/btrfs/) and the helpers used here, such as
+_begin_fstest and _require_scratch, appear to be part of the external
+fstests project. If applied directly to the kernel source tree, this
+script would be orphaned in a root tests/ directory rather than integrating
+with the kernel's selftests framework in tools/testing/selftests/.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260704085208.86039-1-wqu@suse.com?part=1
+

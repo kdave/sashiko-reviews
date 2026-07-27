@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Tue Jul  7 02:28:04 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: generic: add a basic cachestat test case
+Date: Tue, 07 Jul 2026 00:27:58 +0000
+Message-Id: <20260707002758.D6FC11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Medium] Checking dirty pages in a separate xfs_io process is racy against kernel background writeback.
+- [Medium] The test lacks explicit exclusion for mount options that bypass the page cache or synchronously flush, such as `dax` or `sync`.
+- [Low] Spelling errors in comments and failure messages.
+--
+
+--- Patch [1]: [PATCH] fstests: generic: add a basic cachestat test case ---
+commit 8d3b503a602f562464645ea8f51d034954809166
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: generic: add a basic cachestat test case
+
+This commit introduces a new generic fstests case to verify the behavior of
+cachestat. It performs buffered writes of various page sizes, checks that the
+cached and dirtied page counts match, and then verifies the dirty count drops
+to zero after an fsync.
+
+Link: https://bugzilla.suse.com/show_bug.cgi?id=1270397
+
+> diff --git a/tests/generic/798 b/tests/generic/798
+> new file mode 100755
+> index 0000000000000..4328475ebbd6a
+> --- /dev/null
+> +++ b/tests/generic/798
+> @@ -0,0 +1,57 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 798
+> +#
+> +# Basic tests for cachestate()
+
+[Severity: Low]
+This isn't a bug, but there is a typo in the comment (cachestate instead of
+cachestat).
+
+[ ... ]
+
+> +
+> +_require_xfs_io_command "cachestat"
+> +_require_scratch
+
+[Severity: Medium]
+Should this test explicitly exclude dax and sync mount options? 
+
+If run with MOUNT_OPTIONS="-o sync", writes are flushed immediately and the
+dirty page count will be 0. With "-o dax", writes bypass the page cache
+entirely, causing cached pages to be 0. Both of these will cause the strict
+equality checks in this test to spuriously fail.
+
+[ ... ]
+
+> +	# Basic cached number reporting
+> +	$XFS_IO_PROG -f -c "pwrite -b $pagesize 0 $size" \
+> +		$SCRATCH_MNT/foobar >> $seqres.full
+> +	$XFS_IO_PROG -c "cachestat 0 $size" $SCRATCH_MNT/foobar > $tmp.output
+
+[Severity: Medium]
+Does separating the pwrite and cachestat commands into two different xfs_io
+invocations create a race window against background writeback? 
+
+It looks like the kernel background writeback threads could wake up between
+the two process executions and flush the pages to disk. This would cause the
+dirty page count to drop below the expected number and lead to intermittent
+test failures on slower or heavily loaded systems. 
+
+Could both commands be run together in a single xfs_io invocation?
+
+[ ... ]
+
+> +	if [ "$cached" -ne "$num_page" ]; then
+> +		_fail "cached not matching the page number"
+> +	fi
+> +
+> +	if [ "$cached" -ne "$dirtied" ]; then
+> +		_fail "dirited not matching the page number"
+
+[Severity: Low]
+This isn't a bug, but there is a typo in the failure message (dirited).
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260707001807.31931-1-wqu@suse.com?part=1
+

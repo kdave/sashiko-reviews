@@ -1,0 +1,211 @@
+From sashiko-bot@kernel.org Mon Jul 20 11:36:40 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v12 12/21] xfs: handle fsverity I/O in write/read path
+Date: Mon, 20 Jul 2026 09:36:30 +0000
+Message-Id: <20260720093630.DE5771F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [Critical] Unconditional application of IOMAP_F_FSVERITY during writeback causes WARN_ON_ONCE panics and breaks mixed data/metadata writeback.
+- [High] Missing IOMAP_F_SHARED flag for existing COW extents in xfs_zoned_buffered_write_iomap_begin.
+- [High] IOMAP_F_FSVERITY (and other iomap_flags) is silently dropped when returning COW extents in write paths.
+- [High] Double assignment of wpc->iomap.flags in xfs_zoned_map_blocks unconditionally overwrites IOMAP_F_FSVERITY and IOMAP_F_DIRTY.
+--
+
+--- Patch [12]: [PATCH v12 12/21] xfs: handle fsverity I/O in write/read path ---
+commit 4331a3c1feae214ff88b692d9533413a3ded8973
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+    xfs: handle fsverity I/O in write/read path
+    
+    For write/writeback set IOMAP_F_FSVERITY flag telling iomap to not
+    update inode size and to not skip folios beyond EOF.
+
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index 51293b6f331f0..27ff2b2404579 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+
+[ ... ]
+
+> @@ -350,12 +351,16 @@ xfs_map_blocks(
+>  	int			retries = 0;
+>  	int			error = 0;
+>  	unsigned int		*seq;
+> +	unsigned int		iomap_flags = 0;
+>  
+>  	if (xfs_is_shutdown(mp))
+>  		return -EIO;
+>  
+>  	XFS_ERRORTAG_DELAY(mp, XFS_ERRTAG_WB_DELAY_MS);
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: Critical]
+Does unconditionally setting IOMAP_F_FSVERITY here (and in 
+xfs_iomap_writepages() below) cause a panic on dirty data folios?
+
+If fsverity is enabled on a file with dirty user data folios in the 
+pagecache, writeback will process these folios while 
+XFS_VERITY_CONSTRUCTION is active. Because the flag is applied to all
+folios regardless of offset, it can cause a WARN_ON_ONCE to trigger in 
+iomap_writeback_handle_eof():
+
+fs/iomap/buffered-io.c:iomap_writeback_handle_eof() {
+    if (wpc->iomap.flags & IOMAP_F_FSVERITY) {
+        WARN_ON_ONCE(folio_pos(folio) < isize);
+        return true;
+    }
+}
+
+[ ... ]
+
+> @@ -590,12 +596,16 @@ xfs_zoned_map_blocks(
+>  	xfs_filblks_t		count_fsb;
+>  	struct xfs_bmbt_irec	imap, del;
+>  	struct xfs_iext_cursor	icur;
+> +	u16			iomap_flags = 0;
+>  
+>  	if (xfs_is_shutdown(mp))
+>  		return -EIO;
+>  
+>  	XFS_ERRORTAG_DELAY(mp, XFS_ERRTAG_WB_DELAY_MS);
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+
+[ ... ]
+
+> @@ -632,7 +642,7 @@ xfs_zoned_map_blocks(
+>  	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+>  
+>  	wpc->iomap.type = IOMAP_MAPPED;
+> -	wpc->iomap.flags = IOMAP_F_DIRTY;
+> +	wpc->iomap.flags = iomap_flags | IOMAP_F_DIRTY;
+>  	wpc->iomap.bdev = mp->m_rtdev_targp->bt_bdev;
+>  	wpc->iomap.offset = offset;
+>  	wpc->iomap.length = XFS_FSB_TO_B(mp, count_fsb);
+>  	wpc->iomap.flags = IOMAP_F_ANON_WRITE;
+
+[Severity: High]
+Does this double assignment of wpc->iomap.flags discard IOMAP_F_FSVERITY 
+and IOMAP_F_DIRTY?
+
+It looks like we assign iomap_flags | IOMAP_F_DIRTY but then unconditionally 
+overwrite it with IOMAP_F_ANON_WRITE on zoned inodes. This might lead to 
+silent writeback failures for fsverity metadata, as generic iomap writeback 
+could erroneously skip remaining dirty folios past EOF.
+
+[ ... ]
+
+> @@ -684,6 +694,22 @@ static const struct iomap_writeback_ops xfs_zoned_writeback_ops = {
+>  	.writeback_submit	= xfs_zoned_writeback_submit,
+>  };
+>  
+> +static int
+> +xfs_iomap_writepages(
+> +	struct xfs_inode		*ip,
+> +	struct iomap_writepage_ctx	*ctx)
+> +{
+> +	/*
+> +	 * Writeback does not work for folios past EOF, let it know that
+> +	 * I/O happens for fsverity metadata and this restriction need
+> +	 * to be skipped
+> +	 */
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		ctx->iomap.flags |= IOMAP_F_FSVERITY;
+> +
+> +	return iomap_writepages(ctx);
+> +}
+> +
+
+[Severity: Critical]
+Does globally priming the context with IOMAP_F_FSVERITY here break mixed 
+data/metadata writeback?
+
+As mentioned in xfs_map_blocks(), setting this unconditionally across the 
+entire writeback context causes iomap_writeback_handle_eof() to evaluate 
+WARN_ON_ONCE(folio_pos(folio) < isize) to true for any data folio.
+
+[ ... ]
+
+> diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+> index 225c3de88d03b..af5ceda83ffee 100644
+> --- a/fs/xfs/xfs_iomap.c
+> +++ b/fs/xfs/xfs_iomap.c
+
+[ ... ]
+
+> @@ -883,6 +885,9 @@ xfs_direct_write_iomap_begin(
+>  	if (flags & IOMAP_ATOMIC)
+>  		iomap_flags |= IOMAP_F_ATOMIC_BIO;
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: High]
+Is IOMAP_F_FSVERITY silently dropped when returning COW extents here?
+
+When returning a COW extent in xfs_direct_write_iomap_begin(), the 
+out_found_cow path calls xfs_bmbt_to_iomap() using a hardcoded 
+IOMAP_F_SHARED or 0, discarding the accumulated iomap_flags:
+
+xfs_direct_write_iomap_begin() {
+    ...
+out_found_cow:
+    if (imap.br_startblock != HOLESTARTBLOCK) {
+        ...
+        error = xfs_bmbt_to_iomap(ip, srcmap, &imap, flags, 0, seq);
+    }
+    ...
+    return xfs_bmbt_to_iomap(ip, iomap, &cmap, flags, IOMAP_F_SHARED, seq);
+}
+
+If srcmap lacks IOMAP_F_FSVERITY, iomap_block_needs_zeroing() could 
+erroneously zero out existing Merkle tree metadata past EOF during fsverity 
+construction. The same concern applies to xfs_buffered_write_iomap_begin().
+
+[ ... ]
+
+> @@ -1589,7 +1594,8 @@ xfs_zoned_buffered_write_iomap_begin(
+>  	loff_t			count,
+>  	unsigned		flags,
+>  	struct iomap		*iomap,
+> -	struct iomap		*srcmap)
+> +	struct iomap		*srcmap,
+> +	u16			iomap_flags)
+>  {
+
+[Severity: High]
+Does passing iomap_flags as an argument drop the initialization of 
+IOMAP_F_SHARED for existing COW extents?
+
+Before this change, iomap_flags was initialized to IOMAP_F_SHARED in 
+xfs_zoned_buffered_write_iomap_begin(). Now it is passed in from 
+xfs_buffered_write_iomap_begin() initialized to 0.
+
+If a buffered write on a zoned inode hits an existing COW extent 
+(got.br_startoff <= offset_fsb), the code jumps to the done label
+where xfs_bmbt_to_iomap() maps the extent without the shared flag:
+
+xfs_zoned_buffered_write_iomap_begin() {
+    ...
+    if (got.br_startoff <= offset_fsb) {
+        trace_xfs_reflink_cow_found(ip, &got);
+        goto done;
+    }
+    ...
+    iomap_flags |= (IOMAP_F_NEW | IOMAP_F_SHARED);
+    ...
+done:
+    error = xfs_bmbt_to_iomap(ip, iomap, &got, flags, iomap_flags, ...);
+}
+
+Could this break copy-on-write invariants and unshare operations?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260720090410.3487990-1-aalbersh@kernel.org?part=12
+

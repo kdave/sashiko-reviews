@@ -1,0 +1,66 @@
+From sashiko-bot@kernel.org Wed Jul 22 10:01:39 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: test POSIX ACL changes for RO btrfs property
+Date: Wed, 22 Jul 2026 08:01:37 +0000
+Message-Id: <20260722080137.A3FCF1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] An fstests (xfstests) suite test script was mistakenly added directly to the Linux kernel repository instead of the separate fstests repository.
+- [Medium] The script fails to source 'common/acl', leading to undefined function errors for ACL-related helpers.
+--
+
+--- Patch [1]: [PATCH v3] btrfs: test POSIX ACL changes for RO btrfs property ---
+commit 2562e348d8c8225c2d4379e6e304e240a2f79cec
+Author: Sun YangKai <sunyangkai@fygo.io>
+
+btrfs: test POSIX ACL changes for RO btrfs property
+
+This commit adds a test case to verify that POSIX ACLs cannot be modified on a
+read-only btrfs subvolume. It includes the test script and its corresponding
+golden output file.
+
+> diff --git a/tests/btrfs/353 b/tests/btrfs/353
+> new file mode 100755
+> index 0000000000000..63ba46813df3b
+> --- /dev/null
+> +++ b/tests/btrfs/353
+> @@ -0,0 +1,95 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (C) 2026 Fygo OS. All Rights Reserved.
+> +#
+> +# FS QA Test No. 353
+
+[Severity: High]
+Is this patch targeted at the correct repository? This appears to be an
+fstests (xfstests) suite script, which belongs in the separate fstests
+repository rather than the Linux kernel tree.
+
+The kernel tree lacks the required fstests infrastructure (like the common/
+directory), so this script will not be runnable here.
+
+[ ... ]
+
+> +_begin_fstest auto quick acl attr
+> +
+> +. ./common/filter
+> +. ./common/attr
+
+[Severity: Medium]
+Does this script also need to source common/acl here? 
+
+The script later relies on _acl_setup_ids to set up the $acl2 variable:
+
+    _acl_setup_ids
+
+And it also uses _getfacl_filter_id in get_acl():
+
+    getfacl --absolute-names -n $filename | _filter_scratch | _getfacl_filter_id
+
+Since common/acl is not explicitly sourced, will these helpers be undefined and
+cause the test to fail with command not found errors if executed within the
+fstests framework?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260722075347.26639-1-sunk67188@gmail.com?part=1
+

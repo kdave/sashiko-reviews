@@ -1,0 +1,77 @@
+From sashiko-bot@kernel.org Tue Jul 14 05:41:42 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: fix missing chunk metadata reservation
+Date: Tue, 14 Jul 2026 03:41:39 +0000
+Message-Id: <20260714034140.0A43C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] If `btrfs_zoned_activate_one_bg()` fails, `reserve_chunk_space()` returns early without reserving the necessary chunk metadata space, leaving the newly created block group in `trans->new_bgs`.
+--
+
+--- Patch [1]: [PATCH] btrfs: zoned: fix missing chunk metadata reservation ---
+commit f1580916ccf15e9fe040a9bf42c623f87fbd8205
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: zoned: fix missing chunk metadata reservation
+
+This commit fixes a bug where a successful return from
+btrfs_zoned_activate_one_bg() would overwrite the return value,
+inadvertently skipping chunk tree metadata reservation. It introduces a
+separate variable for the activation result so success does not affect
+the reservation.
+
+Fixes: b6a98021e401 ("btrfs: zoned: activate necessary block group")
+Cc: stable@vger.kernel.org
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index ab76a5173272a..00540b96c163f 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -4532,12 +4532,14 @@ static void reserve_chunk_space(struct btrfs_trans_handle *trans,
+>  		if (IS_ERR(bg)) {
+>  			ret = PTR_ERR(bg);
+>  		} else {
+> +			int activate_ret;
+> +
+>  			/*
+>  			 * We have a new chunk. We also need to activate it for
+>  			 * zoned filesystem.
+>  			 */
+> -			ret = btrfs_zoned_activate_one_bg(info, true);
+> -			if (ret < 0)
+> +			activate_ret = btrfs_zoned_activate_one_bg(info, true);
+> +			if (activate_ret < 0)
+>  				return;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but is it safe to return early
+here if btrfs_zoned_activate_one_bg() fails?
+
+The newly created block group was already added to trans->new_bgs by the
+earlier call to btrfs_create_chunk(). By returning early, we skip the metadata
+space reservation and btrfs_chunk_alloc_add_chunk_item().
+
+Later in the transaction, btrfs_create_pending_block_groups() processes this
+block group and attempts to insert its items into the chunk tree without the
+required metadata reservation:
+
+fs/btrfs/block-group.c:btrfs_create_pending_block_groups() {
+    ...
+    ret = btrfs_chunk_alloc_add_chunk_item(trans, block_group);
+    mutex_unlock(&fs_info->chunk_mutex);
+    if (ret)
+        btrfs_abort_transaction(trans, ret);
+    ...
+}
+
+Could this lead to an -ENOSPC error and trigger a transaction abort, since
+the space was never reserved?
+
+>  
+>  			/*
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/tencent_860054603C488A379E3D21126EA610D63108@qq.com?part=1
+

@@ -1,0 +1,60 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:07:11 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: allow any block size that is no larger than
+ page size
+Date: Fri, 19 Jun 2026 09:07:08 +0000
+Message-Id: <20260619090709.A39811F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] A malformed btrfs superblock with an invalid `sectorsize` causes a kernel panic via `ASSERT` due to a missing return or `else if` in `btrfs_validate_super()`.
+--
+
+commit e405543aa0b08211d233a8c503e772ef0831f64d
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: allow any block size that is no larger than page size
+    
+This commit relaxes the 4K limitation for block sizes smaller than the page
+size. It allows any block size up to PAGE_SIZE for regular builds, and
+between BTRFS_MIN_BLOCKSIZE and BTRFS_MAX_BLOCKSIZE for experimental builds.
+
+> diff --git a/fs/btrfs/fs.c b/fs/btrfs/fs.c
+> index 907c8837a6393..5015d0148841a 100644
+> --- a/fs/btrfs/fs.c
+> +++ b/fs/btrfs/fs.c
+[ ... ]
+> @@ -142,7 +137,7 @@ bool __attribute_const__ btrfs_supported_blocksize(u32 blocksize)
+>  	ASSERT(is_power_of_2(blocksize) && blocksize >= BTRFS_MIN_BLOCKSIZE &&
+>  	       blocksize <= BTRFS_MAX_BLOCKSIZE);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but can this ASSERT be triggered
+by a malformed superblock?
+
+Looking at btrfs_validate_super() in fs/btrfs/disk-io.c, if the on-disk
+sectorsize is invalid, the code logs an error and sets ret = -EINVAL, but
+does not immediately return:
+
+fs/btrfs/disk-io.c:btrfs_validate_super() {
+	if (unlikely(!is_power_of_2(sectorsize) ||
+		     sectorsize < BTRFS_MIN_BLOCKSIZE ||
+		     sectorsize > BTRFS_MAX_METADATA_BLOCKSIZE)) {
+		btrfs_err(fs_info, "invalid sectorsize %llu", sectorsize);
+		ret = -EINVAL;
+	}
+	...
+}
+
+Does this allow execution to fall through to btrfs_supported_blocksize()
+where it evaluates this ASSERT with the known-invalid sectorsize,
+potentially crashing the kernel?
+
+> -	if (blocksize == PAGE_SIZE || blocksize == SZ_4K || blocksize == BTRFS_MIN_BLOCKSIZE)
+> +	if (blocksize <= PAGE_SIZE)
+>  		return true;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1781859111.git.wqu@suse.com?part=2
+

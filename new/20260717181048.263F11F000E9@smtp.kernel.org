@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Fri Jul 17 20:10:50 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/4] btrfs: pre-allocate delayed dir index for
+ non-overwrite rename
+Date: Fri, 17 Jul 2026 18:10:47 +0000
+Message-Id: <20260717181048.263F11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] The preallocated delayed dir index (`prealloc`) is permanently leaked if `btrfs_alloc_path()` fails within `btrfs_insert_dir_item()`.
+--
+
+--- Patch [4]: [PATCH 4/4] btrfs: pre-allocate delayed dir index for non-overwrite rename ---
+commit bfc1dc2af334e942256f1e95088001ee748afcc4
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: pre-allocate delayed dir index for non-overwrite rename
+
+This patch pre-allocates the delayed dir index for rename() without an
+overwrite target before modifying the btree. It introduces a prealloc
+parameter to btrfs_add_link() and btrfs_insert_dir_item() which takes
+ownership of the preallocated resources.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 4d9947ae08f72..9a717d21f7133 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+
+[ ... ]
+
+> @@ -6746,11 +6747,14 @@ int btrfs_add_link(struct btrfs_trans_handle *trans,
+>  	}
+>  
+>  	/* Nothing to clean up yet */
+> -	if (ret)
+> +	if (ret) {
+> +		if (prealloc)
+> +			btrfs_free_delayed_dir_index_prealloc(trans, prealloc);
+>  		return ret;
+> +	}
+>  
+>  	ret = btrfs_insert_dir_item(trans, name, parent_inode, &key,
+> -				    btrfs_inode_type(inode), index, NULL);
+> +				    btrfs_inode_type(inode), index, prealloc);
+
+[Severity: Medium]
+Does this code leak the preallocated delayed dir index on path allocation failure?
+
+If btrfs_alloc_path() fails inside btrfs_insert_dir_item(), it returns -ENOMEM
+early without freeing the prealloc structure:
+
+fs/btrfs/dir-item.c:btrfs_insert_dir_item() {
+	...
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+	...
+}
+
+However, the caller in btrfs_rename() clears its reference right after calling
+btrfs_add_link(), transferring ownership and assuming the prealloc is fully
+consumed or freed:
+
+fs/btrfs/inode.c:btrfs_rename() {
+	...
+	ret = btrfs_add_link(trans, BTRFS_I(new_dir), ...
+			     prealloc.item ? &prealloc : NULL);
+	prealloc.item = NULL;
+	...
+}
+
+Since btrfs_insert_dir_item() drops the pointer on an early failure, and the
+caller already cleared its local reference, will this memory be permanently
+leaked?
+
+>  	if (ret == -EEXIST || ret == -EOVERFLOW || ret == -ENOMEM)
+>  		goto fail_dir_item;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260717-btrfs-enomem-v1-0-cdc9c0e265d0@kernel.org?part=4
+

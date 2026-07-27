@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Thu Jun  4 11:11:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: start qgroup ioctl transactions on the quota
+ root
+Date: Thu, 04 Jun 2026 09:11:33 +0000
+Message-Id: <20260604091133.662371F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Lockless read of `fs_info->quota_root` followed by `btrfs_grab_root()` introduces a TOCTOU Use-After-Free race with concurrent quota disable.
+--
+
+commit 9db07c9c82d74bf6476c91df62111a6ff911a9af
+Author: Dongjiang Zhu <zhudongjiang@fnnas.com>
+
+btrfs: start qgroup ioctl transactions on the quota root
+
+This commit changes the qgroup ioctls to start their transactions using
+the quota root instead of the inode's root. It grabs a reference to the
+quota root before starting the transaction to handle concurrent quota disable.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 9d47d16394fc5..bec4f921aefd5 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -3637,8 +3637,15 @@ static long btrfs_ioctl_qgroup_assign(struct file *file, void __user *arg)
+>  		}
+>  	}
+>  
+> +	quota_root = btrfs_grab_root(fs_info->quota_root);
+
+[Severity: High]
+Can this lockless read of fs_info->quota_root result in a use-after-free?
+
+If a concurrent btrfs_quota_disable() call acquires qgroup_lock, sets
+fs_info->quota_root to NULL, and drops the last reference to free the root,
+could this thread read the pointer, get preempted, and then execute
+btrfs_grab_root() on the stale freed memory?
+
+Should this read and reference increment be protected by
+spin_lock(&fs_info->qgroup_lock)?
+
+> +	if (!quota_root) {
+> +		ret = -ENOTCONN;
+> +		goto drop_write;
+> +	}
+> +
+
+[ ... ]
+
+> @@ -3707,11 +3715,18 @@ static long btrfs_ioctl_qgroup_create(struct file *file, void __user *arg)
+>  		goto drop_write;
+>  	}
+>  
+> +	quota_root = btrfs_grab_root(fs_info->quota_root);
+
+[Severity: High]
+Does this have the same race with concurrent quota disable as in
+btrfs_ioctl_qgroup_assign()?
+
+> +	if (!quota_root) {
+> +		ret = -ENOTCONN;
+> +		goto drop_write;
+> +	}
+> +
+
+[ ... ]
+
+> @@ -3758,8 +3775,15 @@ static long btrfs_ioctl_qgroup_limit(struct file *file, void __user *arg)
+>  		goto drop_write;
+>  	}
+>  
+> +	quota_root = btrfs_grab_root(fs_info->quota_root);
+
+[Severity: High]
+Is this access to fs_info->quota_root susceptible to the same
+use-after-free if the root is concurrently freed?
+
+> +	if (!quota_root) {
+> +		ret = -ENOTCONN;
+> +		goto drop_write;
+> +	}
+> +
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260604085522.3872126-1-zhudongjiang@fnnas.com?part=1
+

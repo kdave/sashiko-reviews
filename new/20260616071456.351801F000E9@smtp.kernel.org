@@ -1,0 +1,108 @@
+From sashiko-bot@kernel.org Tue Jun 16 09:15:02 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: zoned: don't force read-only on transient
+ -EAGAIN from reloc merge
+Date: Tue, 16 Jun 2026 07:14:55 +0000
+Message-Id: <20260616071456.351801F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] Silent data corruption due to dangling fs_root->reloc_root pointers causing relocation retries to prematurely delete active chunks.
+- [High] Memory Leak and unmountable filesystem during mount recovery on -EAGAIN.
+--
+
+commit 3c0622c5643fba48c4d8d2d9026fe3602157eacb
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Subject: btrfs: zoned: don't force read-only on transient -EAGAIN from reloc merge
+
+This commit updates block-group reclaim to treat -EAGAIN as a soft,
+retryable condition instead of aborting the transaction. It modifies
+merge_reloc_roots() to skip triggering a filesystem error state when
+encountering -EAGAIN.
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index fb85bc8b345c7..a356161ee60c6 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+> @@ -1946,7 +1946,8 @@ void merge_reloc_roots(struct reloc_control *rc)
+>  	}
+>  out:
+>  	if (ret) {
+> -		btrfs_handle_fs_error(fs_info, ret, NULL);
+> +		if (ret != -EAGAIN)
+> +			btrfs_handle_fs_error(fs_info, ret, NULL);
+>  		free_reloc_roots(&reloc_roots);
+>  
+>  		/* new reloc root may be added */
+> @@ -1971,6 +1972,7 @@ void merge_reloc_roots(struct reloc_control *rc)
+>  	 *
+>  	 * The remaining nodes will be cleaned up by put_reloc_control().
+>  	 */
+> +	return ret;
+>  }
+
+[Severity: Critical]
+Does returning -EAGAIN here without queueing the roots onto
+dirty_subvol_roots prevent fs_root->reloc_root from being cleaned up?
+
+If clean_dirty_subvols() is bypassed, the dangling pointer remains. During
+the chunk reclaim retry, btrfs_init_reloc_root() will observe the uncleared
+fs_root->reloc_root and assume it is already initialized:
+
+fs/btrfs/relocation.c:btrfs_init_reloc_root() {
+    ...
+    if (root->reloc_root) {
+        btrfs_set_root_last_trans(root->reloc_root, trans->transid);
+        goto out;
+    }
+    ...
+}
+
+Because it jumps to out, it skips adding the root to the new rc->reloc_roots
+list. Could this result in an empty reloc_roots list, making
+merge_reloc_roots() implicitly succeed, and causing the active chunk to be
+deleted while subvolumes still reference the freed space?
+
+[ ... ]
+
+> @@ -5669,7 +5673,9 @@ int btrfs_recover_relocation(struct btrfs_fs_info *fs_info)
+>  	if (ret)
+>  		goto out_unset;
+>  
+> -	merge_reloc_roots(rc);
+> +	ret = merge_reloc_roots(rc);
+> +	if (ret)
+> +		goto out_unset;
+
+[Severity: High]
+Does this jump to out_unset cause a memory leak during mount recovery?
+
+By jumping directly to out_unset, we bypass out_clean, which is responsible
+for invoking clean_dirty_subvols() to clear root->reloc_root.
+
+Since btrfs_handle_fs_error() was also bypassed for -EAGAIN earlier,
+BTRFS_FS_ERROR(fs_info) evaluates to false. During the subsequent mount
+failure cleanup, btrfs_drop_and_free_fs_root() skips dropping the
+reloc_root references:
+
+fs/btrfs/disk-io.c:btrfs_drop_and_free_fs_root() {
+    ...
+    if (unlikely(BTRFS_FS_ERROR(fs_info))) {
+        ASSERT(root->log_root == NULL);
+        if (root->reloc_root) {
+            btrfs_put_root(root->reloc_root);
+            root->reloc_root = NULL;
+        }
+    }
+    ...
+}
+
+Additionally, since there is no retry loop in btrfs_recover_relocation(),
+does propagating -EAGAIN here cause the mount to permanently fail?
+
+>  
+>  	unset_reloc_control(rc);
+>
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616065129.318703-1-johannes.thumshirn@wdc.com?part=1
+

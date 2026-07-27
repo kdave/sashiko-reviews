@@ -1,0 +1,91 @@
+From sashiko-bot@kernel.org Mon Jun 15 19:27:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: send: fix is_current_inode_path() to avoid
+ path resets for common prefixes
+Date: Mon, 15 Jun 2026 17:27:20 +0000
+Message-Id: <20260615172720.9F0081F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [Low] The comment inside is_current_inode_path() inverts the bug scenario and misrepresents the role of the length check.
+
+Pre-existing issues:
+- [Critical] User xattrs whose names are prefixes of special xattrs (e.g., 'security.capability') are incorrectly skipped or mutated during btrfs send.
+--
+
+commit 157d07029573939f771d4efbf454fedc283b60f8
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: send: fix is_current_inode_path() to avoid path resets for common prefixes
+
+This commit fixes a regression in is_current_inode_path() where it
+incorrectly returned true if the current inode's path was a prefix of
+the given path. It corrects the issue by replacing strncmp with a length
+check followed by strcmp.
+
+> diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+> index 89d72d8cb85fd..d89581518a067 100644
+> --- a/fs/btrfs/send.c
+> +++ b/fs/btrfs/send.c
+> @@ -624,7 +624,14 @@ static inline bool is_current_inode_path(const struct send_ctx *sctx,
+>  {
+>  	const struct fs_path *cur = &sctx->cur_inode_path;
+>  
+> -	return (strncmp(path->start, cur->start, fs_path_len(cur)) == 0);
+> +	/*
+> +	 * Path may be a prefix of the current inode's path, so return false if
+> +	 * the lengths are different.
+> +	 */
+
+[Severity: Low]
+This isn't a bug, but does this comment invert the actual scenario being
+fixed?
+
+If the given path were a prefix of the current inode's path cur (the
+scenario described by the comment), the original strncmp using
+fs_path_len(cur) would have correctly returned false, since it would hit
+the null terminator in path before finishing the comparison.
+
+The issue seems to occur when cur is a prefix of path. Is the comment
+accurate about the roles of the two paths?
+
+> +	if (fs_path_len(path) != fs_path_len(cur))
+> +		return false;
+> +
+> +	return (strcmp(path->start, cur->start) == 0);
+>  }
+
+[Severity: Critical]
+This is a pre-existing issue, but it looks like a similar prefix-matching
+regression might exist in __process_new_xattr().
+
+fs/btrfs/send.c:__process_new_xattr() {
+    ...
+	/* Capabilities are emitted by finish_inode_if_needed */
+	if (!strncmp(name, XATTR_NAME_CAPS, name_len))
+		return 0;
+
+	/*
+	 * This hack is needed because empty acls are stored as zero byte
+	 * data in xattrs. Problem with that is, that receiving these zero byte
+	 * acls will fail later. To fix this, we send a dummy acl list that
+	 * only contains the version number and no entries.
+	 */
+	if (!strncmp(name, XATTR_NAME_POSIX_ACL_ACCESS, name_len) ||
+	    !strncmp(name, XATTR_NAME_POSIX_ACL_DEFAULT, name_len)) {
+    ...
+}
+
+If name is a user xattr that is a prefix of a special xattr (for example,
+"security.cap" with length 12 compared against XATTR_NAME_CAPS
+"security.capability" length 19), will strncmp evaluate to 0 because it
+only checks up to name_len characters?
+
+Could this cause valid user xattrs to be entirely skipped in the send
+stream, or in the case of POSIX ACL prefixes, have their data replaced with
+a dummy ACL?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/ef59cdc332942f989bda1448b95007c6c2d55f82.1781543363.git.fdmanana@suse.com?part=1
+

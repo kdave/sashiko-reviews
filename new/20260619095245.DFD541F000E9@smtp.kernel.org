@@ -1,0 +1,78 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:52:48 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 14/15] btrfs: tests: add RAID5 RAID-stripe-tree
+ create/update/delete tests
+Date: Fri, 19 Jun 2026 09:52:45 +0000
+Message-Id: <20260619095245.DFD541F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] Missing validation of device ID in RAID5 stripe test.
+--
+
+commit a0de4a8e86c337e082f13022aabcb8827ef4774e
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Subject: btrfs: tests: add RAID5 RAID-stripe-tree create/update/delete tests
+
+This commit adds RAID5 stripe-tree unit tests, mirroring the existing
+coverage for RAID1 profiles. It provides test coverage for simple
+create/delete as well as create/update/delete cycles of a full 3-device
+stripe. The tests are intended to verify that both data and parity stripes
+resolve to the expected devices and physical addresses.
+
+> diff --git a/fs/btrfs/tests/raid-stripe-tree-tests.c b/fs/btrfs/tests/raid-stripe-tree-tests.c
+> index f78e548d29d27..6a4e298e3f9a6 100644
+> --- a/fs/btrfs/tests/raid-stripe-tree-tests.c
+> +++ b/fs/btrfs/tests/raid-stripe-tree-tests.c
+
+[ ... ]
+
+> +/* Verify a RAID5 data or parity stripe resolves to @phys. */
+> +static int check_raid5_stripe(struct btrfs_fs_info *fs_info, u64 logical,
+> +			      u64 len, u64 devid, u64 phys, bool parity)
+> +{
+> +	struct btrfs_io_stripe io_stripe = { 0 };
+> +	int ret;
+> +
+> +	io_stripe.dev = btrfs_device_by_devid(fs_info->fs_devices, devid);
+> +	if (!io_stripe.dev) {
+> +		test_err("cannot find device with devid %llu", devid);
+> +		return -EINVAL;
+> +	}
+> +
+> +	if (parity)
+> +		ret = btrfs_get_parity_extent(fs_info, logical, &len,
+> +					      RST_TEST_RAID5_TYPE, &io_stripe);
+> +	else
+> +		ret = btrfs_get_raid_extent_offset(fs_info, logical, &len,
+> +						   RST_TEST_RAID5_TYPE, 0,
+> +						   &io_stripe);
+> +	if (ret) {
+> +		test_err("lookup of %s extent [%llu, %llu] failed: %d",
+> +			 parity ? "parity" : "data", logical, logical + len, ret);
+> +		return ret;
+> +	}
+> +
+> +	if (io_stripe.physical != phys) {
+> +		test_err("invalid %s physical, expected %llu, got %llu",
+> +			 parity ? "parity" : "data", phys, io_stripe.physical);
+> +		return -EINVAL;
+> +	}
+
+[Severity: Low]
+The commit message mentions verifying that each stripe "resolves to the
+expected device/physical". The code here correctly verifies that
+io_stripe.physical matches phys, but does it also need to check that the
+returned io_stripe.dev->devid matches the expected devid?
+
+Since btrfs_get_raid_extent() and btrfs_get_parity_extent() overwrite the
+dev pointer in the passed io_stripe struct with the device found in the
+tree item, without an explicit assertion on the returned device ID, couldn't
+the test pass even if the tree item pointed to an incorrect device?
+
+> +
+> +	return 0;
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=14
+

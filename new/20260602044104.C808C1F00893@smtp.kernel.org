@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Tue Jun  2 06:41:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: add a new test case for fstrim crash
+Date: Tue, 02 Jun 2026 04:41:04 +0000
+Message-Id: <20260602044104.C808C1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] `_require_batched_discard` is incorrectly called on an unmounted `$SCRATCH_MNT`.
+- [Medium] The patch adds an fstests script directly to the Linux kernel repository instead of the separate fstests repository.
+--
+
+commit fcad36bbafdae2a7b1d4200c1a1d6eef01e33b70
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a new test case for fstrim crash
+
+This commit adds a new test case for an fstrim crash caused by a
+re-appearing missing device.
+
+Link: https://lore.kernel.org/linux-btrfs/wlwir19t.fsf@damenly.org/
+
+> diff --git a/tests/btrfs/350 b/tests/btrfs/350
+> new file mode 100755
+> index 0000000000000..1206d66f19e33
+> --- /dev/null
+> +++ b/tests/btrfs/350
+> @@ -0,0 +1,38 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+
+[Severity: Medium]
+Is this patch intended for the fstests repository rather than the Linux kernel
+tree?
+
+The file path tests/btrfs/350 and the framework primitives belong to the
+separate fstests project. Applying this patch here creates an unused directory
+at the root of the kernel tree instead of adding the test to fstests.
+
+[ ... ]
+
+> +dev1=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{ print $1 }')
+> +dev2=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{ print $2 }')
+> +
+> +_scratch_pool_mkfs "-m raid1 -d raid1"
+> +_require_batched_discard $SCRATCH_MNT
+> +
+> +# Mount the filesystem in degraded mode
+> +_btrfs_forget_or_module_reload
+> +_mount -o degraded $dev1 $SCRATCH_MNT
+
+[Severity: High]
+Is it expected to call _require_batched_discard before mounting the scratch
+filesystem?
+
+Because the filesystem has not yet been mounted at $SCRATCH_MNT, fstrim will
+operate on the underlying host filesystem where the empty mountpoint directory
+resides.
+
+Could this evaluate the discard capability of the host filesystem instead of
+the scratch devices, and potentially unintentionally trim the host filesystem?
+
+Should this check be deferred until after the _mount command?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260602043347.50381-1-wqu@suse.com?part=1
+

@@ -1,0 +1,99 @@
+From sashiko-bot@kernel.org Fri Jun  5 18:54:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix use-after-free after relocation failure with
+ concurrent COW
+Date: Fri, 05 Jun 2026 16:54:30 +0000
+Message-Id: <20260605165431.145BE1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Critical] `__del_reloc_root()` operates on the global `fs_info->reloc_ctl` instead of the specific `reloc_control` structure being cleaned up, leading to cross-relocation state corruption.
+- [High] Shallow refcounting of `struct reloc_control` extends its lifetime without extending the lifetime of the objects it points to (`block_group`, `data_inode`), causing Use-After-Free vulnerabilities.
+- [High] The newly added `ASSERT` in `put_reloc_control` unconditionally dereferences `rc->extent_root`, which is NULL if `reloc_chunk_start` fails, leading to a NULL pointer dereference.
+--
+
+commit 6c4a36af9b6afbaf7ddc4c2bebd6516a2359a15b
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix use-after-free after relocation failure with concurrent COW
+
+This commit addresses a use-after-free on the reloc control structure during
+a relocation failure when a concurrent task is COWing a subvolume leaf. It
+implements a refcount for the reloc control structure to ensure it remains
+alive while concurrent tasks hold a reference.
+
+Link: https://lore.kernel.org/linux-btrfs/6a1df323.bb0696ed.125a22.000a.GAE@google.com/
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 80aac9fcd6279..1af5d0d67af32 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+
+[ ... ]
+
+> +/* Helper to delete the 'address of tree root -> reloc tree' mapping. */
+> +static void __del_reloc_root(struct btrfs_root *root)
+> +{
+> +	struct btrfs_fs_info *fs_info = root->fs_info;
+> +	struct rb_node *rb_node;
+> +	struct mapping_node AUTO_KFREE(node);
+> +	struct reloc_control *rc = fs_info->reloc_ctl;
+
+[Severity: Critical]
+Does this global fetch of fs_info->reloc_ctl lead to cross-relocation state
+corruption?
+
+Because put_reloc_control() lazily frees the structure when rc->refs drops to
+zero, it calls free_reloc_roots() which in turn calls __del_reloc_root(). If
+the last reference is dropped asynchronously after the original relocation has
+ended, fs_info->reloc_ctl might point to a newly started relocation control
+structure.
+
+Could this incorrectly lock and erase nodes from the new, active relocation's
+RB-tree using the old root's metadata, causing unrecoverable state corruption?
+
+[ ... ]
+
+> +static void put_reloc_control(struct reloc_control *rc)
+> +{
+> +	if (refcount_dec_and_test(&rc->refs)) {
+> +		struct mapping_node *node, *tmp;
+> +
+> +		ASSERT(rc->extent_root->fs_info->reloc_ctl != rc);
+
+[Severity: High]
+Can this ASSERT trigger a NULL pointer dereference if the control structure
+is freed early?
+
+Looking at btrfs_relocate_block_group(), rc is allocated and then
+reloc_chunk_start() is called before rc->extent_root is initialized. If
+reloc_chunk_start() fails (for example, due to cancellation), it jumps to the
+error path and calls put_reloc_control(rc) while rc->extent_root is still
+NULL. Evaluating this ASSERT would crash the kernel.
+
+[ ... ]
+
+> @@ -5456,7 +5486,7 @@ int btrfs_relocate_block_group(struct btrfs_fs_info *fs_info, u64 group_start,
+>  	reloc_chunk_end(fs_info);
+>  out_put_bg:
+>  	btrfs_put_block_group(bg);
+> -	free_reloc_control(rc);
+> +	put_reloc_control(rc);
+>  	return ret;
+>  }
+
+[Severity: High]
+Does this shallow refcounting leave the block_group and data_inode vulnerable
+to a use-after-free?
+
+When the structure is made refcounted, a concurrent COW task can safely retain
+a reference to rc. However, in btrfs_relocate_block_group(), the references to
+rc->block_group (via btrfs_put_block_group()) and rc->data_inode (via iput()
+earlier in the exit path) are unconditionally dropped right before exiting.
+
+If a COW task executing replace_file_extents() continues after this, will it
+dereference the freed rc->block_group and pass the freed rc->data_inode to
+get_new_location(), resulting in a use-after-free for both objects?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/3d57517e6e8ace7f1294277b0f03baa1150be55c.1780677297.git.fdmanana@suse.com?part=1
+

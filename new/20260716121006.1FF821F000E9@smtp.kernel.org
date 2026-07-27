@@ -1,0 +1,69 @@
+From sashiko-bot@kernel.org Thu Jul 16 14:10:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/5] btrfs: walk waited ordered extents in place
+Date: Thu, 16 Jul 2026 12:10:05 +0000
+Message-Id: <20260716121006.1FF821F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Missing `cond_resched_lock()` in the extent skipping paths of `btrfs_wait_ordered_extents()` causes soft lockups.
+--
+
+--- Patch [3]: [PATCH 3/5] btrfs: walk waited ordered extents in place ---
+commit 873ef345dbd42db4afa0c91c1a8a9a0e196230e3
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: walk waited ordered extents in place
+    
+btrfs_wait_ordered_extents() splices root->ordered_extents onto a private
+list while it flushes and waits, making the ordered extents temporarily
+invisible on the root. Walk the list in place instead, moving each entry to
+the tail as it is processed and guarding against re-queueing with the new
+BTRFS_ORDERED_FLUSHING flag.
+
+> diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+> index b32d4eabe0abe..11aa7e8efe04b 100644
+> --- a/fs/btrfs/ordered-data.c
+> +++ b/fs/btrfs/ordered-data.c
+
+[ ... ]
+
+> @@ -778,20 +784,22 @@ u64 btrfs_wait_ordered_extents(struct btrfs_root *root, u64 nr,
+>  
+>  	mutex_lock(&root->ordered_extent_mutex);
+>  	spin_lock(&root->ordered_extent_lock);
+> -	list_splice_init(&root->ordered_extents, &splice);
+> -	while (!list_empty(&splice) && nr) {
+> -		ordered = list_first_entry(&splice, struct btrfs_ordered_extent,
+> +	remaining = root->nr_ordered_extents;
+> +	while (remaining && nr && !list_empty(&root->ordered_extents)) {
+> +		remaining--;
+> +		ordered = list_first_entry(&root->ordered_extents,
+> +					   struct btrfs_ordered_extent,
+>  					   root_extent_list);
+> +		list_move_tail(&ordered->root_extent_list,
+> +			       &root->ordered_extents);
+>  
+> -		if (range_end <= ordered->disk_bytenr ||
+> -		    ordered->disk_bytenr + ordered->disk_num_bytes <= range_start) {
+> -			list_move_tail(&ordered->root_extent_list, &skipped);
+> -			cond_resched_lock(&root->ordered_extent_lock);
+> +		if (!ordered_in_range(ordered, range_start, range_end))
+> +			continue;
+> +
+> +		/* Already queued to 'works' by this call, skip on revisit. */
+> +		if (test_and_set_bit(BTRFS_ORDERED_FLUSHING, &ordered->flags))
+>  			continue;
+
+[Severity: High]
+Does skipping the cond_resched_lock() call when an extent is out of range
+or already flushing risk causing soft lockups?
+
+If there is a very large number of skipped ordered extents, this loop will
+continuously process them while holding root->ordered_extent_lock with
+preemption disabled. The original code explicitly called
+cond_resched_lock(&root->ordered_extent_lock) before continuing to the
+next extent to allow other tasks to acquire the lock and avoid CPU stalls.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260716115656.1319295-1-johannes.thumshirn@wdc.com?part=3
+

@@ -1,0 +1,140 @@
+From sashiko-bot@kernel.org Tue Jul 21 23:47:38 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 23/23] xfs: enable ro-compat fs-verity flag
+Date: Tue, 21 Jul 2026 21:47:36 +0000
+Message-Id: <20260721214736.BE41A1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] iomap_read_folio leaves folios uninitialized when reading holes in fsverity metadata before verity info is fully initialized.
+- [High] xfs_read_ioend_compare fails to prioritize fsverity metadata ioends when i_size is a multiple of 65536, risking a deadlock.
+--
+
+--- Patch [23]: [PATCH v13 23/23] xfs: enable ro-compat fs-verity flag ---
+commit 5f8162d77d6bed612cb73e447593086acaf4bad3
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: enable ro-compat fs-verity flag
+
+Finalize fs-verity integration in XFS by making kernel fs-verity aware with
+ro-compat flag.
+
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index 51293b6f331f0..135be711f9a40 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+
+[ ... ]
+
+> @@ -181,6 +183,49 @@ xfs_end_ioend_write(
+[ ... ]
+> +static int
+> +xfs_read_ioend_compare(
+> +	void			*priv,
+> +	const struct list_head	*a,
+> +	const struct list_head	*b)
+> +{
+> +	struct iomap_ioend	*ia = container_of(a, struct iomap_ioend,
+> +			io_list);
+> +	struct iomap_ioend	*ib = container_of(b, struct iomap_ioend,
+> +			io_list);
+> +	loff_t			i_size = i_size_read(ia->io_inode);
+> +
+> +	if (!IS_VERITY(ia->io_inode))
+> +		return iomap_ioend_compare(priv, a, b);
+> +
+> +	if (ia->io_offset > i_size && ib->io_offset < i_size)
+> +		return -1;
+> +	if (ia->io_offset < i_size && ib->io_offset > i_size)
+> +		return 1;
+> +	return 0;
+> +}
+
+[Severity: High]
+Does xfs_read_ioend_compare() fail to correctly identify metadata ioends when their
+offset exactly equals i_size?
+
+If an unprivileged user creates an fsverity file with an i_size exactly a multiple
+of 65536 (XFS_FSVERITY_START_ALIGN), xfs_fsverity_metadata_offset() returns an offset
+equal to i_size. When comparing the metadata ioend (io_offset == i_size) and data
+ioend (io_offset < i_size), both greater-than and less-than checks fail, returning 0.
+
+Could this leave the data ioend ahead of the metadata ioend in the completion list,
+causing the worker thread to self-deadlock while waiting for metadata folio locks?
+
+[ ... ]
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> new file mode 100644
+> index 0000000000000..462223b4619b0
+> --- /dev/null
+> +++ b/fs/xfs/xfs_fsverity.c
+
+[ ... ]
+
+> @@ -0,0 +1,480 @@
+[ ... ]
+> +static int
+> +xfs_fsverity_get_descriptor(
+> +	struct inode		*inode,
+> +	void			*buf,
+> +	size_t			buf_size)
+> +{
+> +	struct xfs_inode	*ip = XFS_I(inode);
+> +	struct xfs_mount	*mp = ip->i_mount;
+> +	__be32			d_desc_size;
+> +	u32			desc_size;
+> +	u64			desc_size_pos;
+> +	int			error;
+> +	u64			desc_pos;
+> +	struct xfs_bmbt_irec	rec;
+> +	int			is_empty;
+> +	uint32_t		blocksize = i_blocksize(VFS_I(ip));
+> +	xfs_fileoff_t		last_block_offset;
+> +
+> +	ASSERT(inode->i_flags & S_VERITY);
+> +	xfs_ilock(ip, XFS_ILOCK_SHARED);
+> +	error = xfs_bmap_last_extent(NULL, ip, XFS_DATA_FORK, &rec, &is_empty);
+> +	xfs_iunlock(ip, XFS_ILOCK_SHARED);
+> +	if (error)
+> +		return error;
+> +
+> +	if (is_empty)
+> +		return -ENODATA;
+> +
+> +	last_block_offset =
+> +		XFS_FSB_TO_B(mp, rec.br_startoff + rec.br_blockcount);
+> +	if (last_block_offset <= xfs_fsverity_metadata_offset(ip))
+> +		return -ENODATA;
+> +
+> +	desc_size_pos = last_block_offset - sizeof(__be32);
+> +	error = fsverity_pagecache_read(inode, (char *)&d_desc_size,
+> +			sizeof(d_desc_size), desc_size_pos);
+
+[Severity: Critical]
+Is it possible for xfs_fsverity_get_descriptor() to leak uninitialized kernel memory
+to userspace?
+
+If a maliciously crafted XFS image has an unallocated hole for the fsverity
+descriptor block, this triggers an iomap read with IOMAP_F_FSVERITY set. Because
+ctx->vi is NULL during initialization, iomap_read_folio_iter() skips 
+fsverity_fill_zerohash() and bypasses the hole-zeroing logic:
+
+fs/iomap/buffered-io.c:iomap_read_folio_iter() {
+    ...
+		if ((iomap->flags & IOMAP_F_FSVERITY) &&
+		    iomap->type == IOMAP_HOLE) {
+			if (ctx->vi)
+				fsverity_fill_zerohash(folio, poff, plen,
+						       ctx->vi);
+			iomap_set_range_uptodate(folio, poff, plen);
+		} else if (iomap_block_needs_zeroing(iter, pos)) {
+    ...
+}
+
+Could the newly allocated folio be marked as uptodate without being zeroed, allowing
+uninitialized kernel memory to be copied into the buffer and returned to userspace via
+the ioctl?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=23
+

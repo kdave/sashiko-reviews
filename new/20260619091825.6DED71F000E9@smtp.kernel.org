@@ -1,0 +1,129 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:18:31 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 05/15] btrfs: load raid56 block-groups
+Date: Fri, 19 Jun 2026 09:18:25 +0000
+Message-Id: <20260619091825.6DED71F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [Critical] bg->alloc_offset calculation for RAID5/6 incorrectly handles missing devices, leading to logical offset rewind and silent data corruption.
+- [Critical] The formula to calculate bg->alloc_offset subtracts a full stripe of parity for partially written rows, causing integer underflow.
+- [High] bg->zone_capacity is inconsistently reduced on degraded mounts depending on the missing device's array index.
+- [High] Explicitly opened zones with alloc_offset == 0 are incorrectly skipped, failing to track active zones.
+--
+
+commit 7b43aeed135322be304b3812aafe81784c70a6a7
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: load raid56 block-groups
+
+This commit adds support for loading RAID5/6 block-groups on mount for zoned
+storage by recovering allocation offsets and zone capacities from device write
+pointers.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index ab386b4afa725..fcc9607273742 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -1855,6 +1855,72 @@ static int btrfs_load_block_group_raid10(struct btrfs_block_group *bg,
+>  	return 0;
+>  }
+>  
+> +static int btrfs_load_block_group_raid56(struct btrfs_block_group *bg,
+> +					 struct btrfs_chunk_map *map,
+> +					 struct zone_info *zone_info,
+> +					 unsigned long *active,
+> +					 u64 last_alloc)
+> +{
+
+[ ... ]
+
+> +	for (int i = 0; i < map->num_stripes; i++) {
+> +		if (zone_info[i].alloc_offset == WP_MISSING_DEV)
+> +			continue;
+> +		if (zone_info[i].alloc_offset == WP_CONVENTIONAL) {
+> +			has_conventional = true;
+> +			continue;
+> +		}
+> +		wp_sum += zone_info[i].alloc_offset;
+> +	}
+
+[Severity: Critical]
+Does skipping WP_MISSING_DEV here artificially shrink wp_sum by the missing
+device's contribution?
+
+Because row_bytes later correctly accounts for all num_stripes devices,
+dividing a deficient wp_sum by row_bytes and subtracting the parity size can
+compute a dangerously low logical allocation offset.
+
+Will the allocator start at this rewound offset on subsequent zone append
+operations and overwrite previously committed data and parity stripes?
+
+> +
+> +	if (has_conventional) {
+> +		bg->alloc_offset = last_alloc;
+> +	} else {
+> +		u64 row_bytes = (u64)map->num_stripes << BTRFS_STRIPE_LEN_SHIFT;
+> +		u64 nr_rows = div64_u64(wp_sum + row_bytes - 1, row_bytes);
+> +
+> +		bg->alloc_offset = wp_sum -
+> +			(((u64)nr_rows * nr_parity) << BTRFS_STRIPE_LEN_SHIFT);
+> +	}
+
+[Severity: Critical]
+Can this subtraction underflow for partially written rows?
+
+Since nr_rows rounds up, a partially written row will subtract a full row's
+worth of parity bytes from a wp_sum that only includes the partial bytes.
+
+Could this cause an unsigned integer underflow that rewinds the allocation
+pointer to near U64_MAX?
+
+> +
+> +	for (int i = 0; i < nr_data; i++) {
+> +		if (zone_info[i].alloc_offset == WP_MISSING_DEV)
+> +			continue;
+> +		bg->zone_capacity += zone_info[i].capacity;
+> +	}
+
+[Severity: High]
+Is this loop inconsistently reducing bg->zone_capacity on degraded mounts
+depending on the missing device's array index?
+
+Since the loop rigidly bounds to nr_data, a missing device within the data
+index range shrinks the block group's usable logical capacity. However, if a
+parity device is missing, it is completely ignored and capacity is unaffected.
+
+Because RAID5/6 rotates data and parity physically across all devices,
+shouldn't the block group's total logical capacity remain constant regardless
+of which physical device is missing?
+
+> +
+> +	for (int i = 0; i < map->num_stripes; i++) {
+> +		if (!map->stripes[i].dev->bdev)
+> +			continue;
+> +		if (!btrfs_dev_is_sequential(map->stripes[i].dev,
+> +					     map->stripes[i].physical))
+> +			continue;
+> +		if (zone_info[i].alloc_offset != 0 && test_bit(i, active)) {
+> +			set_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &bg->runtime_flags);
+> +			break;
+> +		}
+> +	}
+
+[Severity: High]
+Could requiring alloc_offset != 0 cause us to skip explicitly opened zones
+where no data has been written yet?
+
+On a zoned block device, a zone can be explicitly opened (consuming an active
+zone resource) while its alloc_offset is still 0.
+
+By rejecting these zones, is it possible the block group avoids being added
+to fs_info->zone_active_bgs, preventing Btrfs from finishing it to reclaim
+the device's active zone limit?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=5
+

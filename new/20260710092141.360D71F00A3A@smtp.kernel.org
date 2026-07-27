@@ -1,0 +1,146 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:23:13 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 14/20] xfs: add fs-verity support
+Date: Fri, 10 Jul 2026 09:21:40 +0000
+Message-Id: <20260710092141.360D71F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 5 potential issue(s) to consider:
+- [High] xfs_fsverity_delete_metadata removes extents without invalidating the page cache, causing writeback corruption.
+- [High] Double unlock of XFS_ILOCK_EXCL in the error path of xfs_fsverity_cancel_unwritten.
+- [High] xfs_fsverity_cancel_unwritten unconditionally advances past incomplete unmap operations.
+- [High] Unlocked initialization of ip->i_cowfp introduces a data race with concurrent fork format queries.
+- [Medium] Direct bitwise modification of inode->i_flags creates a read-modify-write data race.
+--
+
+--- Patch [14]: [PATCH v11 14/20] xfs: add fs-verity support ---
+commit b5b28e93427666d4836b10d2ca470f8fe9c45022
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: add fs-verity support
+
+Add integration with fs-verity. XFS stores fs-verity descriptor and
+Merkle tree in the inode data fork at first block aligned to 64k past
+EOF.
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index e3c8ac51c43fc..0d66aec433836 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+[ ... ]
+> +static int
+> +xfs_fsverity_delete_metadata(
+> +	struct xfs_inode	*ip)
+> +{
+[ ... ]
+> +	/*
+> +	 * We removing post EOF data, no need to update i_size as fsverity
+> +	 * didn't move i_size in the first place
+> +	 */
+> +	error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, XFS_ISIZE(ip));
+
+[Severity: High]
+Does this leave stale dirty pages in the page cache?
+
+If fsverity enablement fails after the Merkle tree blocks have been written
+to the page cache, xfs_fsverity_delete_metadata() removes the physical extents
+on disk via xfs_itruncate_extents(). However, it doesn't seem to invalidate
+the corresponding dirty pages in the page cache.
+
+When writeback later attempts to flush these past-EOF dirty pages, could it
+try to write to extents that no longer exist, causing XFS writeback to fail?
+
+> +	if (error)
+> +		goto err_cancel;
+[ ... ]
+> +static int
+> +xfs_fsverity_end_enable(
+> +	struct file		*file,
+> +	const void		*desc,
+> +	size_t			desc_size,
+> +	u64			merkle_tree_size)
+> +{
+[ ... ]
+> +	/*
+> +	 * Proactively drop any delayed allocations in COW fork, the fsverity
+> +	 * files are read-only
+> +	 */
+> +	if (xfs_is_cow_inode(ip)) {
+> +		if (!ip->i_cowfp)
+> +			xfs_ifork_init_cow(ip);
+
+[Severity: High]
+Does initializing ip->i_cowfp without holding XFS_ILOCK_EXCL introduce a data
+race?
+
+In xfs_fsverity_end_enable(), xfs_ifork_init_cow() is called without holding
+XFS_ILOCK_EXCL. Background processes like XFS online scrub take
+XFS_ILOCK_SHARED to safely inspect inode forks.
+
+If scrub runs concurrently, could it see ip->i_cowfp != NULL but read an
+uninitialized if_format due to a lack of memory barriers, resulting in a crash?
+
+> +		xfs_bmap_punch_delalloc_range(ip, XFS_COW_FORK, 0, LLONG_MAX,
+> +				NULL);
+> +	}
+[ ... ]
+> +	error = xfs_trans_commit(tp);
+> +	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+> +
+> +	if (!error)
+> +		inode->i_flags |= S_VERITY;
+
+[Severity: Medium]
+Does direct bitwise modification of inode->i_flags create a data race?
+
+Although XFS_IOLOCK_EXCL is held, other VFS paths might modify or read i_flags
+under inode->i_lock. Modifying the flags using a raw bitwise OR can lead to
+lost flag updates or torn reads. Should this use inode_set_flags() to ensure
+atomicity under the inode lock?
+
+> +
+> +out:
+> +	if (error) {
+[ ... ]
+
+In xfs_fsverity_cancel_unwritten():
+
+[Severity: High]
+Does the error path cause a double-unlock of XFS_ILOCK_EXCL?
+
+fs/xfs/xfs_fsverity.c:xfs_fsverity_cancel_unwritten() {
+    ...
+    xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+    error = xfs_bunmapi(tp, ip, imap.br_startoff, imap.br_blockcount, 0, 1, &done);
+    if (error)
+        goto out_cancel;
+    ...
+out_cancel:
+    xfs_trans_cancel(tp);
+    xfs_iunlock(ip, XFS_ILOCK_EXCL);
+    ...
+}
+
+Calling xfs_trans_cancel() automatically unlocks the joined inode, but the code
+then explicitly calls xfs_iunlock(ip, XFS_ILOCK_EXCL). Could this cause a
+kernel panic due to a double-unlock?
+
+[Severity: High]
+Does this unconditionally advance past incomplete unmap operations?
+
+fs/xfs/xfs_fsverity.c:xfs_fsverity_cancel_unwritten() {
+    ...
+    error = xfs_bunmapi(tp, ip, imap.br_startoff, imap.br_blockcount, 0, 1, &done);
+    ...
+    offset_fsb = imap.br_startoff + imap.br_blockcount;
+}
+
+xfs_bunmapi() limits the number of blocks it unmaps in a single transaction.
+If it unmaps a partial extent, it sets the done parameter to 0. However, this
+loop seems to ignore the done variable and unconditionally advances offset_fsb.
+
+If fsverity encounters a large unwritten extent, could this leave garbage
+unwritten metadata blocks on disk?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=14
+

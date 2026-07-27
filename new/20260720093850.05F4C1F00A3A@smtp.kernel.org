@@ -1,0 +1,146 @@
+From sashiko-bot@kernel.org Mon Jul 20 11:38:54 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v12 14/21] xfs: add fs-verity support
+Date: Mon, 20 Jul 2026 09:38:49 +0000
+Message-Id: <20260720093850.05F4C1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Critical] Background block garbage collection can silently free Merkle tree blocks during fs-verity construction.
+- [High] Fsverity descriptor retrieval fails due to trailing unwritten extent preallocations past the descriptor.
+- [Medium] Using `XFS_IS_CORRUPT` to validate the user-controllable fs-verity descriptor size triggers filesystem-wide corruption alerts and potential kernel panics.
+--
+
+--- Patch [14]: [PATCH v12 14/21] xfs: add fs-verity support ---
+commit aabad2b9088c58be4ed83b9379b987de65ca443f
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+xfs: add fs-verity support
+
+This commit adds integration with fs-verity to XFS. It stores the fs-verity
+descriptor and Merkle tree in the inode data fork past EOF, managing reading
+and writing through the iomap interface. The construction process uses a new
+XFS_IVERITY_CONSTRUCTION flag, which is cleared once the I_VERITY flag is set.
+
+> diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+> index 3b9f262f8e912..b34f2f27cc93a 100644
+> --- a/fs/xfs/xfs_bmap_util.c
+> +++ b/fs/xfs/xfs_bmap_util.c
+> @@ -553,6 +554,13 @@ xfs_can_free_eofblocks(
+>  	if (last_fsb <= end_fsb)
+>  		return false;
+>  
+> +	/*
+> +	 * Nothing to clean on fsverity inodes as they don't use prealloc and
+> +	 * there no delalloc as only written data is fsverity metadata
+> +	 */
+> +	if (IS_VERITY(VFS_I(ip)))
+> +		return false;
+> +
+
+[Severity: Critical]
+Does this logic miss files that are actively constructing their Merkle trees?
+
+During FS_IOC_ENABLE_VERITY, build_merkle_tree() drops the VFS inode lock
+(XFS_IOLOCK_EXCL) before performing buffered writes past i_size. These writes
+can tag the inode for block garbage collection.
+
+If xfs_blockgc_worker or a concurrent flush evaluates xfs_can_free_eofblocks()
+during this window, it will invoke xfs_free_eofblocks() because S_VERITY is
+not yet set.
+
+Could this lead to silent data loss of the Merkle tree blocks by truncating
+them before the verity flag is set? Would checking for
+xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION) prevent this regression?
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index e3c8ac51c43fc..4606354894e13 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+[ ... ]
+> @@ -27,3 +37,363 @@ xfs_fsverity_is_file_data(
+[ ... ]
+> +static int
+> +xfs_fsverity_get_descriptor(
+> +	struct inode		*inode,
+> +	void			*buf,
+> +	size_t			buf_size)
+> +{
+[ ... ]
+> +	desc_size_pos = last_block_offset - sizeof(__be32);
+> +	error = fsverity_pagecache_read(inode, (char *)&d_desc_size,
+> +			sizeof(d_desc_size), desc_size_pos);
+> +	if (error)
+> +		return error;
+> +
+> +	desc_size = be32_to_cpu(d_desc_size);
+> +	if (XFS_IS_CORRUPT(mp, desc_size > FS_VERITY_MAX_DESCRIPTOR_SIZE))
+> +		return -ERANGE;
+
+[Severity: Medium]
+Is XFS_IS_CORRUPT appropriate for validating data read from the
+unauthenticated data fork?
+
+The descriptor size is read from the end of the file's data fork. If the disk
+is modified or suffers bit-rot, this condition could evaluate to true.
+
+Because XFS_IS_CORRUPT triggers internal corruption alerts
+(xfs_corruption_error), it can spam dmesg and panic the kernel if
+xfs_panic_mask is configured.
+
+Since this is unauthenticated file data and not XFS metadata, xfs_repair
+cannot fix it. Can this simply be a normal range check rather than using
+metadata corruption macros?
+
+> +	if (XFS_IS_CORRUPT(mp, desc_size > desc_size_pos))
+> +		return -ERANGE;
+[ ... ]
+> +static int
+> +xfs_fsverity_end_enable(
+> +	struct file		*file,
+> +	const void		*desc,
+> +	size_t			desc_size,
+> +	u64			merkle_tree_size)
+> +{
+[ ... ]
+> +	error = xfs_fsverity_write_descriptor(file, desc, desc_size,
+> +			merkle_tree_size);
+> +	if (error)
+> +		goto out;
+> +
+> +	/*
+> +	 * Wait for Merkle tree get written to disk before setting on-disk inode
+> +	 * flag and clearing XFS_VERITY_CONSTRUCTION
+> +	 */
+> +	error = filemap_write_and_wait_range(inode->i_mapping, range_start,
+> +			LLONG_MAX);
+> +	if (error)
+> +		goto out;
+> +
+
+[Severity: High]
+Does this leave trailing unwritten preallocations past the descriptor?
+
+fsverity_ioctl_enable() writes the Merkle tree and descriptor via buffered I/O,
+which triggers XFS speculative preallocation (such as EOF preallocation or
+extent size hints).
+
+Because these unwritten extents are not cancelled here before sealing the
+file, later when xfs_fsverity_get_descriptor() calls xfs_bmap_last_extent(),
+it will find that the end of the last extent includes these trailing unwritten
+blocks.
+
+This causes the descriptor size read to return zeroes instead of the actual
+size, resulting in an -ERANGE failure and breaking the verity feature for the
+file.
+
+Should this code remove unwritten preallocations past the descriptor before
+returning?
+
+> +	/*
+> +	 * Proactively drop any delayed allocations in COW fork, the fsverity
+> +	 * files are read-only
+> +	 */
+> +	if (xfs_is_cow_inode(ip)) {
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260720090410.3487990-1-aalbersh@kernel.org?part=14
+

@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:41:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 11/15] btrfs: tests: add a RAID5 RAID-stripe-tree read
+ test
+Date: Fri, 19 Jun 2026 09:41:16 +0000
+Message-Id: <20260619094116.862CC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Double btrfs_end_transaction() on error path causes Use-After-Free of trans handle.
+--
+
+commit c7af757427282e2705f4afe0d15e3768f74cf1f4
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: tests: add a RAID5 RAID-stripe-tree read test
+
+This commit adds test_read_data_and_parity to verify that
+btrfs_get_raid_extent_offset and btrfs_get_parity_extent resolve device
+and physical addresses correctly for a full stripe. It also updates
+btrfs_insert_one_raid_extent to support inserting parity stripe keys.
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 30ea066161f62..abe0ad10ee87d 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+> @@ -341,7 +341,9 @@ int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,
+>  	struct btrfs_fs_info *fs_info = trans->fs_info;
+>  	struct btrfs_key stripe_key;
+>  	struct btrfs_root *stripe_root = fs_info->stripe_root;
+> -	const int num_stripes = btrfs_bg_type_to_factor(bioc->map_type);
+> +	const int num_stripes = (type == BTRFS_RAID_STRIPE_PARITY_KEY) ?
+> +		btrfs_nr_parity_stripes(bioc->map_type) :
+> +		btrfs_bg_type_to_factor(bioc->map_type);
+>  	struct btrfs_stripe_extent AUTO_KFREE(stripe_extent);
+>  	const size_t item_size = struct_size(stripe_extent, strides, num_stripes);
+>  	int ret;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but looking at the error path just
+below this hunk in btrfs_insert_one_raid_extent(), is there a risk of a
+use-after-free and double-free on the transaction handle?
+
+When kzalloc fails to allocate stripe_extent, the code currently calls
+btrfs_end_transaction(trans) and returns -ENOMEM:
+
+	stripe_extent = kzalloc(item_size, GFP_NOFS);
+	if (unlikely(!stripe_extent)) {
+		btrfs_abort_transaction(trans, -ENOMEM);
+		btrfs_end_transaction(trans);
+		return -ENOMEM;
+	}
+
+Since btrfs_insert_one_raid_extent() receives trans as an argument and does
+not own it, the caller will handle the error by calling
+btrfs_abort_transaction(trans, ret) and then btrfs_end_transaction(trans)
+again.
+
+Does this result in a use-after-free when dereferencing trans in the caller's
+abort path, followed by a double free when ending it again?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=11
+

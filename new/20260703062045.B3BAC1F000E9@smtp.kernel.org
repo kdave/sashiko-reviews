@@ -1,0 +1,115 @@
+From sashiko-bot@kernel.org Fri Jul  3 08:20:48 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: fix deadlock between metadata writeback
+ and transaction commit
+Date: Fri, 03 Jul 2026 06:20:45 +0000
+Message-Id: <20260703062045.B3BAC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Dropping `zoned_meta_io_lock` without taking a local reference on `tgt` in the `*active_bg != block_group` branch allows concurrent threads to cause a Use-After-Free on `tgt`.
+- [High] The patch resolves a lock inversion on `zoned_meta_io_lock` but fails to address a latent transaction state deadlock between fsync (tree-log writeback) and the transaction commit thread.
+--
+
+commit 27642281a3a314cf40c028eb496ce292045da88a
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: fix deadlock between metadata writeback and transaction commit
+    
+This commit addresses a deadlock between metadata writeback and transaction
+commit in a zoned filesystem. It releases the zoned_meta_io_lock around
+btrfs_zone_finish_one_bg() to avoid blocking the transaction committer.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 97f06dd016932..44a13ed6b8b24 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2190,7 +2190,11 @@ static bool check_bg_is_active(struct btrfs_eb_write_context *ctx,
+>  
+>  	if (fs_info->treelog_bg == block_group->start) {
+>  		if (!btrfs_zone_activate(block_group)) {
+> -			int ret_fin = btrfs_zone_finish_one_bg(fs_info);
+> +			int ret_fin;
+> +
+> +			btrfs_zoned_meta_io_unlock(fs_info);
+> +			ret_fin = btrfs_zone_finish_one_bg(fs_info);
+> +			btrfs_zoned_meta_io_lock(fs_info);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does this still leave a
+latent transaction state deadlock between fsync and the transaction commit
+thread?
+
+When btrfs_sync_file() starts a transaction, it acquires an extwriter
+reference. If it then calls btrfs_sync_log(), triggering tree-log writeback,
+btree_writepages() calls check_bg_is_active().
+
+To activate the zone, btrfs_zone_finish_one_bg() is called, which leads to
+btrfs_inc_block_group_ro().
+
+In fs/btrfs/block-group.c:btrfs_inc_block_group_ro():
+
+	if (test_bit(BTRFS_TRANS_DIRTY_BG_RUN, &trans->transaction->flags)) {
+		// ...
+		ret = btrfs_wait_for_commit(fs_info, transid);
+
+This blocks the fsync thread on btrfs_wait_for_commit().
+
+Concurrently, the transaction commit thread sets BTRFS_TRANS_DIRTY_BG_RUN
+and blocks waiting for extwriter_counter to reach 0:
+
+In fs/btrfs/transaction.c:btrfs_commit_transaction():
+
+	wait_event(cur_trans->writer_wait,
+		   extwriter_counter_read(cur_trans) == 0);
+
+Could this sequence cause a system hang on zoned filesystems during fsync?
+
+>  
+>  			if (ret_fin != 1 || !btrfs_zone_activate(block_group))
+>  				return false;
+
+[Severity: Critical]
+This is a pre-existing issue, but I have a question about the branch
+immediately following this code in check_bg_is_active().
+
+When dropping zoned_meta_io_lock in the active_bg pivot path, is it possible
+for concurrent threads to cause a use-after-free on the tgt block group?
+
+fs/btrfs/zoned.c:check_bg_is_active() {
+    ...
+	} else if (*active_bg != block_group) {
+		struct btrfs_block_group *tgt = *active_bg;
+
+		/* zoned_meta_io_lock protects fs_info->active_{meta,system}_bg. */
+		lockdep_assert_held(&fs_info->zoned_meta_io_lock);
+
+		if (tgt) {
+            ...
+			/* Pivot active metadata/system block group. */
+			btrfs_zoned_meta_io_unlock(fs_info);
+			wait_eb_writebacks(tgt);
+			do_zone_finish(tgt, true);
+			btrfs_zoned_meta_io_lock(fs_info);
+			if (*active_bg == tgt) {
+				btrfs_put_block_group(tgt);
+				*active_bg = NULL;
+			}
+    ...
+}
+
+If thread A reads tgt = *active_bg and drops the lock without taking a local
+reference, could thread B concurrently enter check_bg_is_active() and assign
+the same tgt pointer?
+
+If thread A finishes its asynchronous work, re-acquires the lock, and calls
+btrfs_put_block_group(tgt), and the block group was concurrently removed,
+this could drop the last reference and free the block group memory while
+thread B is still executing wait_eb_writebacks(tgt) or do_zone_finish(tgt).
+
+Can this memory corruption occur under heavy concurrent metadata writeback?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260703055440.117200-1-johannes.thumshirn@wdc.com?part=1
+

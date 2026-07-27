@@ -1,0 +1,85 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:17:38 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 02/15] btrfs: pass the key type to
+ btrfs_insert_one_raid_extent()
+Date: Fri, 19 Jun 2026 09:17:33 +0000
+Message-Id: <20260619091733.E5BEA1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] btrfs_insert_one_raid_extent() prematurely calls btrfs_end_transaction(trans) on the allocation error path, leading to a use-after-free and double free of the transaction handle.
+- [High] `update_raid_extent_item()` blindly overwrites an existing item without verifying that the on-disk item's size is large enough, leading to an out-of-bounds write in the extent buffer on maliciously crafted disk images.
+--
+
+commit 6307ee890e17dec7a2c1bf1be5af9a5b52bfa0ee
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: pass the key type to btrfs_insert_one_raid_extent()
+
+This patch updates btrfs_insert_one_raid_extent() to accept a type parameter 
+instead of hardcoding BTRFS_RAID_STRIPE_KEY. Callers are updated to pass 
+the explicit type. There is no functional change intended.
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 8592fa76728ea..1a6ebd10849a1 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+> @@ -334,7 +334,7 @@ static void fill_raid_stride(struct btrfs_io_stripe *stripe,
+>  
+>  EXPORT_FOR_TESTS
+>  int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,
+> -				 struct btrfs_io_context *bioc)
+> +				 struct btrfs_io_context *bioc, u8 type)
+>  {
+
+[Severity: Critical]
+This is a pre-existing issue, but I wanted to ask about the error handling
+in this function. If kzalloc() fails, btrfs_insert_one_raid_extent() calls 
+btrfs_end_transaction(trans).
+
+Since trans is owned by the caller (which will also call 
+btrfs_abort_transaction(trans) and btrfs_end_transaction(trans) when the 
+error propagates), doesn't this result in a use-after-free and double-free 
+of the trans structure? 
+
+In test environments, trans might even be allocated on the stack, so the 
+first btrfs_end_transaction() would attempt a kmem_cache_free() on a stack 
+pointer.
+
+[ ... ]
+
+> @@ -360,7 +360,7 @@ int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,
+>  	}
+>  
+>  	stripe_key.objectid = bioc->logical;
+> -	stripe_key.type = BTRFS_RAID_STRIPE_KEY;
+> +	stripe_key.type = type;
+>  	stripe_key.offset = bioc->size;
+>  
+>  	ret = btrfs_insert_item(trans, stripe_root, &stripe_key, stripe_extent,
+
+[Severity: High]
+This isn't a bug introduced by this patch, but when btrfs_insert_item()
+returns -EEXIST, the code calls update_raid_extent_item(trans, &stripe_key,
+stripe_extent, item_size).
+
+Does update_raid_extent_item() blindly overwrite the existing item without 
+verifying that the on-disk item's size is large enough? It seems to call 
+write_extent_buffer() with a newly calculated item_size derived from the 
+block group profile:
+
+fs/btrfs/raid-stripe-tree.c:update_raid_extent_item() {
+    ...
+    write_extent_buffer(leaf, stripe_extent, btrfs_item_ptr_offset(leaf, slot),
+                        item_size);
+    ...
+}
+
+If the filesystem is maliciously crafted so the existing BTRFS_RAID_STRIPE_KEY
+has a smaller size, could this write past the item's boundary and overwrite 
+adjacent item payloads in the B-tree leaf?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=2
+

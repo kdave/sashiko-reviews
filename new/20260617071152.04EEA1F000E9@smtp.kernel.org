@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Wed Jun 17 09:11:56 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: emit BTRFS_SEND_C_FILEATTR during full send
+Date: Wed, 17 Jun 2026 07:11:51 +0000
+Message-Id: <20260617071152.04EEA1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Emitting FILEATTR for newly created files causes `btrfs receive` to abort with -EINVAL when swapping mutually exclusive NOCOW and COMPR flags.
+
+Pre-existing issues:
+- [High] BTRFS_SEND_C_FILEATTR is emitted too late to successfully apply NOCOW and COMPR flags on non-empty files.
+--
+
+commit 00278c890e8710086483d76b1bff943345bf3ffb
+Author: Mateusz Poliwczak <mpoliwczak34@gmail.com>
+
+btrfs: emit BTRFS_SEND_C_FILEATTR during full send
+
+Emit BTRFS_SEND_C_FILEATTR during full send for all non-symlink newly
+created inodes to ensure their file attributes are properly synced.
+
+> diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+> index 3ae480c7474b0..effbe7ac1a814 100644
+> --- a/fs/btrfs/send.c
+> +++ b/fs/btrfs/send.c
+> @@ -6575,8 +6575,10 @@ static int finish_inode_if_needed(struct send_ctx *sctx, bool at_end)
+>  
+>  	if (!sctx->parent_root || sctx->cur_inode_new) {
+>  		need_chown = true;
+> -		if (!S_ISLNK(sctx->cur_inode_mode))
+> +		if (!S_ISLNK(sctx->cur_inode_mode)) {
+>  			need_chmod = true;
+> +			need_fileattr = true;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but will emitting the fileattr
+here successfully apply NOCOW and COMPR flags?
+
+Since finish_inode_if_needed() is called after data extents have been
+processed (BTRFS_SEND_C_WRITE or BTRFS_SEND_C_CLONE), the file's data has
+already been written and i_size > 0. When btrfs receive processes this
+command, the kernel's btrfs_fileattr_set() silently ignores setting
+BTRFS_INODE_NODATACOW if the file already has data:
+
+fs/btrfs/ioctl.c:btrfs_fileattr_set() {
+    ...
+			if (inode->vfs_inode.i_size == 0)
+				inode_flags |= BTRFS_INODE_NODATACOW |
+					       BTRFS_INODE_NODATASUM;
+    ...
+}
+
+Similarly, applying FS_COMPR_FL after data is written means the existing
+data on the destination is not compressed.
+
+
+[Severity: High]
+Can emitting the fileattr here cause btrfs receive to fatally abort?
+
+When a new file is created on the destination, it automatically inherits
+flags like FS_COMPR_FL from its parent directory. If the original source
+file had FS_NOCOW_FL, this patch will emit BTRFS_SEND_C_FILEATTR with
+FS_NOCOW_FL.
+
+When btrfs receive attempts to apply this, check_fsflags() forbids swapping
+NOCOW and COMPR in a single ioctl:
+
+fs/btrfs/ioctl.c:check_fsflags() {
+    ...
+	if ((flags & FS_NOCOW_FL) && (old_flags & (FS_COMPR_FL | FS_NOCOMP_FL)))
+		return -EINVAL;
+    ...
+}
+
+This -EINVAL error will abort the entire btrfs receive operation.
+
+> +		}
+>  		if (sctx->cur_inode_next_write_offset == sctx->cur_inode_size)
+>  			need_truncate = false;
+>  	} else {
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260617070112.1407453-1-mpoliwczak34@gmail.com?part=1
+

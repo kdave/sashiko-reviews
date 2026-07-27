@@ -1,0 +1,72 @@
+From sashiko-bot@kernel.org Wed Jul 22 14:54:11 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 7/7] btrfs: use simple booleans for log_commit field in
+ struct btrfs_root
+Date: Wed, 22 Jul 2026 12:54:05 +0000
+Message-Id: <20260722125405.927471F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Lockless read of the non-atomic `root->log_commit` boolean array in the `btrfs_sync_log_enter` tracepoint triggers a KCSAN data race.
+--
+
+--- Patch [7]: [PATCH 7/7] btrfs: use simple booleans for log_commit field in struct btrfs_root ---
+commit f988abca0c31e69d3320f6700a46fdb7464547f1
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: use simple booleans for log_commit field in struct btrfs_root
+
+This patch converts the log_commit array in struct btrfs_root from atomic
+types to simple booleans to reduce object size. The commit message states
+that these elements are always protected by the root's log_mutex for both
+reads and writes.
+
+> We are using atomic types for the log_commit array of struct btrfs_root
+> but all we need is simple booleans. The log_commit array elements are
+> always protected by the root's log_mutex, both for writes and reads, so
+> we can use a simple boolean.
+
+[Severity: Medium]
+Is this description accurate? Looking at btrfs_sync_log() in
+fs/btrfs/tree-log.c, there is a fast path that avoids taking log_mutex:
+
+fs/btrfs/tree-log.c:btrfs_sync_log() {
+	/* Avoid fist taking root->log_mutex, reduce lock contention. */
+	if (data_race(root->log_transid_committed) >= log_transid) {
+		trace_btrfs_sync_log_enter(trans, root, ctx);
+		trace_btrfs_sync_log_exit(trans, root, ctx, ctx->log_ret);
+		return ctx->log_ret;
+	}
+...
+}
+
+This calls trace_btrfs_sync_log_enter() without the log_mutex held, which
+leads to a lockless read in the tracepoint modified below.
+
+> diff --git a/include/trace/events/btrfs.h b/include/trace/events/btrfs.h
+> index 4c5c47c5edb74..083519ceecbfc 100644
+> --- a/include/trace/events/btrfs.h
+> +++ b/include/trace/events/btrfs.h
+[ ... ]
+> @@ -1578,9 +1578,9 @@ TRACE_EVENT(btrfs_sync_log_enter,
+>  		__entry->log_transid_committed	=
+>  			data_race(root->log_transid_committed);
+>  		__entry->log_committing		=
+> -			atomic_read(&root->log_commit[ctx->log_transid % 2]);
+> +			root->log_commit[ctx->log_transid % 2];
+>  		__entry->log_committing_prev	=
+> -			atomic_read(&root->log_commit[(ctx->log_transid + 1) % 2]);
+> +			root->log_commit[(ctx->log_transid + 1) % 2];
+>  		__entry->log_writers		= atomic_read(&root->log_writers);
+>  	),
+
+[Severity: Medium]
+Will this lockless read of the newly converted boolean array elements trigger
+a KCSAN data race warning?
+
+Since another thread might concurrently mutate root->log_commit under
+log_mutex, do these reads need to be wrapped in data_race() annotations
+similar to how root->log_transid_committed is handled just above them?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1784656641.git.fdmanana@suse.com?part=7
+

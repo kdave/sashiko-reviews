@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Fri Jun 19 08:35:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: decentralize transaction aborts in
+ create_reloc_root
+Date: Fri, 19 Jun 2026 06:35:32 +0000
+Message-Id: <20260619063533.129651F00ACA@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] Obsolete comment referencing the removed 'goto abort' label.
+--
+
+commit 0401a3ef31da0b5d803d0298532917af7ff499b0
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: decentralize transaction aborts in create_reloc_root
+
+This commit removes the centralized abort label in create_reloc_root() and
+replaces it with direct calls to btrfs_abort_transaction(). The goal is to
+clarify which specific call failed and triggered the transaction abort.
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index fb85bc8b345c7..9550fb59c5904 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+> @@ -719,21 +719,20 @@ static struct btrfs_root *create_reloc_root(struct btrfs_trans_handle *trans,
+>  
+>  	ret = btrfs_insert_root(trans, fs_info->tree_root,
+>  				&root_key, root_item);
+> -	if (ret)
+> -		goto abort;
+> +	if (ret) {
+> +		btrfs_abort_transaction(trans, ret);
+> +		return ERR_PTR(ret);
+> +	}
+
+[Severity: Low]
+Since this patch removes the abort label, should the comment slightly earlier
+in create_reloc_root() also be updated?
+
+It looks like the comment just before memcpy() still references the removed
+label:
+
+        /*
+         * We have changed references at this point, we must abort the
+         * transaction if anything fails (i.e. 'goto abort').
+         */
+
+>  
+>  	reloc_root = btrfs_read_tree_root(fs_info->tree_root, &root_key);
+>  	if (IS_ERR(reloc_root)) {
+>  		ret = PTR_ERR(reloc_root);
+> -		goto abort;
+> +		btrfs_abort_transaction(trans, ret);
+> +		return ERR_PTR(ret);
+>  	}
+>  	set_bit(BTRFS_ROOT_SHAREABLE, &reloc_root->state);
+>  	btrfs_set_root_last_trans(reloc_root, trans->transid);
+>  	return reloc_root;
+> -
+> -abort:
+> -	btrfs_abort_transaction(trans, ret);
+> -	return ERR_PTR(ret);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619062928.447838-1-johannes.thumshirn@wdc.com?part=1
+

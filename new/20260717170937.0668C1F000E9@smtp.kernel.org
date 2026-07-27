@@ -1,0 +1,91 @@
+From sashiko-bot@kernel.org Fri Jul 17 19:09:38 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/4] btrfs: split btrfs_insert_delayed_dir_index() into
+ prealloc and commit phases
+Date: Fri, 17 Jul 2026 17:09:36 +0000
+Message-Id: <20260717170937.0668C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] The newly introduced `btrfs_prealloc_delayed_dir_index()` function accepts a `const char *name` parameter but completely ignores it, leaving it unused. This creates an API trap where callers must manually copy the name to avoid writing uninitialized memory to disk.
+--
+
+--- Patch [1]: [PATCH 1/4] btrfs: split btrfs_insert_delayed_dir_index() into prealloc and commit phases ---
+commit f5cd5bad62d5d9231798d7feccc60fddde47a187
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: split btrfs_insert_delayed_dir_index() into prealloc and commit phases
+
+This commit splits btrfs_insert_delayed_dir_index() into three functions
+to separate the pre-allocation and commit phases. This allows callers
+to handle memory allocation failures before modifying the btree.
+
+> diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+> index 09795439b9fb6..9d7343934eea0 100644
+> --- a/fs/btrfs/delayed-inode.c
+> +++ b/fs/btrfs/delayed-inode.c
+[ ... ]
+> +/*
+> + * Pre-allocate a delayed node and delayed item for a dir index insertion.
+> + * Call this before modifying the btree so that ENOMEM can be returned
+> + * before any on-disk state has changed.
+> + *
+> + * Returns 0 on success, -ENOMEM on allocation failure.
+> + */
+> +int btrfs_prealloc_delayed_dir_index(struct btrfs_inode *dir,
+> +				     const char *name, int name_len,
+> +				     struct btrfs_dir_index_prealloc *prealloc)
+> +{
+> +	struct btrfs_delayed_node *node;
+> +	struct btrfs_delayed_item *item;
+> +
+> +	node = btrfs_get_or_create_delayed_node(dir, &prealloc->tracker);
+> +	if (IS_ERR(node))
+> +		return PTR_ERR(node);
+> +
+> +	item = btrfs_alloc_delayed_item(sizeof(struct btrfs_dir_item) + name_len,
+> +					node, BTRFS_DELAYED_INSERTION_ITEM);
+> +	if (!item) {
+> +		btrfs_release_delayed_node(node, &prealloc->tracker);
+> +		return -ENOMEM;
+> +	}
+> +
+> +	prealloc->node = node;
+> +	prealloc->item = item;
+> +	return 0;
+> +}
+
+[Severity: Medium]
+Since btrfs_prealloc_delayed_dir_index() accepts the name parameter, should it
+also copy the name into the newly allocated item buffer? Currently, the name
+parameter is completely ignored.
+
+If future callers use this new preallocation API and assume the name is copied,
+could they inadvertently leave uninitialized memory in the buffer that gets
+written to disk?
+
+[ ... ]
+> +/* Will return 0, -ENOMEM or -EEXIST (index number collision, unexpected). */
+> +int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+> +				   const char *name, int name_len,
+> +				   struct btrfs_inode *dir,
+> +				   const struct btrfs_disk_key *disk_key, u8 flags,
+> +				   u64 index)
+> +{
+> +	struct btrfs_dir_index_prealloc prealloc;
+> +	int ret;
+> +
+> +	ret = btrfs_prealloc_delayed_dir_index(dir, name, name_len, &prealloc);
+> +	if (ret)
+> +		return ret;
+> +
+> +	memcpy(prealloc.item->data + sizeof(struct btrfs_dir_item), name,
+> +	       name_len);
+
+[Severity: Medium]
+The wrapper manually copies the name here despite having passed it to
+btrfs_prealloc_delayed_dir_index() above. Would moving this memcpy into the
+preallocation function prevent potential API misuse by future callers?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260717-btrfs-enomem-v1-0-cdc9c0e265d0@kernel.org?part=1
+

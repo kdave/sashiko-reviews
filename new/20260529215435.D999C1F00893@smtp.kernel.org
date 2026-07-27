@@ -1,0 +1,58 @@
+From sashiko-bot@kernel.org Fri May 29 23:54:41 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: use lockless read in nr_cached_objects shrinker
+ callback
+Date: Fri, 29 May 2026 21:54:35 +0000
+Message-Id: <20260529215435.D999C1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] BTRFS extent map shrinker falsely reports global, unaccounted objects during memcg-specific reclaim, leading to severe global cache thrashing and memcg reclaim starvation.
+--
+
+commit 49dc10f81615dc01d6ab6be44f9abdef0ae39435
+Author: Ben Maurer <bmaurer@meta.com>
+
+btrfs: use lockless read in nr_cached_objects shrinker callback
+
+This commit replaces the spinlock-protected percpu_counter_sum_positive call
+with the lockless percpu_counter_read_positive in the btrfs shrinker callback
+to prevent global serialization during memcg-driven slab reclaim.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+
+[ ... ]
+
+> @@ -2405,7 +2405,7 @@ static int btrfs_show_devname(struct seq_file *m, struct dentry *root)
+>  static long btrfs_nr_cached_objects(struct super_block *sb, struct shrink_control *sc)
+>  {
+>  	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
+> -	const s64 nr = percpu_counter_sum_positive(&fs_info->evictable_extent_maps);
+> +	const s64 nr = percpu_counter_read_positive(&fs_info->evictable_extent_maps);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but modifying this exact line
+highlights a pre-existing issue. Does btrfs_nr_cached_objects() need to
+return 0 when called during memcg-specific reclaim (when sc->memcg != NULL)?
+
+Since btrfs extent maps are global and lack the SLAB_ACCOUNT flag, returning
+their global count during memcg-driven reclaim skews the proportions
+calculated in super_cache_scan(). The global object count dominates the
+target memcg's dentry and inode counts, effectively crushing the target scan
+counts to 0.
+
+This causes the shrinker to queue massive asynchronous work to drop global
+extent maps, which doesn't free any memory for the constrained memcg. This
+can lead to heavy global cache thrashing while the memcg reclaim loop spins
+with minimal progress.
+
+>  
+>  	trace_btrfs_extent_map_shrinker_count(fs_info, nr);
+>
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/4c64ed769cbb827b8c55de8f89372fc27290feea.1780089816.git.boris@bur.io?part=1
+

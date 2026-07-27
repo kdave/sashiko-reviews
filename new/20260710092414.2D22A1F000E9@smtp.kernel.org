@@ -1,0 +1,137 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:24:16 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 13/20] xfs: use read ioend for fsverity data
+ verification
+Date: Fri, 10 Jul 2026 09:24:13 +0000
+Message-Id: <20260710092414.2D22A1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Critical] Single-inode self-deadlock due to shared `ip->i_ioend_work` when block device supports integrity checksums.
+- [Critical] Merged read ioends completely bypass fs-verity verification, allowing corrupted data to be read as valid.
+- [High] Severe performance bottleneck due to strictly serialized fs-verity verification per-inode.
+--
+
+--- Patch [13]: [PATCH v11 13/20] xfs: use read ioend for fsverity data verification ---
+commit 057961b1c56a952449b1134091de95fd74280526
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: use read ioend for fsverity data verification
+
+This commit routes fsverity data verification through the read ioend
+completion path, passing fsverity_info to the ioend to avoid expensive
+lookups. It introduces helper functions to identify file data versus
+metadata and separates the completion workqueues.
+
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index 27ff2b2404579..b0537c67e960e 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+
+[ ... ]
+
+> @@ -182,6 +183,23 @@ xfs_end_ioend_write(
+>  	memalloc_nofs_restore(nofs_flag);
+>  }
+>  
+> +/*
+> + * IO read completion.
+> + */
+> +static void
+> +xfs_end_ioend_read(
+> +	struct iomap_ioend	*ioend)
+> +{
+> +	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+> +
+> +	if (!ioend->io_bio.bi_status &&
+> +			xfs_fsverity_is_file_data(ip, ioend->io_offset))
+> +		fsverity_verify_bio(ioend->io_vi,
+> +				    &ioend->io_bio);
+
+[Severity: Critical]
+Does this completely bypass verification for merged ioends, causing a
+regression where corrupted data is read as valid?
+
+When large contiguous reads are split into multiple bios by the block layer,
+xfs_end_io() merges the tail ioends into the head ioend's io_list via
+iomap_ioend_try_merge().
+
+Since xfs_end_ioend_read() only passes the head's io_bio to
+fsverity_verify_bio(), does it leave the merged tail bios completely
+unverified before iomap_finish_ioends() loops through the entire io_list
+and marks all of their folios as uptodate?
+
+> +	iomap_finish_ioends(ioend,
+> +		blk_status_to_errno(ioend->io_bio.bi_status));
+> +}
+> +
+
+[ ... ]
+
+> @@ -216,8 +234,7 @@ xfs_end_io(
+>  		list_del_init(&ioend->io_list);
+>  		iomap_ioend_try_merge(ioend, &tmp);
+>  		if (bio_op(&ioend->io_bio) == REQ_OP_READ)
+> -			iomap_finish_ioends(ioend,
+> -				blk_status_to_errno(ioend->io_bio.bi_status));
+> +			xfs_end_ioend_read(ioend);
+
+[Severity: High]
+Does this strictly serialize fs-verity verification per-inode, causing a
+severe performance regression?
+
+Unlike ext4 and f2fs which allocate a work_struct per bio to allow parallel
+hashing across CPUs, this reuses the single ip->i_ioend_work per inode.
+
+When multiple concurrent reads to the same file complete, they are appended
+to ip->i_ioend_list. A single worker thread running xfs_end_io() iterates
+over them and sequentially calls the CPU-intensive fsverity_verify_bio().
+
+Could this limit fs-verity throughput for a single file to the hashing
+speed of a single CPU core?
+
+>  		else
+>  			xfs_end_ioend_write(ioend);
+>  		cond_resched();
+
+[ ... ]
+
+> @@ -243,9 +260,14 @@ xfs_end_bio(
+>  	}
+>  
+>  	spin_lock_irqsave(&ip->i_ioend_lock, flags);
+> -	if (list_empty(&ip->i_ioend_list))
+> -		WARN_ON_ONCE(!queue_work(mp->m_unwritten_workqueue,
+> +	if (list_empty(&ip->i_ioend_list)) {
+> +		if (IS_ENABLED(CONFIG_FS_VERITY) && ioend->io_vi &&
+> +		    ioend->io_offset < xfs_fsverity_metadata_offset(ip))
+> +			fsverity_enqueue_verify_work(&ip->i_ioend_work);
+> +		else
+> +			WARN_ON_ONCE(!queue_work(mp->m_unwritten_workqueue,
+>  					 &ip->i_ioend_work));
+
+[Severity: Critical]
+Can this result in an unresolvable self-deadlock regression when the block
+device has integrity checksums enabled?
+
+If bdev_has_integrity_csum() is true, xfs_get_iomap_read_ops() forces
+metadata reads to use xfs_iomap_read_ops.
+
+When a data read completes, it queues the per-inode ip->i_ioend_work. The
+worker calls xfs_end_io() -> xfs_end_ioend_read() -> fsverity_verify_bio().
+
+If fsverity_verify_bio() synchronously submits a read for a Merkle tree
+page, that metadata read completion will eventually call xfs_end_bio() and
+attempt to queue the exact same ip->i_ioend_work struct while the worker is
+blocked waiting for the folio lock.
+
+Since the work is already executing, the workqueue subsystem merely marks
+it pending, leaving the worker indefinitely blocked.
+
+> +	}
+>  	list_add_tail(&ioend->io_list, &ip->i_ioend_list);
+>  	spin_unlock_irqrestore(&ip->i_ioend_lock, flags);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=13
+

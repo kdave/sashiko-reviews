@@ -1,0 +1,113 @@
+From sashiko-bot@kernel.org Mon Jun 15 20:01:34 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: release extent lock per folio in readahead
+Date: Mon, 15 Jun 2026 18:01:29 +0000
+Message-Id: <20260615180130.11FFD1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Piecemeal unlocking of a bulk-locked extent state causes extent tree fragmentation and an infinite loop lockup under memory pressure.
+
+Pre-existing issues:
+- [Critical] Expanded readahead folios are not extent-locked, causing a stale page cache race with concurrent direct IO writes.
+--
+
+commit 768780154b867dcc25ae6f06c23d6abad0eb1951
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: release extent lock per folio in readahead
+
+This patch changes the extent locking behavior in btrfs_readahead() to unlock
+extents on a per-folio basis rather than in bulk at the end of the operation.
+This is intended to prevent other threads from blocking on the extent lock for
+the entire readahead range if a partial read failure occurs.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 2275189b78605..6e9ddec2ad19a 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+> @@ -2704,12 +2704,23 @@ void btrfs_readahead(struct readahead_control *rac)
+>  	struct fsverity_info *vi = NULL;
+>  
+>  	lock_extents_for_read(inode, start, end, &cached_state);
+> +	/* We don't use cached state for a bulk unlock, just free it. */
+> +	btrfs_free_extent_state(cached_state);
+>  	if (start < i_size_read(vfs_inode))
+>  		vi = fsverity_get_info(vfs_inode);
+> -	while ((folio = readahead_folio(rac)) != NULL)
+> -		btrfs_do_readpage(folio, &em_cached, &bio_ctrl, vi);
+> +	while ((folio = readahead_folio(rac)) != NULL) {
+> +		/*
+> +		 * Read start and end before btrfs_do_readpage(). It unlocks the
+> +		 * folio, so our reference might not be valid after.
+> +		 */
+> +		const u64 folio_start = folio_pos(folio);
+> +		const u64 folio_end = folio_start + folio_size(folio) - 1;
+>  
+> -	btrfs_unlock_extent(&inode->io_tree, start, end, &cached_state);
+> +		btrfs_do_readpage(folio, &em_cached, &bio_ctrl, vi);
+
+[Severity: Critical]
+This is a pre-existing issue, but does this call to btrfs_do_readpage()
+leave newly expanded readahead folios unlocked?
+
+When btrfs_do_readpage() expands the readahead window via
+btrfs_readahead_expand(), it adds new folios to the page cache without
+acquiring the extent lock for the expanded range:
+
+fs/btrfs/extent_io.c:btrfs_do_readpage() {
+    ...
+    if (bio_ctrl->ractl &&
+        !btrfs_is_subpage(fs_info, folio) &&
+        compress_type != BTRFS_COMPRESS_NONE)
+        btrfs_readahead_expand(bio_ctrl->ractl, em);
+    ...
+}
+
+Since btrfs_readahead() only locked the original [start, end] range, can a
+concurrent direct IO write safely acquire the extent lock for the expanded
+range, invalidate the page cache, and write new data, while the readahead
+thread populates the page cache with stale data using the old extent map?
+
+> +		/* Only unlock the range we locked, even if readahead expands. */
+> +		if (folio_start >= start && folio_end <= end)
+> +			btrfs_unlock_extent(&inode->io_tree, folio_start, folio_end, NULL);
+
+[Severity: High]
+Can this piecemeal unlocking cause an infinite loop and thread hang under
+memory pressure?
+
+Since the extent was initially locked in bulk, unlocking a sub-range forces
+the extent IO tree to split the extent_state node. Splitting requires a memory
+allocation.
+
+If alloc_extent_state_atomic() fails during the split in
+btrfs_clear_extent_bit_changeset(), it jumps to search_again, dropping the
+spin lock and looping indefinitely:
+
+fs/btrfs/extent-io-tree.c:btrfs_clear_extent_bit_changeset() {
+    ...
+        prealloc = alloc_extent_state_atomic(prealloc);
+        if (!prealloc)
+            goto search_again;
+    ...
+search_again:
+    spin_unlock(&tree->lock);
+    if (gfpflags_allow_blocking(mask))
+        cond_resched();
+    goto again;
+}
+
+Since the thread would hang in this retry loop while still holding the
+extent lock for the remaining folios, will this deadlock any concurrent
+readers or writers trying to lock the overlapping range?
+
+> +	}
+>  
+>  	if (em_cached)
+>  		btrfs_free_extent_map(em_cached);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/1cdab9f1329c31c69b3d9ef6ec19977004d1bc57.1781545249.git.boris@bur.io?part=1
+

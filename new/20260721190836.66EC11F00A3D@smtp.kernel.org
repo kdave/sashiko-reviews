@@ -1,0 +1,100 @@
+From sashiko-bot@kernel.org Tue Jul 21 21:08:41 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 14/23] xfs: always prioritize fsverity metadata
+ ioends in ioend completion
+Date: Tue, 21 Jul 2026 19:08:35 +0000
+Message-Id: <20260721190836.66EC11F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The custom sorting logic in `xfs_read_ioend_compare` fails to prioritize metadata ioends that start exactly at `i_size` and breaks offset-based sorting for same-class ioends.
+- [High] Unchecked use of `list_first_entry_or_null` leads to a direct NULL pointer dereference in `xfs_end_io`.
+--
+
+--- Patch [14]: [PATCH v13 14/23] xfs: always prioritize fsverity metadata ioends in ioend completion ---
+commit 204e9b0aa94938c0b633d005c67fd4568e3e9a37
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: always prioritize fsverity metadata ioends in ioend completion
+
+This patch modifies ioend processing to prioritize fsverity metadata ioends
+over data ioends. By ensuring metadata ioends are processed first, it avoids
+a self-deadlock scenario where a metadata ioend holding a folio lock blocks a
+data ioend waiting for that same folio. A custom sorting comparison function
+is introduced to prioritize offsets beyond i_size.
+
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index 34d0ff7c70865..c7843a8776b0a 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+
+[ ... ]
+
+> @@ -182,6 +182,32 @@ xfs_end_ioend_write(
+>  	memalloc_nofs_restore(nofs_flag);
+>  }
+>  
+> +/*
+> + * Prioritize fsverity metadata over file data. Sort based on i_size as fsverity
+> + * metadata is always beyond EOF
+> + */
+> +static int
+> +xfs_read_ioend_compare(
+> +	void			*priv,
+> +	const struct list_head	*a,
+> +	const struct list_head	*b)
+> +{
+> +	struct iomap_ioend	*ia = container_of(a, struct iomap_ioend,
+> +			io_list);
+> +	struct iomap_ioend	*ib = container_of(b, struct iomap_ioend,
+> +			io_list);
+> +	loff_t			i_size = i_size_read(ia->io_inode);
+> +
+> +	if (!IS_VERITY(ia->io_inode))
+> +		return iomap_ioend_compare(priv, a, b);
+> +
+> +	if (ia->io_offset > i_size && ib->io_offset < i_size)
+> +		return -1;
+> +	if (ia->io_offset < i_size && ib->io_offset > i_size)
+> +		return 1;
+> +	return 0;
+> +}
+
+[Severity: High]
+Does this logic break offset-based sorting for same-class ioends?
+
+Since xfs_read_ioend_compare returns 0 instead of falling back to
+iomap_ioend_compare for two data ioends or two metadata ioends, it appears
+they will be treated as equal. Could this prevent iomap_ioend_try_merge from
+coalescing I/O requests properly?
+
+Also, does the strict inequality (> i_size) miss fsverity metadata that
+starts exactly at i_size, causing it to lose priority and potentially fail
+to prevent the deadlock this patch is intended to address?
+
+> @@ -210,7 +236,11 @@ xfs_end_io(
+>  	list_replace_init(&ip->i_ioend_list, &tmp);
+>  	spin_unlock_irqrestore(&ip->i_ioend_lock, flags);
+>  
+> -	iomap_sort_ioends(&tmp);
+> +	ioend = list_first_entry_or_null(&tmp, struct iomap_ioend, io_list);
+> +	if (bio_op(&ioend->io_bio) == REQ_OP_READ)
+
+[Severity: High]
+Can list_first_entry_or_null return a NULL pointer here if the tmp list is
+empty?
+
+If tmp is empty after list_replace_init, ioend will be NULL, which would
+cause a NULL pointer dereference when bio_op evaluates ioend->io_bio.
+Would it be better to check if ioend is NULL before attempting to read the
+bio operation?
+
+> +		iomap_sort_ioends(&tmp, xfs_read_ioend_compare);
+> +	else
+> +		iomap_sort_ioends(&tmp, iomap_ioend_compare);
+>  	while ((ioend = list_first_entry_or_null(&tmp, struct iomap_ioend,
+>  			io_list))) {
+>  		list_del_init(&ioend->io_list);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=14
+

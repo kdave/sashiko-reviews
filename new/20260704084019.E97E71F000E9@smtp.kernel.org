@@ -1,0 +1,89 @@
+From sashiko-bot@kernel.org Sat Jul  4 10:40:22 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix leaking BTRFS_FS_STATE_REMOUNTING flag
+Date: Sat, 04 Jul 2026 08:40:19 +0000
+Message-Id: <20260704084019.E97E71F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] `btrfs_check_features()` validates features against the old mount options rather than the new ones requested in the remount, allowing restricted options to be incorrectly enabled.
+--
+
+commit 5ef8861b8c2ae4ed9d48a9986d0ef01f241dac6a
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: fix leaking BTRFS_FS_STATE_REMOUNTING flag
+
+This commit changes the error handling of btrfs_check_options() and
+btrfs_check_features() inside btrfs_reconfigure() to go to the restore
+label. This prevents the BTRFS_FS_STATE_REMOUNTING flag from remaining
+set if either of these functions fail.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index a7d804219bec3..4b2c07211c30e 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -1519,12 +1519,14 @@ static int btrfs_reconfigure(struct fs_context *fc)
+>  	sync_filesystem(sb);
+>  	set_bit(BTRFS_FS_STATE_REMOUNTING, &fs_info->fs_state);
+>  
+> -	if (!btrfs_check_options(fs_info, &ctx->mount_opt, fc->sb_flags))
+> -		return -EINVAL;
+> +	if (!btrfs_check_options(fs_info, &ctx->mount_opt, fc->sb_flags)) {
+> +		ret = -EINVAL;
+> +		goto restore;
+> +	}
+>  
+>  	ret = btrfs_check_features(fs_info, !(fc->sb_flags & SB_RDONLY));
+>  	if (ret < 0)
+> -		return ret;
+> +		goto restore;
+>  
+>  	btrfs_ctx_to_info(fs_info, ctx);
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+[Severity: High]
+This is a pre-existing issue, but does calling btrfs_check_features() before
+btrfs_ctx_to_info() validate the features against the old mount options rather
+than the newly requested ones?
+
+Since btrfs_check_features() relies on fs_info->mount_opt and
+fs_info->compress_type, checking them before btrfs_ctx_to_info() transfers
+the new context can allow users to bypass safety constraints during remount.
+
+For example, a user could issue mount -o remount,space_cache=v1 on a subpage
+system. btrfs_check_features() would incorrectly pass validation since it
+checks the old mount options:
+
+fs/btrfs/disk-io.c:btrfs_check_features() {
+    ...
+	if (fs_info->sectorsize != PAGE_SIZE && btrfs_test_opt(fs_info, SPACE_CACHE)) {
+		btrfs_warn(fs_info,
+	"v1 space cache is not supported for page size %lu with sectorsize %u",
+			   PAGE_SIZE, fs_info->sectorsize);
+		return -EINVAL;
+	}
+    ...
+}
+
+Similarly, enabling a new compression type like ZSTD during remount might
+fail to set the appropriate incompat flag, as it checks the old compress_type:
+
+fs/btrfs/disk-io.c:btrfs_check_features() {
+    ...
+	if (fs_info->compress_type == BTRFS_COMPRESS_LZO)
+		incompat |= BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO;
+	else if (fs_info->compress_type == BTRFS_COMPRESS_ZSTD)
+		incompat |= BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD;
+    ...
+}
+
+Could btrfs_check_features() be adjusted to validate the requested state?
+
+>  	btrfs_remount_begin(fs_info, old_ctx.mount_opt, fc->sb_flags);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/60a629f78bbd03c07e8907101a23368722c47662.1783153727.git.wqu@suse.com?part=1
+

@@ -1,0 +1,59 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:21:13 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 07/20] xfs: introduce fsverity on-disk changes
+Date: Fri, 10 Jul 2026 09:16:39 +0000
+Message-Id: <20260710091639.DBBCB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] XFS online scrub and repair utilities were not updated to handle the new XFS_DIFLAG2_VERITY flag, leading to repair failures and filesystem shutdowns.
+--
+
+--- Patch [7]: [PATCH v11 07/20] xfs: introduce fsverity on-disk changes ---
+commit adbd3633806f20edb902c38eb3c6049e5c502a94
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: introduce fsverity on-disk changes
+
+Introduce XFS_DIFLAG2_VERITY for inodes with fsverity. This flag indicates
+that the inode has fs-verity enabled, and introduces the read-only
+compatibility feature for filesystems having fsverity inodes.
+
+> diff --git a/fs/xfs/libxfs/xfs_inode_buf.c b/fs/xfs/libxfs/xfs_inode_buf.c
+> index 336ef843f2fe4..bd80a19f2e092 100644
+> --- a/fs/xfs/libxfs/xfs_inode_buf.c
+> +++ b/fs/xfs/libxfs/xfs_inode_buf.c
+> @@ -760,6 +760,14 @@ xfs_dinode_verify(
+>  	    !xfs_has_rtreflink(mp))
+>  		return __this_address;
+>  
+> +	/* only regular files can have fsverity */
+> +	if (flags2 & XFS_DIFLAG2_VERITY) {
+> +		if (!xfs_has_verity(mp))
+> +			return __this_address;
+> +		if (!S_ISREG(mode))
+> +			return __this_address;
+> +	}
+> +
+
+[Severity: High]
+Should the online scrub and repair utilities also be updated to handle
+XFS_DIFLAG2_VERITY?
+
+While xfs_dinode_verify() correctly catches invalid verity flags, it appears
+the scrub and repair paths in fs/xfs/scrub/inode_repair.c and
+fs/xfs/scrub/inode.c were not updated.
+
+If an inode on disk is corrupted with the XFS_DIFLAG2_VERITY bit set when it
+should not be, xfs_dinode_verify() will correctly fail. When online scrub
+attempts to repair this via xrep_dinode_core() calling xrep_dinode_flags(),
+the invalid flag is never cleared because xrep_dinode_flags() lacks the
+clearing logic for XFS_DIFLAG2_VERITY (unlike REFLINK or DAX).
+
+When the repair finishes and xfs_trans_log_buf() attempts to write the
+repaired inode, xfs_dinode_verify() will trigger again, see the still-present
+invalid verity flag, and reject the write. Can this cause XFS to forcefully
+shut down the filesystem during periodic automated online scrub jobs?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=7
+

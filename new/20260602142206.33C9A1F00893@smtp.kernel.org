@@ -1,0 +1,47 @@
+From sashiko-bot@kernel.org Tue Jun  2 16:22:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: use verbose assertions in backref.c
+Date: Tue, 02 Jun 2026 14:22:05 +0000
+Message-Id: <20260602142206.33C9A1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] The assertion `ASSERT(node->eb == NULL, "node->eb->start=%llu", node->eb->start);` unconditionally evaluates `node->eb->start`, resulting in a NULL pointer dereference on the success path.
+--
+
+commit 3c9cee8d5006c8bfb901d142fad270ff5397f909
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: use verbose assertions in backref.c
+
+This commit updates simple assertions in backref.c to print out the
+unexpected values when they fail. This improves debugging by providing
+more context about the assertion failure.
+
+> diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+> index 273924ca912c2..b535e5c8a60d0 100644
+> --- a/fs/btrfs/backref.c
+> +++ b/fs/btrfs/backref.c
+
+[ ... ]
+
+> @@ -3063,7 +3065,7 @@ void btrfs_backref_free_node(struct btrfs_backref_cache *cache,
+>  	if (node) {
+>  		ASSERT(list_empty(&node->list));
+>  		ASSERT(list_empty(&node->lower));
+> -		ASSERT(node->eb == NULL);
+> +		ASSERT(node->eb == NULL, "node->eb->start=%llu", node->eb->start);
+
+[Severity: High]
+Will this assertion cause a NULL pointer dereference on the success path?
+
+The ASSERT macro in fs/btrfs/messages.h evaluates its formatting arguments
+unconditionally by passing them to verify_assert_printk_format() before
+checking the condition.
+
+When node->eb is indeed NULL (the normal, successful path), the macro still
+evaluates the argument node->eb->start. Can this dereference the NULL pointer
+and cause a crash?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/b6f6b52824e4b9e6ee9f883e09e53da9eb8152ee.1780409231.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Tue Jul 21 22:56:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 17/23] xfs: remove unwritten extents after
+ preallocations in fsverity metadata
+Date: Tue, 21 Jul 2026 20:56:44 +0000
+Message-Id: <20260721205644.C3CA11F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Calling `truncate_inode_pages` while holding `XFS_ILOCK_EXCL` and a transaction log space reservation inverts the standard XFS lock order, creating a potential ABBA deadlock with background writeback.
+--
+
+--- Patch [17]: [PATCH v13 17/23] xfs: remove unwritten extents after preallocations in fsverity metadata ---
+commit 68859151961426ee3111cfd57da4e4e645a7b239
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+xfs: remove unwritten extents after preallocations in fsverity metadata
+
+This commit ensures that any unused preallocated space left over in
+fsverity metadata regions past EOF is removed after writing the merkle
+tree. Unwritten extents are iterated and removed when enabling fsverity
+finishes.
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index d3d4ba3edfc16..5dcbdf20e4743 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+[ ... ]
+> @@ -174,6 +177,74 @@ xfs_fsverity_delete_metadata(
+>  	return error;
+>  }
+
+[Severity: High]
+This isn't a bug introduced by this patch, but while looking at
+xfs_fsverity_delete_metadata() just above this new function, I noticed
+a potential lock ordering issue.
+
+In xfs_fsverity_delete_metadata(), truncate_inode_pages() is called while
+holding XFS_ILOCK_EXCL and a transaction log space reservation:
+
+fs/xfs/xfs_fsverity.c:xfs_fsverity_delete_metadata() {
+        error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate, 0, 0, 0, &tp);
+        ...
+        xfs_ilock(ip, XFS_MMAPLOCK_EXCL | XFS_ILOCK_EXCL);
+        truncate_inode_pages(VFS_I(ip)->i_mapping, XFS_ISIZE(ip));
+        ...
+}
+
+Could this create an ABBA deadlock with background writeback?
+
+If a user process fails to enable fsverity and triggers this cleanup path,
+and simultaneously background writeback starts writing the dirty fsverity
+merkle tree pages, the writeback thread holds the page lock and tries to
+acquire XFS_ILOCK_SHARED.
+
+At the same time, xfs_fsverity_delete_metadata() holds XFS_ILOCK_EXCL and
+calls truncate_inode_pages(), which attempts to acquire the page lock. This
+appears to invert the standard XFS lock order.
+
+> +static int
+> +xfs_fsverity_cancel_unwritten(
+> +	struct xfs_inode	*ip,
+> +	loff_t			start,
+> +	loff_t			end)
+> +{
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=17
+

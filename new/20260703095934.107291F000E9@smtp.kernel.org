@@ -1,0 +1,63 @@
+From sashiko-bot@kernel.org Fri Jul  3 11:59:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 1/3] btrfs: add "rescue=usebackuproot" into forced
+ read-only options
+Date: Fri, 03 Jul 2026 09:59:33 +0000
+Message-Id: <20260703095934.107291F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] btrfs_reconfigure leaks BTRFS_FS_STATE_REMOUNTING on validation failure, disabling background tasks.
+--
+
+commit 16bf6f8f3bc4530eb135bbbc29d23505a7176638
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: add "rescue=usebackuproot" into forced read-only options
+
+This changes the "rescue=usebackuproot" mount option to strictly require
+a read-only mount, matching the btrfs(5) documentation. It also removes
+the option from oneshot options.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index a7d804219bec3..bbb841f590528 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -691,7 +690,8 @@ bool btrfs_check_options(const struct btrfs_fs_info *info,
+>  	bool ret = true;
+>  
+>  	if (!(flags & SB_RDONLY) &&
+> -	    (check_ro_option(info, *mount_opt, BTRFS_MOUNT_NOLOGREPLAY, "nologreplay") ||
+> +	    (check_ro_option(info, *mount_opt, BTRFS_MOUNT_USEBACKUPROOT, "usebackuproot") ||
+> +	     check_ro_option(info, *mount_opt, BTRFS_MOUNT_NOLOGREPLAY, "nologreplay") ||
+>  	     check_ro_option(info, *mount_opt, BTRFS_MOUNT_IGNOREBADROOTS, "ignorebadroots") ||
+
+[Severity: High]
+This is a pre-existing issue, but does failing validation here during a 
+remount leak the BTRFS_FS_STATE_REMOUNTING bit?
+
+Because this patch makes usebackuproot a forced RO option, an administrator 
+mistakenly trying to remount rw a filesystem initially mounted 
+with rescue=usebackuproot will have btrfs_check_options() reject the 
+remount. 
+
+Looking at btrfs_reconfigure(), it appears this validation failure directly 
+returns without clearing the remounting bit:
+
+fs/btrfs/super.c:btrfs_reconfigure() {
+    ...
+    set_bit(BTRFS_FS_STATE_REMOUNTING, &fs_info->fs_state);
+
+    if (!btrfs_check_options(fs_info, &ctx->mount_opt, fc->sb_flags))
+        return -EINVAL;
+    ...
+}
+
+Does this permanently disable auto-defrag, background space reclaim, and 
+qgroup rescanning until the filesystem is completely unmounted?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783071857.git.wqu@suse.com?part=1
+

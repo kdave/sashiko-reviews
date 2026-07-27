@@ -1,0 +1,99 @@
+From sashiko-bot@kernel.org Mon Jul  6 07:51:11 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: remove verity Merkle folio from page cache on
+ error
+Date: Mon, 06 Jul 2026 05:51:08 +0000
+Message-Id: <20260706055109.60D411F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [Low] Module build failure due to use of unexported symbol `filemap_remove_folio`.
+
+Pre-existing issues:
+- [High] Silent uninitialized memory exposure on 32-bit systems with HIGHMEM.
+- [High] Missing mapping re-validation after lock acquisition causes spurious -EIO errors.
+--
+
+commit 9a6d03c1fdfc05a409e766bdc65fcd6477f147aa
+Author: Yichong Chen <chenyichong@uniontech.com>
+
+btrfs: remove verity Merkle folio from page cache on error
+
+This commit modifies btrfs_read_merkle_tree_page() to properly clean up
+when read_key_bytes() fails. Instead of leaving a locked, not-uptodate folio
+in the page cache, it drops the folio from the page cache and unlocks it
+before releasing the reference.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index 983365a735416..99468791a98ef 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+> @@ -753,6 +753,8 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+
+[Severity: High]
+This is a pre-existing issue, but does this missing mapping re-validation
+cause spurious -EIO errors earlier in btrfs_read_merkle_tree_page()?
+
+When a concurrent thread fails to read the data, the new error handling added
+by this patch correctly removes the folio from the page cache and unlocks it.
+If another thread is waiting on folio_lock() earlier in this function:
+
+		folio_lock(folio);
+		/* If it's not uptodate after we have the lock, we got a read error. */
+		if (!folio_test_uptodate(folio)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return ERR_PTR(-EIO);
+		}
+
+It wakes up and sees the folio is not uptodate, returning -EIO. Could this be
+resolved by checking if folio->mapping == NULL after acquiring the lock, and
+jumping back to retry?
+
+>  	ret = read_key_bytes(BTRFS_I(inode), BTRFS_VERITY_MERKLE_ITEM_KEY, off,
+>  			     folio_address(folio), PAGE_SIZE, folio);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does calling folio_address()
+here cause silent uninitialized memory exposure on 32-bit systems with HIGHMEM?
+
+For HIGHMEM folios, folio_address() returns NULL. When this NULL is passed
+as the dest argument to read_key_bytes(), it treats it as a dry-run size
+calculation:
+
+fs/btrfs/verity.c:read_key_bytes() {
+    ...
+		if (dest) {
+			if (dest_folio)
+				kaddr = kmap_local_folio(dest_folio, 0);
+
+			data = btrfs_item_ptr(leaf, path->slots[0], void);
+			read_extent_buffer(leaf, kaddr + dest_offset,
+					   (unsigned long)data + copy_offset,
+					   copy_bytes);
+    ...
+}
+
+Because dest is NULL, the entire data copy block is skipped, returning a
+success length and marking the folio as uptodate despite it containing
+uninitialized memory.
+
+>  	if (ret < 0) {
+> +		filemap_remove_folio(folio);
+
+[Severity: Low]
+Does calling filemap_remove_folio() here cause a module build failure?
+
+filemap_remove_folio() is an unexported MM internal function, which might
+result in an Unknown symbol error when Btrfs is compiled as a loadable
+module (CONFIG_BTRFS_FS=m).
+
+> +		folio_unlock(folio);
+>  		folio_put(folio);
+>  		return ERR_PTR(ret);
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260706053907.544337-1-chenyichong@uniontech.com?part=1
+

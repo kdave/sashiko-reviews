@@ -1,0 +1,101 @@
+From sashiko-bot@kernel.org Wed Jun  3 14:20:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix inline reflink deadlock at non-zero offset
+Date: Wed, 03 Jun 2026 12:20:54 +0000
+Message-Id: <20260603122055.2330B1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] In `copy_inline_to_page()`, the subpage block zeroing logic uses `folio_zero_range()` with `datal` as the absolute start offset within the folio, completely ignoring the block's page offset. On subpage architectures where `sectorsize < PAGE_SIZE` and the file offset is not page-aligned, this corrupts the folio and leaves the tail of the target block uninitialized.
+- [High] If `btrfs_decompress()` fails in `copy_inline_to_page()`, the function returns without clearing the `EXTENT_DELALLOC` bit in the inode's `io_tree`, resulting in a permanent resource leak of `EXTENT_DELALLOC` state and the associated accounting counters.
+--
+
+commit 02c63780396b311a7f51813da663c5cfd8e8a2c6
+Author: Guangshuo Li <lgs201920130244@gmail.com>
+
+btrfs: fix inline reflink deadlock at non-zero offset
+
+This commit updates i_size after a successful copy_inline_to_page() in
+the early non-zero offset path of clone_copy_inline_extent(). This
+matches the existing copy_to_page path and prevents a deadlock where
+writeback invalidates a folio beyond EOF and blocks on the extent range
+lock.
+
+Fixes: 05a5a7621ce66 ("Btrfs: implement full reflink support for inline extents")
+
+> diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+> index 49865a4637809..5722cccb53eb7 100644
+> --- a/fs/btrfs/reflink.c
+> +++ b/fs/btrfs/reflink.c
+> @@ -185,6 +185,8 @@ static int clone_copy_inline_extent(struct btrfs_inode *inode,
+>  	if (new_key->offset > 0) {
+>  		ret = copy_inline_to_page(inode, new_key->offset,
+>  					  inline_data, size, datal, comp_type);
+
+[Severity: High]
+This is a pre-existing issue, but does copy_inline_to_page() corrupt the
+folio on subpage architectures?
+
+In copy_inline_to_page(), the subpage block zeroing logic uses
+folio_zero_range():
+
+fs/btrfs/reflink.c:copy_inline_to_page() {
+    ...
+    if (datal < block_size)
+        folio_zero_range(folio, datal, block_size - datal);
+    ...
+}
+
+Does this zero memory starting at byte datal from the beginning of the folio
+instead of the block's offset, since it omits
+offset_in_folio(folio, file_offset)?
+
+Could this destroy valid data from earlier sectors in the same page and leave
+the remainder of the target sector containing uninitialized kernel memory?
+
+[Severity: High]
+This is also a pre-existing issue, but does copy_inline_to_page() leak the
+EXTENT_DELALLOC state and accounting counters on decompression failure?
+
+If btrfs_decompress() fails in copy_inline_to_page(), the code jumps to
+out_unlock:
+
+fs/btrfs/reflink.c:copy_inline_to_page() {
+    ...
+    } else {
+        ret = btrfs_decompress(comp_type, data_start, folio,
+                               offset_in_folio(folio, file_offset),
+                               inline_size, datal);
+        if (ret)
+            goto out_unlock;
+    ...
+out_unlock:
+    if (!IS_ERR(folio)) {
+        folio_unlock(folio);
+        folio_put(folio);
+    }
+    if (ret)
+        btrfs_delalloc_release_space(inode, data_reserved, file_offset,
+                                     block_size, true);
+    btrfs_delalloc_release_extents(inode, block_size);
+out:
+    ...
+}
+
+The out_unlock error path drops space reservations but does not appear to
+clear the EXTENT_DELALLOC bit that was previously set on the io_tree via
+btrfs_set_extent_delalloc().
+
+Does this permanently bias space flushing heuristics and risk triggering
+ENOSPC or infinite loops in background flushers?
+
+> +		if (ret == 0 && new_key->offset + datal > i_size_read(&inode->vfs_inode))
+> +			i_size_write(&inode->vfs_inode, new_key->offset + datal);
+>  		goto out;
+>  	}
+>
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260603120443.1394044-1-lgs201920130244@gmail.com?part=1
+

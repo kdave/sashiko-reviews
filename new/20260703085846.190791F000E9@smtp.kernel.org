@@ -1,0 +1,45 @@
+From sashiko-bot@kernel.org Fri Jul  3 11:20:40 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/3] btrfs: remove "usebackuproot" mount option
+Date: Fri, 03 Jul 2026 08:58:45 +0000
+Message-Id: <20260703085846.190791F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Removing the `usebackuproot` mount option breaks backward compatibility for existing user configurations.
+--
+
+commit e1ba5787ace535fa8087f39e48c25252d7ed7873
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove "usebackuproot" mount option
+
+This commit completely removes the deprecated "usebackuproot" mount option
+from the filesystem parameters and its associated handling logic.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index 48de3ba80d183..8e471c15ae0a5 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -248,8 +247,6 @@ static const struct fs_parameter_spec btrfs_fs_parameters[] = {
+>  
+>  	/* Rescue options. */
+>  	fsparam_enum("rescue", Opt_rescue, btrfs_parameter_rescue),
+> -	/* Deprecated, with alias rescue=usebackuproot */
+> -	__fsparam(NULL, "usebackuproot", Opt_usebackuproot, fs_param_deprecated, NULL),
+
+[Severity: High]
+Will removing this parameter completely cause mount failures for users who
+still have "usebackuproot" configured in their /etc/fstab or kernel command
+line?
+
+Without this parameter present in btrfs_fs_parameters, vfs_parse_fs_param()
+will treat it as an unrecognized option and return -ENOPARAM, which translates
+to a mount failure. 
+
+Could this break backward compatibility and render systems unbootable upon a
+kernel upgrade if the filesystem is the root partition?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783068013.git.wqu@suse.com?part=3
+

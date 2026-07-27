@@ -1,0 +1,71 @@
+From sashiko-bot@kernel.org Mon Jun 15 19:00:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: send: fix is_current_inode_path() to avoid path
+ resets for common prefixes
+Date: Mon, 15 Jun 2026 17:00:44 +0000
+Message-Id: <20260615170044.AF7281F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] Out-of-bounds read in `is_current_inode_path()` due to early `strncmp` termination on embedded null bytes.
+- [Medium] Incomplete fix / Logic error: `is_current_inode_path()` still returns `true` for descendant paths.
+--
+
+commit 96ba4e71023053d7131bb2c2bcf9f3be51708805
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: send: fix is_current_inode_path() to avoid path resets for common prefixes
+
+This commit updates is_current_inode_path() to avoid path resets when the
+current inode's path is a prefix of the given path. It attempts to enforce
+an exact match by checking the character after the matching prefix.
+
+> diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+> index 89d72d8cb85fd..a9a9a567aa72c 100644
+> --- a/fs/btrfs/send.c
+> +++ b/fs/btrfs/send.c
+> @@ -623,8 +623,18 @@ static inline bool is_current_inode_path(const struct send_ctx *sctx,
+>  					 const struct fs_path *path)
+>  {
+>  	const struct fs_path *cur = &sctx->cur_inode_path;
+> +	const int cur_len = fs_path_len(cur);
+>  
+> -	return (strncmp(path->start, cur->start, fs_path_len(cur)) == 0);
+> +	if (strncmp(path->start, cur->start, cur_len) != 0)
+> +		return false;
+> +
+> +	/* Path may be a prefix of the current inode's path, check for that. */
+> +	if (path->start[cur_len] == '\0')
+
+[Severity: High]
+Can this result in an out-of-bounds read if both paths contain an embedded
+null byte before cur_len?
+
+If a crafted filesystem image contains directory items with embedded null bytes,
+strncmp() will terminate early at the null byte and return 0. If path->start
+is shorter than cur_len (for instance, if path->start uses the fixed 256-byte
+inline_buf inside struct fs_path, while cur_len is much larger), accessing
+path->start[cur_len] will read past the end of the allocation.
+
+> +		return true;
+> +	if (path->start[cur_len] == '/')
+
+[Severity: Medium]
+Does returning true here undermine the goal of detecting exact matches?
+
+The commit message states the goal is to prevent the helper from returning
+true when the current inode's path is a prefix of the given path. However,
+if path is "a/b/c" and cur is "a/b" (cur_len = 3), strncmp() returns 0, and
+path->start[cur_len] will be '/'.
+
+By explicitly returning true when path->start[cur_len] == '/', this still
+returns true for descendant paths, which contradicts the "exact match"
+requirement stated in the commit message.
+
+> +		return true;
+> +
+> +	return false;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/4402ee2dd45308bdcfade989e0fb5a917cfc3f6a.1781541942.git.fdmanana@suse.com?part=1
+

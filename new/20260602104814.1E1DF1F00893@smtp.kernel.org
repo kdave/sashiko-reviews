@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Tue Jun  2 12:48:16 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] fstests: btrfs: add a new test case for fstrim crash
+Date: Tue, 02 Jun 2026 10:48:13 +0000
+Message-Id: <20260602104814.1E1DF1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] Batched discard is checked on the host filesystem instead of the test filesystem.
+- [High] Missing mount failure check leads to trimming the host filesystem.
+- [Medium] Patch is intended for the fstests repository, not the Linux kernel tree.
+--
+
+commit 827f1045cb0d16f4ddf573e50dfbab42bf85a3ad
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a new test case for fstrim crash
+
+This patch introduces a new test case to verify that fstrim does not crash
+when a missing device reappears. It creates a RAID1 filesystem, mounts it in
+degraded mode, allows the missing device to reappear, and then runs fstrim.
+
+Link: https://lore.kernel.org/linux-btrfs/wlwir19t.fsf@damenly.org/
+
+> diff --git a/tests/btrfs/350 b/tests/btrfs/350
+> new file mode 100755
+> index 0000000000000..7cc04b631aa6b
+> --- /dev/null
+> +++ b/tests/btrfs/350
+> @@ -0,0 +1,39 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+
+[Severity: Medium]
+Is this patch intended for the external fstests repository instead of the
+Linux kernel tree? It adds a script using fstests-specific internal helpers
+like _begin_fstest and _require_scratch_dev_pool under a tests/ directory,
+which isn't part of the kernel source tree.
+
+[ ... ]
+> +_scratch_pool_mkfs "-m raid1 -d raid1"
+> +_require_batched_discard $SCRATCH_MNT
+> +
+> +# Mount the filesystem in degraded mode
+> +_btrfs_forget_or_module_reload
+> +_mount -o degraded $dev1 $SCRATCH_MNT
+
+[Severity: High]
+Does _require_batched_discard check the correct filesystem here? Because it is
+called before _mount, the SCRATCH_MNT directory is still unmounted, meaning
+this will evaluate the discard capability of the underlying host filesystem
+rather than the btrfs scratch filesystem.
+
+[Severity: High]
+What happens if the _mount command fails? If the mount operation fails and the
+script continues, SCRATCH_MNT will still point to the underlying host
+filesystem.
+
+> +
+> +# Now let devid 2 reappear
+> +_btrfs device scan $dev2
+> +
+> +# Run fstrim, it should skip the re-appeared device, as it still
+> +# lacks WRITEBALE flag and a proper bdev pointer.
+> +#
+> +# For unpatched kernel, it will crash with a NULL pointer dereference.
+> +$FSTRIM_PROG $SCRATCH_MNT
+
+[Severity: High]
+Following up on the previous question, if the earlier _mount failed, will this
+fstrim command end up trimming the host filesystem instead? Trimming the host
+environment in an automated test breaks test isolation and could cause severe
+performance impacts or hangs on the test machine.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260602103903.93754-1-wqu@suse.com?part=1
+

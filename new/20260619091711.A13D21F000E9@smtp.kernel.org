@@ -1,0 +1,104 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:17:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 03/15] btrfs: introduce BTRFS_RAID_STRIPE_PARITY_KEY
+Date: Fri, 19 Jun 2026 09:17:10 +0000
+Message-Id: <20260619091711.A13D21F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] BTRFS_RAID_STRIPE_PARITY_KEY is completely omitted from the B-tree leaf checker, allowing malformed keys to be read without verification.
+
+Pre-existing issues:
+- [High] In-place modification of metadata leaf buffer in update_raid_extent_item() without marking the buffer dirty.
+--
+
+commit 8be84e061584c9182c6d6879978a0f221d651e14
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: introduce BTRFS_RAID_STRIPE_PARITY_KEY
+
+This commit introduces BTRFS_RAID_STRIPE_PARITY_KEY to hold parity information
+for a specific tuple inside the RAID stripe-tree. The parity information uses
+the same on-disk format as DATA stripes. It also updates btrfs_print_leaf()
+to print the new key type.
+
+> diff --git a/fs/btrfs/print-tree.c b/fs/btrfs/print-tree.c
+> index 87e60a2d4bd81..2698b9184281b 100644
+> --- a/fs/btrfs/print-tree.c
+> +++ b/fs/btrfs/print-tree.c
+[ ... ]
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 1a6ebd10849a1..48436b0561917 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+[ ... ]
+> @@ -456,7 +461,8 @@ int btrfs_get_raid_extent_offset(struct btrfs_fs_info *fs_info,
+>  			goto out;
+>  		}
+>  
+> -		if (in_range(logical, found_logical, found_length))
+> +		if (in_range(logical, found_logical, found_length) &&
+> +		    found_key.type == type)
+>  			break;
+>  
+>  		ret = btrfs_next_item(stripe_root, path);
+
+[Severity: High]
+This is a pre-existing issue, but I noticed a potential problem in
+update_raid_extent_item() in this file when it modifies the metadata leaf
+buffer.
+
+After using btrfs_search_slot() to obtain a writable leaf and updating the
+stripe extent via write_extent_buffer(), it doesn't call
+btrfs_mark_buffer_dirty():
+
+fs/btrfs/raid-stripe-tree.c:update_raid_extent_item() {
+    ...
+	leaf = path->nodes[0];
+	slot = path->slots[0];
+
+	write_extent_buffer(leaf, stripe_extent, btrfs_item_ptr_offset(leaf, slot),
+			    item_size);
+
+	return ret;
+}
+
+If the buffer was already COW'd earlier in the same transaction,
+btrfs_cow_block() returns it without re-dirtying it. If the flusher thread
+already wrote this buffer to disk and cleared its dirty flag, could these new
+modifications only exist in memory and be silently discarded when the
+transaction commits?
+
+> diff --git a/include/uapi/linux/btrfs_tree.h b/include/uapi/linux/btrfs_tree.h
+> index cc3b9f7dccafa..7b2f5f4cf78c7 100644
+> --- a/include/uapi/linux/btrfs_tree.h
+> +++ b/include/uapi/linux/btrfs_tree.h
+> @@ -284,6 +284,7 @@
+>  #define BTRFS_CHUNK_ITEM_KEY	228
+>  
+>  #define BTRFS_RAID_STRIPE_KEY	230
+> +#define BTRFS_RAID_STRIPE_PARITY_KEY	231
+
+[Severity: High]
+Since this key shares the exact same on-disk layout as BTRFS_RAID_STRIPE_KEY,
+does it also need to be added to the switch statement in check_leaf_item() to
+ensure it gets validated?
+
+Currently, check_leaf_item() only validates BTRFS_RAID_STRIPE_KEY:
+
+fs/btrfs/tree-checker.c:check_leaf_item() {
+    ...
+	case BTRFS_RAID_STRIPE_KEY:
+		ret = check_raid_stripe_extent(leaf, key, slot);
+		break;
+    ...
+}
+
+Without adding BTRFS_RAID_STRIPE_PARITY_KEY here, parity keys read from disk
+will bypass check_raid_stripe_extent(). Could this allow malformed keys to be
+read without triggering structural and alignment checks?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=3
+

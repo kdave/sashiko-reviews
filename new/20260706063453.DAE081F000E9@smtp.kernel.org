@@ -1,0 +1,69 @@
+From sashiko-bot@kernel.org Mon Jul  6 08:34:58 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: zoned: reset active_meta_bg on zone finish
+Date: Mon, 06 Jul 2026 06:34:53 +0000
+Message-Id: <20260706063453.DAE081F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] NULL pointer dereference and reference leak / premature free due to unhandled NULL values and double-pointer mutation.
+--
+
+commit 8e1e25b06b03cff408d5f55594141ec077107159
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: reset active_meta_bg on zone finish
+
+do_zone_finish() clears BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE and removes the
+block group from zone_active_bgs, but only the pivot path in
+check_bg_is_active() resets fs_info->active_meta_bg / active_system_bg.
+This commit resets the corresponding active_{meta,system}_bg pointer in 
+do_zone_finish() so it can never go stale.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 97f06dd016932..70997470fa84c 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2270,6 +2270,7 @@ int btrfs_check_meta_write_pointer(struct btrfs_fs_info *fs_info,
+>  
+>  	if (block_group->meta_write_pointer == eb->start) {
+>  		struct btrfs_block_group **tgt;
+> +		bool active;
+>  
+>  		if (!test_bit(BTRFS_FS_ACTIVE_ZONE_TRACKING, &fs_info->flags))
+>  			return 0;
+> @@ -2278,7 +2279,12 @@ int btrfs_check_meta_write_pointer(struct btrfs_fs_info *fs_info,
+>  			tgt = &fs_info->active_system_bg;
+>  		else
+>  			tgt = &fs_info->active_meta_bg;
+> -		if (check_bg_is_active(ctx, tgt))
+> +
+> +		btrfs_get_block_group(*tgt);
+> +		active = check_bg_is_active(ctx, tgt);
+> +		btrfs_put_block_group(*tgt);
+> +
+> +		if (active)
+>  			return 0;
+>  	}
+
+[Severity: Critical]
+Is it possible for *tgt to be NULL here?
+
+Since do_zone_finish() now sets *active_bg = NULL, if
+btrfs_check_meta_write_pointer() is called when fs_info->active_meta_bg
+is NULL, passing *tgt to btrfs_get_block_group() will result in a NULL
+pointer dereference, as btrfs_get_block_group() doesn't check for NULL.
+
+Additionally, does check_bg_is_active() modify *tgt?
+
+Because tgt is passed as a double pointer, check_bg_is_active() can modify
+the underlying pointer (e.g., when activating a new block group it does
+*active_bg = block_group).
+
+If this happens, the subsequent btrfs_put_block_group(*tgt) will drop the
+reference on the newly assigned block group instead of the one originally
+acquired. This could lead to a leaked reference on the old block group and
+a premature free on the new one.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260706062031.185284-1-johannes.thumshirn@wdc.com?part=1
+

@@ -1,0 +1,74 @@
+From sashiko-bot@kernel.org Mon Jun 15 15:28:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 2/6] block: allow making a block device unfreezable
+Date: Mon, 15 Jun 2026 13:28:20 +0000
+Message-Id: <20260615132821.0A0531F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] bdev_thaw() prematurely drops bd_fsfreeze_count to 0 before the filesystem is actually thawed, exposing a vulnerable transient state to lockless readers. A concurrent bdev_deny_freeze() will incorrectly succeed while the device is still frozen. If the thaw operation then fails, bdev_thaw() blindly increments the counter to roll back, changing it from -1 (set by the denier) to 0, instead of 1. This corrupts the sign-encoded counter.
+--
+
+commit 63da433b19e190cabbf0cf97b47c2bb02d7e5795
+Author: Christian Brauner <brauner@kernel.org>
+
+block: allow making a block device unfreezable
+
+This patch adds bdev_deny_freeze() and bdev_allow_freeze() to make a block
+device unfreezable. It converts bd_fsfreeze_count into a signed counter
+where positive values count active freezes and negative values count deniers.
+
+> diff --git a/block/bdev.c b/block/bdev.c
+> index bb0ffa3bb4dfb..939dec3517724 100644
+> --- a/block/bdev.c
+> +++ b/block/bdev.c
+
+[ ... ]
+
+> @@ -368,6 +373,42 @@ int bdev_thaw(struct block_device *bdev)
+>  }
+>  EXPORT_SYMBOL(bdev_thaw);
+>  
+> +/**
+> + * bdev_deny_freeze - make a block device unfreezable
+
+[ ... ]
+
+> + * Return: 0, or -EBUSY if the device is currently frozen.
+> + */
+> +int bdev_deny_freeze(struct block_device *bdev)
+> +{
+> +	return atomic_dec_unless_positive(&bdev->bd_fsfreeze_count) ? 0 : -EBUSY;
+
+[Severity: High]
+Can this race with bdev_thaw() and corrupt the counter?
+
+Looking at bdev_thaw(), the bd_fsfreeze_count is dropped to 0 prematurely
+before the actual thaw operation occurs:
+
+bdev_thaw()
+    nr_freeze = atomic_dec_if_positive(&bdev->bd_fsfreeze_count);
+    ...
+    error = bdev->bd_holder_ops->thaw(bdev);
+
+If bdev_deny_freeze() is called concurrently during this window, it locklessly
+checks atomic_dec_unless_positive(). Since it sees 0, it decrements the
+counter to -1 and incorrectly succeeds, assuming no freeze is active. This
+allows the caller to mutate the device while it is technically still frozen.
+
+Furthermore, if the thaw() operation fails, bdev_thaw() blindly attempts to
+roll back:
+
+bdev_thaw()
+    ...
+    if (error)
+        atomic_inc(&bdev->bd_fsfreeze_count);
+
+Because the denier changed the counter to -1, this rollback increments it to
+0 instead of 1, corrupting the sign-encoded counter.
+
+> +}
+> +EXPORT_SYMBOL_GPL(bdev_deny_freeze);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260615-work-super-freeze_deny_upstream-v1-0-a6c72b840e7d@kernel.org?part=2
+

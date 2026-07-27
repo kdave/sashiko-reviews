@@ -1,0 +1,52 @@
+From sashiko-bot@kernel.org Fri Jun  5 18:49:23 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: move WARN_ON on unexpected error in
+ __add_tree_block()
+Date: Fri, 05 Jun 2026 16:49:19 +0000
+Message-Id: <20260605164920.265581F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Moving `WARN_ON(ret)` into the `if` condition causes the kernel to panic before printing critical debugging information when `panic_on_warn` is enabled.
+--
+
+commit 93bb6e0a168631aaad4a3695bebc86639544c0e1
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: move WARN_ON on unexpected error in __add_tree_block()
+
+This commit moves the WARN_ON() check into the if condition when checking
+for unexpected errors. This is intended to mark the branch as unlikely and
+prevent the stack trace from obscuring the dumped leaf in the logs.
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+> @@ -3187,13 +3187,12 @@ static int __add_tree_block(struct reloc_control *rc,
+>  			goto again;
+>  		}
+>  	}
+> -	if (ret) {
+> +	if (WARN_ON(ret)) {
+
+[Severity: Medium]
+If panic_on_warn is enabled (which is standard in CI and fuzzing 
+environments), will this cause the kernel to panic before printing the 
+critical debugging information? 
+
+Since the WARN_ON(ret) is evaluated in the condition, it executes before
+btrfs_print_leaf() and btrfs_err(). The original code printed the leaf and
+error message before triggering the warning, ensuring the state was logged
+even if the system subsequently panics.
+
+>  		ASSERT(ret == 1);
+>  		btrfs_print_leaf(path->nodes[0]);
+>  		btrfs_err(fs_info,
+>  	     "tree block extent item (%llu) is not found in extent tree",
+>  		     bytenr);
+> -		WARN_ON(1);
+>  		return -EINVAL;
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/3c637e06f9a7c3e83b430c4b30620118356cd3f5.1780677634.git.fdmanana@suse.com?part=1
+

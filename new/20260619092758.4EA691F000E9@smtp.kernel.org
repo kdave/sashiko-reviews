@@ -1,0 +1,108 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:28:03 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 06/15] btrfs: allow RAID56 for data block groups with
+ stripe-tree
+Date: Fri, 19 Jun 2026 09:27:57 +0000
+Message-Id: <20260619092758.4EA691F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Arithmetic underflow in `bg->alloc_offset` calculation for partial stripe writes in zoned RAID56.
+
+Pre-existing issues:
+- [Critical] Use-After-Free and Double-Free of the transaction handle on memory allocation failure.
+--
+
+commit cbcedd25268c31970fb941169a65071c1d94b160
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: allow RAID56 for data block groups with stripe-tree
+    
+Add BTRFS_BLOCK_GROUP_RAID56_MASK to the set of profiles that update the
+raid-stripe-tree, so data extents on a RAID5/6 block-group get their data
+and parity stripe locations recorded in the stripe-tree.
+
+> diff --git a/fs/btrfs/raid-stripe-tree.h b/fs/btrfs/raid-stripe-tree.h
+> index 3c67d814640fa..b1a26e21b0d58 100644
+> --- a/fs/btrfs/raid-stripe-tree.h
+> +++ b/fs/btrfs/raid-stripe-tree.h
+> @@ -14,7 +14,8 @@
+>  #define BTRFS_RST_SUPP_BLOCK_GROUP_MASK    (BTRFS_BLOCK_GROUP_DUP |		\
+>  					    BTRFS_BLOCK_GROUP_RAID1_MASK |	\
+>  					    BTRFS_BLOCK_GROUP_RAID0 |		\
+> -					    BTRFS_BLOCK_GROUP_RAID10)
+> +					    BTRFS_BLOCK_GROUP_RAID10 |		\
+> +					    BTRFS_BLOCK_GROUP_RAID56_MASK)
+
+[Severity: High]
+Does enabling RAID56 here expose an arithmetic underflow in zoned allocations?
+
+Looking at btrfs_load_block_group_raid56() in fs/btrfs/zoned.c,
+bg->alloc_offset is calculated from the sum of all zone write pointers:
+
+fs/btrfs/zoned.c:btrfs_load_block_group_raid56() {
+        ...
+        u64 row_bytes = (u64)map->num_stripes << BTRFS_STRIPE_LEN_SHIFT;
+        u64 nr_rows = div64_u64(wp_sum + row_bytes - 1, row_bytes);
+
+        bg->alloc_offset = wp_sum -
+                (((u64)nr_rows * nr_parity) << BTRFS_STRIPE_LEN_SHIFT);
+        ...
+}
+
+If a crash occurs after writing a small amount of data but before the parity
+stripe's write pointer is advanced, could wp_sum be arbitrarily small?
+
+If wp_sum is smaller than the subtracted full parity capacity, this
+calculation would underflow, resulting in an alloc_offset near U64_MAX.
+
+Would this cause btrfs_load_block_group_zone_info() to detect an impossibly
+large offset and fail the block group load with -EIO, rendering the
+filesystem unmountable and bypassing recovery mechanisms?
+
+
+[Severity: Critical]
+This is a pre-existing issue, but does enabling RAID56 for the stripe-tree
+expose a transaction use-after-free and double-free on memory allocation
+failure?
+
+If kzalloc() fails in btrfs_insert_one_raid_extent(), it prematurely ends
+the transaction:
+
+fs/btrfs/raid-stripe-tree.c:btrfs_insert_one_raid_extent() {
+        ...
+        stripe_extent = kzalloc(item_size, GFP_NOFS);
+        if (unlikely(!stripe_extent)) {
+                btrfs_abort_transaction(trans, -ENOMEM);
+                btrfs_end_transaction(trans);
+                return -ENOMEM;
+        }
+        ...
+}
+
+This frees the transaction handle and returns -ENOMEM to callers like
+btrfs_finish_one_ordered(). The caller's error path then unconditionally
+accesses the freed trans pointer:
+
+fs/btrfs/inode.c:btrfs_finish_one_ordered() {
+        ...
+        ret = btrfs_insert_raid_extent(trans, ordered_extent);
+        if (ret)
+                goto out;
+        ...
+out:
+        if (ret < 0 && trans)
+                btrfs_abort_transaction(trans, ret);
+
+        if (trans)
+                btrfs_end_transaction(trans);
+        ...
+}
+
+Will this result in btrfs_abort_transaction() accessing a freed pointer,
+followed by a double-free when btrfs_end_transaction() is called again?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=6
+

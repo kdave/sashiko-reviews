@@ -1,0 +1,58 @@
+From sashiko-bot@kernel.org Wed Jun 24 01:24:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/5] btrfs: probe with GFP_NOWAIT for tree block
+ readahead
+Date: Tue, 23 Jun 2026 23:24:22 +0000
+Message-Id: <20260623232423.01AD51F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Readahead can still stall in direct reclaim during bio allocation or block layer submission, leaving the patch's primary goal unfulfilled.
+--
+
+commit 6c56f6328f197166102f14289e7e77c37650fcd3
+Author: Boris Burkov <boris@bur.io>
+
+extent_buffer readahead should not be able to painfully stall a
+search_slot and hog tree locks by getting stuck in direct reclaim.
+
+This commit updates btrfs_readahead_tree_block to use NOWAIT semantics
+for extent buffer preallocation. The goal is to prevent the readahead
+thread from stalling in direct reclaim while holding tree locks.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 94fa9a6c3978..b40d3c47eb0d 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+> @@ -4737,7 +4737,8 @@ void btrfs_readahead_tree_block(struct btrfs_fs_info *fs_info,
+>  		.level = level,
+>  		.transid = gen
+>  	};
+> -	struct btrfs_eb_prealloc pa = { 0 };
+> +	/* Readahead is best effort so prefer to fail rather than block in reclaim. */
+> +	struct btrfs_eb_prealloc pa = { .supports_nowait = true };
+>  	struct extent_buffer *eb;
+>  	int ret;
+
+[Severity: High]
+This is a pre-existing issue, but does this patch fully prevent the
+stalls in direct reclaim it aims to address?
+
+While extent buffer allocation will now correctly avoid blocking by using
+supports_nowait, btrfs_readahead_tree_block later makes the following
+call on the newly allocated buffer:
+
+    ret = read_extent_buffer_pages_nowait(eb, 0, &check);
+
+Since read_extent_buffer_pages_nowait internally allocates a bio via
+btrfs_bio_alloc (which hardcodes GFP_NOFS) and submits it without
+REQ_NOWAIT, couldn't the readahead thread still stall waiting for memory
+or block layer congestion?
+
+Under memory pressure, this might still lead to hogging tree locks while
+stuck in direct reclaim, leaving the primary goal of the patch unfulfilled.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1782249000.git.boris@bur.io?part=4
+

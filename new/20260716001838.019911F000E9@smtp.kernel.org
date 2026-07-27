@@ -1,0 +1,116 @@
+From sashiko-bot@kernel.org Thu Jul 16 02:18:41 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5] loop: Fix NULL pointer dereference in lo_rw_aio()
+Date: Thu, 16 Jul 2026 00:18:37 +0000
+Message-Id: <20260716001838.019911F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] The patch ties an extremely expensive debug check to `CONFIG_KCOV`, causing massive performance degradation and memory bloat on fuzzing/coverage kernels.
+- [High] `loop_check_io_race` triggers false positive BUG messages for legitimate I/O requests that are delayed in the workqueue.
+- [Medium] Capturing `current` in the block layer dispatch callback fails to identify the original I/O issuer.
+--
+
+--- Patch [1]: [PATCH v5] loop: Fix NULL pointer dereference in lo_rw_aio() ---
+commit 2f735d1bef8fa5cdd4e9a5ebfba47f7b096bdf7e
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+
+loop: Fix NULL pointer dereference in lo_rw_aio()
+
+This commit introduces a grace period for flushing pending I/O requests to
+prevent a NULL pointer dereference. It also adds a diagnostic check under
+CONFIG_KCOV to trace tasks issuing I/O requests after the device enters the
+rundown state.
+
+Link: https://syzkaller.appspot.com/bug?extid=cd8a9a308e879a4e2c28
+Link: https://syzkaller.appspot.com/bug?extid=bc273027d5643e48e5b3
+Link: https://lkml.kernel.org/r/fbb3edda-f108-4e5b-acf2-266f043f8125@I-love.SAKURA.ne.jp
+
+> diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+> index 310de0463beb1..c3b607a3ddc44 100644
+> --- a/drivers/block/loop.c
+> +++ b/drivers/block/loop.c
+> @@ -85,8 +85,27 @@ struct loop_cmd {
+>  	struct bio_vec *bvec;
+>  	struct cgroup_subsys_state *blkcg_css;
+>  	struct cgroup_subsys_state *memcg_css;
+> +#ifdef CONFIG_KCOV
+> +	unsigned long stack_entries[30];
+> +	int stack_nr;
+> +	pid_t pid;
+> +	char comm[TASK_COMM_LEN];
+> +#endif
+>  };
+
+[Severity: High]
+Does this bloat the request PDU too much?
+
+This adds over 250 bytes to struct loop_cmd per tag. Since CONFIG_KCOV
+is routinely enabled in production fuzzers and debugging kernels, could
+this inflate the tag set memory usage significantly?
+
+[ ... ]
+
+> @@ -1851,10 +1921,18 @@ static blk_status_t loop_queue_rq(struct blk_mq_hw_ctx *hctx,
+>  	struct blk_mq_queue_data *bd)
+>  {
+>  	struct request *rq = bd->rq;
+>  	struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
+>  	struct loop_device *lo = rq->q->queuedata;
+>  
+> +#ifdef CONFIG_KCOV
+> +	cmd->stack_nr = stack_trace_save(cmd->stack_entries, ARRAY_SIZE(cmd->stack_entries), 0);
+> +	cmd->pid = current->pid;
+> +	get_task_comm(cmd->comm, current);
+> +#endif
+
+[Severity: High]
+Will this severely degrade I/O performance on KCOV-enabled kernels?
+
+This executes expensive stack unwinding in the fast path for every single
+I/O request.
+
+[Severity: Medium]
+Does capturing current here actually identify the original I/O issuer?
+
+Because request dispatch in the block layer is frequently asynchronous,
+such as when kblockd workers run blk_mq_run_hw_queue(), current will often
+point to a generic kernel worker thread.
+
+Will this result in capturing the stack trace and task context of the
+dispatcher rather than the file system or user space thread that
+originally called submit_bio()?
+
+>  	blk_mq_start_request(rq);
+>  
+> -	if (data_race(READ_ONCE(lo->lo_state)) != Lo_bound)
+> +	if (data_race(READ_ONCE(lo->lo_state)) != Lo_bound) {
+> +		loop_check_io_race(lo, cmd);
+>  		return BLK_STS_IOERR;
+> +	}
+
+[ ... ]
+
+> @@ -1897,6 +1975,7 @@ static void loop_handle_cmd(struct loop_cmd *cmd)
+>  	int ret = 0;
+>  	struct mem_cgroup *old_memcg = NULL;
+>  
+> +	loop_check_io_race(lo, cmd);
+>  	if (write && (lo->lo_flags & LO_FLAGS_READ_ONLY)) {
+>  		ret = -EIO;
+>  		goto failed;
+
+[Severity: High]
+Will this trigger false positive BUG messages for legitimate requests
+delayed in the workqueue?
+
+When a loop device is closed, lo_release() sets lo_state = Lo_rundown and
+then calls drain_workqueue(). The drain_workqueue() function legitimately
+processes I/O that was queued before the teardown started.
+
+Because loop_check_io_race() is called here from the asynchronous worker
+thread during drain_workqueue(), won't it incorrectly flag these previously
+queued requests as races?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/30ccdd3c-6353-4a0f-bdc7-230ec3bf4765@I-love.SAKURA.ne.jp?part=1
+

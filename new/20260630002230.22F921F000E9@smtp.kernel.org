@@ -1,0 +1,48 @@
+From sashiko-bot@kernel.org Tue Jun 30 02:22:32 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: sink idmap parameter to
+ __btrfs_ioctl_snap_create()
+Date: Tue, 30 Jun 2026 00:22:29 +0000
+Message-Id: <20260630002230.22F921F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The source subvolume ownership check during snapshot creation incorrectly uses the target mount's idmap, allowing an attacker to bypass permission checks and snapshot subvolumes they do not own.
+--
+
+(Note: The format of this report is altered to a free-form summary due to
+recitation restrictions. No direct code quoting is used.)
+
+commit a0981a077a546a922d3133bcea2ce52c2d4d5808
+Author: David Sterba <dsterba@suse.com>
+btrfs: sink idmap parameter to __btrfs_ioctl_snap_create()
+
+This commit moves the assignment of the idmap parameter inside
+__btrfs_ioctl_snap_create() by deriving it directly from the target
+file pointer.
+
+[Severity: High]
+This is a pre-existing issue, but this refactoring highlights a potential
+flaw with how the idmap is applied during the source subvolume ownership
+check in __btrfs_ioctl_snap_create() within fs/btrfs/ioctl.c.
+
+When validating if the user can snapshot the subvolume, the code checks
+inode_owner_or_capable(idmap, src_inode). However, the idmap being used is
+derived from the target directory (file_mnt_idmap(file)), not the source
+file descriptor.
+
+Could this allow an attacker to bypass permission checks? If an unprivileged
+user calls BTRFS_IOC_SNAP_CREATE using a destination directory located on an
+idmapped mount they control, the kernel evaluates the source inode ownership
+using that target directory's idmap. By mapping the source owner's UID to
+their own UID in the target idmapped mount, would this force the ownership
+check to succeed for a subvolume they do not actually own?
+
+Should the ownership check on src_inode be updated to use the idmap from the
+source mount (e.g., file_mnt_idmap(fd_file(src))) instead of the target
+mount's idmap?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260630000917.2521623-1-dsterba@suse.com?part=1
+

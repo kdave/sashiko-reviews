@@ -1,0 +1,72 @@
+From sashiko-bot@kernel.org Wed Jul 22 17:37:45 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/5] btrfs: move condition for log commit wait into
+ wait_log_commit()
+Date: Wed, 22 Jul 2026 15:37:40 +0000
+Message-Id: <20260722153740.B9D691F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Out-of-bounds array access in wait_log_commit() due to negative modulo result.
+--
+
+--- Patch [3]: [PATCH v2 3/5] btrfs: move condition for log commit wait into wait_log_commit() ---
+commit d93660e9a953684fd13f407e5e0735e730621fd2
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: move condition for log commit wait into wait_log_commit()
+
+This commit moves the check for a non-zero log_commit flag into the
+wait_log_commit() function itself, allowing callers to invoke it
+unconditionally.
+
+> diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+> index 580f2aabc0651..b6ed6671ee26d 100644
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+
+[ ... ]
+
+> @@ -3172,11 +3164,15 @@ static int update_log_root(struct btrfs_trans_handle *trans,
+>  	return ret;
+>  }
+>  
+> -static void wait_log_commit(struct btrfs_root *root, int transid)
+> +/* Returns true if we had to wait, false otherwise. */
+> +static bool wait_log_commit(struct btrfs_root *root, int transid)
+>  {
+>  	DEFINE_WAIT(wait);
+>  	int index = transid % 2;
+>  
+> +	if (atomic_read(&root->log_commit[index]) == 0)
+> +		return false;
+> +
+
+[Severity: High]
+Does this code perform an out-of-bounds array access when transid is -1?
+
+In C, -1 % 2 evaluates to -1, which causes index to be -1.
+This leads to accessing root->log_commit[-1] here and later
+root->log_commit_wait[-1], which causes undefined behavior and can alias
+other struct members like log_writers and log_writer_wait.
+
+[ ... ]
+
+> @@ -3333,8 +3328,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
+>  	atomic_set(&root->log_commit[index1], 1);
+>  
+>  	/* wait for previous tree log sync to complete */
+> -	if (atomic_read(&root->log_commit[(index1 + 1) % 2]))
+> -		wait_log_commit(root, log_transid - 1);
+> +	wait_log_commit(root, log_transid - 1);
+
+[Severity: High]
+Is it possible for log_transid to be 0 here during the first log transaction?
+
+If so, this will unconditionally pass -1 to wait_log_commit().
+Before this patch, the code computed (index1 + 1) % 2 which correctly mapped
+0 to 1, and conditionally skipped the function call entirely, avoiding the
+negative modulo issue.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1784733395.git.fdmanana@suse.com?part=3
+

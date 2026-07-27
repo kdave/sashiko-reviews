@@ -1,0 +1,61 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:11:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 04/15] btrfs: zoned: align max_zone_append_size to the
+ stripe length for RST
+Date: Fri, 19 Jun 2026 09:11:07 +0000
+Message-Id: <20260619091107.D26251F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Incomplete fix: silently allowing devices with zone append limits smaller than BTRFS_STRIPE_LEN corrupts the stripe-tree mapping.
+--
+
+commit b3a7fa1af7de50a54e475eaa678048dd51820a94
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: align max_zone_append_size to the stripe length for RST
+
+This commit aligns the maximum zone append size down to the BTRFS stripe
+length when the raid-stripe-tree feature is enabled to prevent mid-stripe
+writes and subsequent mapping corruption. It also guards against a zero
+result if the device's append limit is smaller than a stripe.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -781,6 +781,14 @@ int btrfs_check_zoned_mode(struct btrfs_fs_info *fs_info)
+>  		     (u64)lim->max_sectors << SECTOR_SHIFT,
+>  		     (u64)lim->max_segments << PAGE_SHIFT),
+>  		fs_info->sectorsize);
+> +
+> +	if (btrfs_fs_incompat(fs_info, RAID_STRIPE_TREE)) {
+> +		u64 aligned = ALIGN_DOWN(fs_info->max_zone_append_size,
+> +					 BTRFS_STRIPE_LEN);
+> +
+> +		if (aligned)
+> +			fs_info->max_zone_append_size = aligned;
+
+[Severity: Critical]
+This is a pre-existing issue, but does this logic leave the filesystem
+vulnerable to the exact corruption it tries to prevent?
+
+Looking at btrfs_check_zoned_mode(), if a device has a zone append limit
+smaller than BTRFS_STRIPE_LEN (e.g., 32KB on some NVMe ZNS drives vs a 64KB
+stripe length), ALIGN_DOWN() will return 0.
+
+By skipping the update when aligned == 0, max_zone_append_size remains at
+its original unaligned value. As the commit message notes, if this size is
+not a multiple of BTRFS_STRIPE_LEN, bios will end mid-stripe and corrupt
+the stripe-tree mapping.
+
+Should the mount be rejected instead (e.g., returning -EINVAL) when
+aligned == 0, since RAID_STRIPE_TREE requires the ability to append at
+least one full stripe?
+
+> +	}
+>  	fs_info->fs_devices->chunk_alloc_policy = BTRFS_CHUNK_ALLOC_ZONED;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=4
+

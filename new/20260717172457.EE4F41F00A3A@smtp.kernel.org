@@ -1,0 +1,174 @@
+From sashiko-bot@kernel.org Fri Jul 17 19:25:00 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/4] btrfs: pre-allocate delayed dir index before btree
+ modification
+Date: Fri, 17 Jul 2026 17:24:57 +0000
+Message-Id: <20260717172457.EE4F41F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+
+New issues:
+- [Medium] Memory Leak / API Contract Violation: `prealloc` parameter leaks memory on multiple paths if ownership is transferred.
+- [Medium] Missing Initialization / Information Leak: Uninitialized kernel memory is written as the directory entry name when a caller provides a preallocated delayed dir index.
+- [Medium] Incomplete Implementation: The callers were not updated to handle -ENOMEM gracefully, contradicting the commit message claims.
+
+Pre-existing issues:
+- [High] Data Corruption: Erroneous insertion of orphaned delayed directory index when a DIR_ITEM collision occurs (-EEXIST).
+--
+
+--- Patch [2]: [PATCH 2/4] btrfs: pre-allocate delayed dir index before btree modification ---
+commit 91f48453d314d6c62bbe42ed9b5b4e09b9dbe373
+Author: Jeff Layton <jlayton@kernel.org>
+Subject: btrfs: pre-allocate delayed dir index before btree modification
+
+Move the delayed dir index allocation in btrfs_insert_dir_item() before
+the insert_with_overflow() call that modifies the btree.
+
+> With the pre-allocation, if the GFP_NOFS allocations fail, -ENOMEM is
+> returned before any on-disk state has changed. The caller can then
+> handle the error gracefully. If the btree insertion itself fails, the
+> pre-allocated resources are freed.
+
+[Severity: Medium]
+Does the implementation match this commit message claim?
+
+Looking at the callers btrfs_add_link() in fs/btrfs/inode.c and
+create_pending_snapshot() in fs/btrfs/transaction.c, an -ENOMEM return value
+from btrfs_insert_dir_item() still falls through to a branch that
+unconditionally calls btrfs_abort_transaction().
+
+Should these callers be updated to actually handle the error gracefully?
+
+> ---
+>  fs/btrfs/dir-item.c    | 30 ++++++++++++++++++++++++------
+>  fs/btrfs/dir-item.h    |  5 +++--
+>  fs/btrfs/inode.c       |  2 +-
+>  fs/btrfs/transaction.c |  2 +-
+>  4 files changed, 29 insertions(+), 10 deletions(-)
+> 
+> diff --git a/fs/btrfs/dir-item.c b/fs/btrfs/dir-item.c
+> index 84f1c64423d32..1b956df2c5718 100644
+> --- a/fs/btrfs/dir-item.c
+> +++ b/fs/btrfs/dir-item.c
+
+[ ... ]
+
+> @@ -130,6 +135,18 @@ int btrfs_insert_dir_item(struct btrfs_trans_handle *trans,
+>  
+>  	btrfs_cpu_key_to_disk(&disk_key, location);
+>  
+> +	/* Pre-allocate the delayed dir index before modifying the btree. */
+> +	if (need_delayed_index && !prealloc) {
+> +		ret = btrfs_prealloc_delayed_dir_index(dir, name->name,
+> +						       name->len,
+> +						       &local_prealloc);
+> +		if (ret)
+> +			return ret;
+> +		memcpy(local_prealloc.item->data + sizeof(struct btrfs_dir_item),
+> +		       name->name, name->len);
+> +		prealloc = &local_prealloc;
+> +	}
+
+[Severity: Medium]
+If a caller provides a preallocated struct in the prealloc parameter, will the
+name be initialized correctly?
+
+If need_delayed_index is true but prealloc is not NULL, this block is skipped,
+including the memcpy() that initializes the name. Since
+btrfs_prealloc_delayed_dir_index() only uses the name length for allocation
+and doesn't copy the name itself, does this mean uninitialized kernel memory
+would be used for the directory index name?
+
+[Severity: Medium]
+Will this leak the caller-provided prealloc parameter on error paths?
+
+The commit message states that ownership of a non-NULL prealloc transfers to
+btrfs_insert_dir_item(). However, if btrfs_alloc_path() fails earlier in the
+function, it returns -ENOMEM immediately without freeing prealloc.
+
+Additionally, if need_delayed_index is false, the success path below at
+second_insert returns without consuming or freeing prealloc, and the error
+path below after insert_with_overflow() explicitly skips freeing it.
+
+> +
+>  	data_size = sizeof(*dir_item) + name->len;
+>  	dir_item = insert_with_overflow(trans, root, path, &key, data_size,
+>  					name->name, name->len);
+
+[ ... ]
+
+> @@ -154,15 +173,14 @@ int btrfs_insert_dir_item(struct btrfs_trans_handle *trans,
+>  	write_extent_buffer(leaf, name->name, name_ptr, name->len);
+>  
+>  second_insert:
+> -	/* FIXME, use some real flag for selecting the extra index */
+> -	if (root == root->fs_info->tree_root) {
+> +	if (!need_delayed_index) {
+>  		ret = 0;
+>  		goto out_free;
+>  	}
+>  	btrfs_release_path(path);
+>  
+> -	ret2 = btrfs_insert_delayed_dir_index(trans, name->name, name->len, dir,
+> -					      &disk_key, type, index);
+> +	ret2 = btrfs_insert_delayed_dir_index_prealloc(trans, dir, prealloc,
+> +						       &disk_key, type, index);
+
+[Severity: High]
+This is a pre-existing issue, but does this error handling correctly manage
+directory state on a name collision?
+
+If insert_with_overflow() returns -EEXIST due to an exact name match in the
+directory, the error is intercepted and execution jumps to second_insert.
+At this point, btrfs_insert_delayed_dir_index_prealloc() is executed
+despite the primary DIR_ITEM insertion failing.
+
+Could this lead to directory corruption and phantom delayed DIR_INDEX
+entries on disk if a name collision occurs?
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 272598f6ae77a..b7b4e61771355 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -6737,7 +6737,7 @@ int btrfs_add_link(struct btrfs_trans_handle *trans,
+>  		return ret;
+>  
+>  	ret = btrfs_insert_dir_item(trans, name, parent_inode, &key,
+> -				    btrfs_inode_type(inode), index);
+> +				    btrfs_inode_type(inode), index, NULL);
+>  	if (ret == -EEXIST || ret == -EOVERFLOW)
+>  		goto fail_dir_item;
+
+[Severity: Medium]
+Should this check be updated to handle -ENOMEM?
+
+The commit message indicates that callers can now handle -ENOMEM gracefully.
+However, btrfs_add_link() falls through to the next block which unconditionally
+calls btrfs_abort_transaction(trans, ret).
+
+[ ... ]
+
+> diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+> index 8f94197281008..3a2d4520c79a5 100644
+> --- a/fs/btrfs/transaction.c
+> +++ b/fs/btrfs/transaction.c
+> @@ -1886,7 +1886,7 @@ static noinline int create_pending_snapshot(struct btrfs_trans_handle *trans,
+>  
+>  	ret = btrfs_insert_dir_item(trans, &fname.disk_name,
+>  				    parent_inode, &key, BTRFS_FT_DIR,
+> -				    index);
+> +				    index, NULL);
+>  	if (unlikely(ret)) {
+>  		btrfs_abort_transaction(trans, ret);
+>  		goto fail;
+
+[Severity: Medium]
+Similarly, does create_pending_snapshot() need to be updated?
+
+It unconditionally aborts the transaction on any error from
+btrfs_insert_dir_item(), which prevents it from handling the new graceful
+-ENOMEM returns.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260717-btrfs-enomem-v1-0-cdc9c0e265d0@kernel.org?part=2
+

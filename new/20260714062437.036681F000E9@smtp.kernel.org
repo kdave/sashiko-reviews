@@ -1,0 +1,91 @@
+From sashiko-bot@kernel.org Tue Jul 14 08:24:41 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/3] btrfs: detach failed sprout device from transaction
+ update list
+Date: Tue, 14 Jul 2026 06:24:36 +0000
+Message-Id: <20260714062437.036681F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] In the error handling path of btrfs_init_new_device(), the device struct is freed synchronously after being removed from the RCU-protected fs_devices->devices list, leading to a Use-After-Free.
+- [High] If a seeding device is added and the initial transaction commit succeeds, a subsequent failure in btrfs_attach_transaction() wrongly jumps to error_sysfs and destroys the actively committed device.
+--
+
+--- Patch [1]: [PATCH 1/3] btrfs: detach failed sprout device from transaction update list ---
+commit 64e39d2d8b664dd55cae3ce940c2a123274ea66c
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: detach failed sprout device from transaction update list
+
+This commit addresses a warning during the abort of a transaction when
+creating a sprout filesystem. It removes the failed device from the
+transaction update list before freeing it.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 6eab4cc73ce44..556d8a60a5ec9 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -3071,6 +3071,8 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  	btrfs_sysfs_remove_device(device);
+>  	mutex_lock(&fs_info->fs_devices->device_list_mutex);
+>  	mutex_lock(&fs_info->chunk_mutex);
+> +	if (!list_empty(&device->post_commit_list))
+> +		list_del_init(&device->post_commit_list);
+>  	list_del_rcu(&device->dev_list);
+
+[Severity: High]
+This is a pre-existing issue, but is it safe to free the device synchronously
+after removing it from the RCU list?
+
+In the error handling path of btrfs_init_new_device(), removing the device
+from fs_devices->devices with list_del_rcu() eventually falls through to
+error_free_device which calls btrfs_free_device().
+
+btrfs_free_device() directly frees the device:
+
+fs/btrfs/volumes.c:btrfs_free_device() {
+    ...
+    kfree(rcu_dereference_raw(device->name));
+    ...
+    kfree(device);
+}
+
+Since the device was previously published with list_add_rcu(), wouldn't this
+cause a use-after-free for any concurrent RCU readers traversing the device
+list because there is no RCU grace period before the kfree()?
+
+>  	list_del(&device->dev_alloc_list);
+>  	fs_info->fs_devices->num_devices--;
+
+[Severity: High]
+This is a pre-existing issue, but does jumping to error_sysfs tear down the
+device in memory after it has already been committed to disk?
+
+Earlier in btrfs_init_new_device(), if a seeding device is added, the code
+successfully calls btrfs_commit_transaction(trans). If 
+btrfs_attach_transaction() then fails, the code jumps to error_sysfs:
+
+fs/btrfs/volumes.c:btrfs_init_new_device() {
+    ...
+    ret = btrfs_commit_transaction(trans);
+    if (seeding_dev) {
+        ...
+        trans = btrfs_attach_transaction(root);
+        if (IS_ERR(trans)) {
+            if (PTR_ERR(trans) == -ENOENT)
+                return 0;
+            ret = PTR_ERR(trans);
+            trans = NULL;
+            goto error_sysfs;
+        }
+    ...
+}
+
+By branching to error_sysfs, the in-memory device structures are unlinked and
+freed. Could this cause severe state corruption because the device is already
+persisted to the on-disk metadata and the global transaction state?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260714061037.1014-1-3497809730@qq.com?part=1
+

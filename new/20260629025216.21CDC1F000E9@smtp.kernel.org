@@ -1,0 +1,234 @@
+From sashiko-bot@kernel.org Mon Jun 29 04:52:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: raid56: use async_tx API for parity operations
+Date: Mon, 29 Jun 2026 02:52:15 +0000
+Message-Id: <20260629025216.21CDC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [Critical] In `verify_one_parity_step()`, the `pages` array is corrupted by `async_gen_syndrome()` on its synchronous fallback path, replacing `struct page *` entries with virtual addresses. This leads to fatal out-of-bounds memory accesses when `kmap_local_page()` is called on them.
+- [Critical] The DMA descriptor dependency chain is erroneously broken and lost in early-return paths (e.g., when a sector has no errors), causing the CPU to proceed without waiting for pending DMA operations.
+- [High] The `async_tx` API's synchronous fallback paths do not support `HIGHMEM` pages, leading to a NULL pointer dereference when BTRFS processes BIO pages mapped in high memory on 32-bit platforms.
+- [Medium] Missing `scribble` buffer silently disables DMA offloading for all RAID6 recovery operations.
+--
+
+commit b0c873ff6454d513595629eef33d2ac5483d16f1
+Author: Rosen Penev <rosenp@gmail.com>
+Date:   Mon Jun 29 02:39:12 2026 +0000
+
+    btrfs: raid56: use async_tx API for parity operations
+
+    This commit replaces the kmap-local and synchronous library pattern in
+    btrfs raid56 compute and recovery paths with the async_tx API. It chains
+    step-loop operations as DMA dependency chains across sectors to allow
+    DMA hardware to pipeline parity computations.
+
+> --- a/fs/btrfs/raid56.c
+> +++ b/fs/btrfs/raid56.c
+> @@ -1424,6 +1424,40 @@ static struct dma_async_tx_descriptor *
+>  generate_pq_vertical_step(struct btrfs_raid_bio *rbio, unsigned int sector_nr,
+>  			  unsigned int step_nr,
+>  			  struct page **pages, unsigned int *offsets,
+>  			  struct dma_async_tx_descriptor *depend_tx)
+>  {
+[ ... ]
+>  	if (has_qstripe) {
+[ ... ]
+>  		init_async_submit(&submit, ASYNC_TX_FENCE, depend_tx, NULL, NULL, NULL);
+>  		tx = async_gen_syndrome(pages, offsets, rbio->real_stripes, step, &submit);
+>  	} else {
+>  		init_async_submit(&submit, ASYNC_TX_FENCE | ASYNC_TX_XOR_ZERO_DST,
+>  				  depend_tx, NULL, NULL, NULL);
+>  		tx = async_xor_offs(pages[rbio->nr_data], offsets[rbio->nr_data],
+>  				    pages, offsets, rbio->nr_data, step, &submit);
+
+[Severity: High]
+Can this sequence cause a NULL pointer dereference on 32-bit platforms with
+high memory? The pages array contains struct page pointers that may be mapped
+in high memory. If the async_tx API falls back to its synchronous software
+routine do_sync_xor_offs(), it calls page_address() on these pages:
+
+crypto/async_tx/async_xor.c:do_sync_xor_offs() {
+    ...
+    dest_buf = page_address(dest) + offset;
+    ...
+}
+
+Since page_address() returns NULL for unmapped highmem pages, would this
+lead to a crash when the XOR library attempts to dereference it?
+
+>  	}
+>  	return tx;
+>  }
+[ ... ]
+> @@ -1971,6 +2006,55 @@ static struct dma_async_tx_descriptor *
+>  recover_vertical_step(struct btrfs_raid_bio *rbio,
+>  		      unsigned int sector_nr,
+[ ... ]
+>  	/* All raid6 handling here */
+>  	if (rbio->bioc->map_type & BTRFS_BLOCK_GROUP_RAID6) {
+>  		/* Single failure, rebuild from parity raid5 style */
+>  		if (failb < 0) {
+>  			if (faila == rbio->nr_data)
+>  				/*
+>  				 * Only P stripe has failed without a bad data or
+>  				 * Q stripe.  No recovery needed for this step.
+>  				 * Returning NULL breaks the async_tx dependency
+>  				 * chain, but this path issues no DMA writes
+>  				 * (it is a pure no-op), so no ordering between
+>  				 * steps is required.
+>  				 */
+>  				return NULL;
+
+[Severity: Critical]
+Does returning NULL here unintentionally break the DMA dependency chain for
+subsequent sectors?
+
+If an earlier sector submitted DMA operations but this sector returns NULL,
+the caller recover_vertical_submit() will capture NULL and pass it up to
+recover_sectors().
+
+If the final sector processed results in a NULL descriptor, the wait loop
+in recover_sectors():
+
+    if (tx) {
+        async_tx_issue_pending(tx);
+        dma_wait_for_async_tx(tx);
+    }
+
+would evaluate to false. Could this allow the CPU to proceed, verify
+checksums, and free the RAID buffers while the earlier DMA operations
+are still in flight?
+
+>  			goto pstripe;
+>  		}
+[ ... ]
+>  		if (failb == rbio->real_stripes - 2) {
+>  			init_async_submit(&submit, ASYNC_TX_FENCE,
+>  					  depend_tx, NULL, NULL, NULL);
+>  			tx = async_raid6_datap_recov(rbio->real_stripes, step,
+>  						     faila, pages, offsets, &submit);
+>  		} else {
+>  			init_async_submit(&submit, ASYNC_TX_FENCE,
+>  					  depend_tx, NULL, NULL, NULL);
+>  			tx = async_raid6_2data_recov(rbio->real_stripes, step,
+>  						     faila, failb, pages, offsets,
+>  						     &submit);
+>  		}
+>  		return tx;
+
+[Severity: Medium]
+Does omitting the scribble buffer here unintentionally disable DMA offloading
+for all RAID6 recovery operations?
+
+Looking at the async_tx API for both async_raid6_datap_recov() and
+async_raid6_2data_recov(), they explicitly check for a scribble buffer:
+
+crypto/async_tx/async_raid6_recov.c:async_raid6_2data_recov() {
+    ...
+    if (!async_dma_find_channel(DMA_PQ) || !scribble) {
+        ...
+        raid6_recov_2data(...);
+        ...
+        return NULL;
+    }
+    ...
+}
+
+Since init_async_submit() is called with a NULL scribble buffer, wouldn't
+this always force the synchronous fallback path?
+
+>  	}
+[ ... ]
+> @@ -2090,6 +2090,26 @@ static int recover_vertical_submit(struct btrfs_raid_bio *rbio, int sector_nr,
+>  				   struct page **pages, unsigned int *offsets,
+>  				   struct page **src_pages, unsigned int *src_offsets,
+>  				   int *faila, int *failb,
+>  				   struct dma_async_tx_descriptor **tx_ret,
+>  				   struct dma_async_tx_descriptor *depend_tx)
+>  {
+>  	int found_errors;
+>  	struct dma_async_tx_descriptor *tx = depend_tx;
+>  
+>  	*tx_ret = NULL;
+>  	*faila = -1;
+>  	*failb = -1;
+[ ... ]
+>  	found_errors = get_rbio_vertical_errors(rbio, sector_nr, faila, failb);
+>  	/*
+>  	 * No errors in the vertical stripe, skip it.  Can happen for recovery
+>  	 * which only part of a stripe failed csum check.
+>  	 */
+>  	if (!found_errors)
+>  		return 0;
+
+[Severity: Critical]
+Similar to the P stripe skip above, does clearing the tx_ret handle and
+returning early here drop the pending DMA descriptor chain?
+
+If a middle sector has no errors, depend_tx is discarded, *tx_ret becomes
+NULL, and the returned chain is broken. This seems like it would cause the
+same issue where recover_sectors() skips waiting for previous DMA writes,
+potentially causing use-after-free or data corruption when buffers are freed.
+
+>  
+>  	if (unlikely(found_errors > rbio->bioc->max_errors))
+>  		return -EIO;
+[ ... ]
+> @@ -2815,6 +2815,48 @@ static bool verify_one_parity_step(struct btrfs_raid_bio *rbio,
+>  				   struct page **pages, unsigned int *offsets,
+>  				   unsigned int sector_nr,
+>  				   unsigned int step_nr)
+>  {
+[ ... ]
+>  	if (has_qstripe) {
+>  		assert_rbio(rbio);
+>  		init_async_submit(&submit, 0, NULL, NULL, NULL, NULL);
+>  		tx = async_gen_syndrome(pages, offsets, rbio->real_stripes,
+>  					step, &submit);
+>  	} else {
+[ ... ]
+>  	}
+>  	/* async_tx returns NULL when the operation completed synchronously. */
+>  	if (tx) {
+>  		async_tx_issue_pending(tx);
+>  		dma_wait_for_async_tx(tx);
+>  	}
+>  
+>  	/* Check scrubbing parity and repair it. */
+>  	scrub_kaddr = kmap_local_paddr(rbio_stripe_paddr(rbio, rbio->scrubp,
+>  							 sector_nr, step_nr));
+>  	calc_kaddr = kmap_local_page(pages[rbio->scrubp]);
+
+[Severity: Critical]
+Does providing a NULL scribble buffer to async_gen_syndrome() cause it to
+corrupt the pages array during a synchronous fallback?
+
+When the async_tx API falls back to do_sync_gen_syndrome() and scribble is
+NULL, it aliases its internal srcs array to the blocks array (which is the
+pages array passed in):
+
+crypto/async_tx/async_pq.c:do_sync_gen_syndrome() {
+    ...
+    void **srcs = scribble ? scribble : (void **) blocks;
+    ...
+    for (i = 0; i < disks; i++) {
+        if (blocks[i] == NULL)
+            ...
+        else
+            srcs[i] = page_address(blocks[i]) + offsets[i];
+    }
+    ...
+}
+
+This overwrites the struct page pointers in the pages array with virtual
+addresses. When kmap_local_page(pages[rbio->scrubp]) is subsequently
+called, it receives this virtual address instead of a valid struct page
+pointer, which would lead to memory corruption and a kernel panic.
+
+>  	if (memcmp(scrub_kaddr, (void *)((char *)calc_kaddr + offsets[rbio->scrubp]), step) != 0)
+>  		memcpy(scrub_kaddr, (void *)((char *)calc_kaddr + offsets[rbio->scrubp]), step);
+>  	else
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260629023912.2102700-1-rosenp@gmail.com?part=1
+

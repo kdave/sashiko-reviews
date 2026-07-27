@@ -1,0 +1,89 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:24:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 16/20] xfs: add fs-verity ioctls
+Date: Fri, 10 Jul 2026 09:24:34 +0000
+Message-Id: <20260710092434.EA2E21F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Double unlock of inode ILOCK in the error path of xfs_fsverity_cancel_unwritten()
+--
+
+--- Patch [16]: [PATCH v11 16/20] xfs: add fs-verity ioctls ---
+commit 47f28cf552ea0c7967c4ed99dfd134fe2de87350
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: add fs-verity ioctls
+
+This commit introduces fs-verity ioctls to the XFS filesystem. It adds support
+for enabling fs-verity, dumping metadata (descriptor and Merkle tree pages),
+and obtaining a file's digest.
+
+> diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+> index 1b53701bebea1..fc7860a8b5abb 100644
+> --- a/fs/xfs/xfs_ioctl.c
+> +++ b/fs/xfs/xfs_ioctl.c
+> @@ -49,6 +49,7 @@
+>  
+>  #include <linux/mount.h>
+>  #include <linux/fileattr.h>
+> +#include <linux/fsverity.h>
+>  
+>  /* Return 0 on success or positive error */
+>  int
+
+[ ... ]
+
+> @@ -1466,6 +1467,19 @@ xfs_file_ioctl(
+>  	case XFS_IOC_VERIFY_MEDIA:
+>  		return xfs_ioc_verify_media(filp, arg);
+>  
+> +	case FS_IOC_ENABLE_VERITY:
+> +		if (!xfs_has_verity(mp))
+> +			return -EOPNOTSUPP;
+> +		return fsverity_ioctl_enable(filp, arg);
+
+[Severity: High]
+Does exposing this ioctl introduce a path to a double unlock regression?
+
+When fsverity_ioctl_enable() is called, it can eventually reach the error path
+in xfs_fsverity_cancel_unwritten() if xfs_bunmapi() fails:
+
+fs/xfs/xfs_fsverity.c:xfs_fsverity_cancel_unwritten() {
+    ...
+		if (imap.br_state == XFS_EXT_UNWRITTEN) {
+			xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+
+			error = xfs_bunmapi(tp, ip, imap.br_startoff,
+					imap.br_blockcount, 0, 1, &done);
+			if (error)
+				goto out_cancel;
+    ...
+out_cancel:
+	xfs_trans_cancel(tp);
+	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+	return error;
+}
+
+Because the inode was already joined to the transaction with XFS_ILOCK_EXCL,
+wouldn't the call to xfs_trans_cancel() automatically release the ILOCK?
+
+If so, the subsequent unconditional call to xfs_iunlock() would result in a
+double unlock of the rwsem. This could cause an atomic counter underflow,
+leading to lock state corruption or deadlocks.
+
+> +	case FS_IOC_MEASURE_VERITY:
+> +		if (!xfs_has_verity(mp))
+> +			return -EOPNOTSUPP;
+> +		return fsverity_ioctl_measure(filp, arg);
+> +	case FS_IOC_READ_VERITY_METADATA:
+> +		if (!xfs_has_verity(mp))
+> +			return -EOPNOTSUPP;
+> +		return fsverity_ioctl_read_metadata(filp, arg);
+> +
+>  	default:
+>  		return -ENOTTY;
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=16
+

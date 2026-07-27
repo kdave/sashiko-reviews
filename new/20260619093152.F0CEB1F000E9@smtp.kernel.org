@@ -1,0 +1,211 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:31:58 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 09/15] btrfs: implement basic RAID stripe-tree RAID5 read
+Date: Fri, 19 Jun 2026 09:31:52 +0000
+Message-Id: <20260619093152.F0CEB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 7 potential issue(s) to consider:
+- [Critical] Ignored truncated physical extent lengths leading to out-of-bounds physical I/O.
+- [Critical] Concurrency race leading to Use-After-Free during lockless commit root search.
+- [High] Synchronous block I/O performed in the async submission path.
+- [High] High-order memory allocation in the I/O path using GFP_NOFS without fallback.
+- [High] NULL pointer dereference when a redirected RST device is missing.
+- [High] Undefined behavior and out-of-bounds read due to xor_gen called with 0 sources.
+- [Low] Dead code due to NULL check on a mempool-backed bio allocation.
+--
+
+commit df45cb7e1a281cfae19c28f5c9872400d8b89bbc
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+    btrfs: implement basic RAID stripe-tree RAID5 read
+
+This commit implements the read side of RAID5 backed by the raid-stripe-tree.
+It introduces btrfs_rst_raid56_read() to resolve the targeted data stripe and
+its parity stripe. Depending on the requested mirror, it either reads the
+data stripe directly or reconstructs it via XOR.
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 28aa5e5b21bd6..ebf4162812749 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+[ ... ]
+> -int btrfs_get_raid_extent_offset(struct btrfs_fs_info *fs_info,
+> +static int btrfs_get_raid_extent(struct btrfs_fs_info *fs_info,
+>  				 u64 logical, u64 *length, u64 map_type,
+> -				 u32 stripe_index, struct btrfs_io_stripe *stripe)
+> +				 u32 stripe_index, u8 type,
+> +				 struct btrfs_io_stripe *stripe)
+>  {
+
+[Severity: Critical]
+If this tree search is configured to use the commit root (e.g., setting
+path->search_commit_root = true in the final state of the series), does it
+also need to set path->need_commit_sem = 1?
+
+Without the rw_semaphore protection, the lockless search could race with a
+concurrent transaction commit and cause a use-after-free when the tree roots
+are swapped and freed.
+
+[ ... ]
+> +static int btrfs_rst_read_stripe(struct btrfs_device *dev, u64 physical,
+> +				 struct folio *folio, u64 len)
+> +{
+> +	struct bio *bio;
+> +	int ret;
+> +
+> +	if (!dev->bdev)
+> +		return -EIO;
+> +
+> +	bio = bio_alloc(dev->bdev, 1, REQ_OP_READ, GFP_NOFS);
+> +	if (!bio)
+> +		return -ENOMEM;
+
+[Severity: Low]
+This isn't a bug, but does this path contain dead code? Allocations using
+GFP_NOFS are mempool-backed and are guaranteed to succeed, making this
+failure path unreachable.
+
+> +
+> +	bio_add_folio_nofail(bio, folio, len, 0);
+> +	bio->bi_iter.bi_sector = physical >> SECTOR_SHIFT;
+> +	ret = submit_bio_wait(bio);
+
+[Severity: High]
+Does this perform a synchronous blocking wait in the asynchronous submission
+path? The Btrfs I/O submission path is expected to be async and support
+REQ_NOWAIT. Blocking here sequentially for each stripe could exhaust worker
+threads and degrade performance.
+
+> +	bio_put(bio);
+> +
+> +	return ret;
+> +}
+> +
+> +int btrfs_rst_raid56_read(struct btrfs_bio *orig,
+> +			  struct btrfs_io_context *bioc)
+> +{
+[ ... ]
+> +	if (target_present && (orig->mirror_num <= 1 || !others_present)) {
+> +		struct btrfs_io_stripe dstripe = { 0 };
+> +		u64 dlen = len;
+> +
+> +		dstripe.dev = bioc->stripes[target].dev;
+> +		ret = btrfs_get_raid_extent_offset(fs_info, bioc->logical, &dlen,
+> +						   bioc->map_type, 0, &dstripe);
+
+[Severity: Critical]
+Is it safe to ignore the updated dlen returned by
+btrfs_get_raid_extent_offset()?
+
+If the logical extent spans physically non-contiguous extents, submitting the
+bio with the original full len could read past the boundary of the physical
+extent and cause silent data corruption.
+
+> +		if (ret)
+> +			return ret;
+> +
+> +		bio_set_dev(&orig->bio, dstripe.dev->bdev);
+
+[Severity: High]
+Could dstripe.dev->bdev be NULL here? The fast path checks the geometrically
+derived device earlier, but btrfs_get_raid_extent_offset() overrides
+dstripe.dev with the actual device from the stripe tree.
+
+If the RST-recorded device is missing, passing NULL to bio_set_dev() might
+cause a kernel panic during submission.
+
+> +		orig->bio.bi_iter.bi_sector = dstripe.physical >> SECTOR_SHIFT;
+> +		return submit_bio_wait(&orig->bio);
+
+[Severity: High]
+Will this synchronous block degrade the asynchronous submission path? Using
+submit_bio_wait() blocks the executing thread, violating REQ_NOWAIT semantics.
+
+> +	}
+> +
+> +	if (!others_present)
+> +		return -EIO;
+> +
+> +	folios = kcalloc(nr_data, sizeof(*folios), GFP_NOFS);
+> +	if (!folios) {
+> +		ret = -ENOMEM;
+> +		goto out;
+> +	}
+[ ... ]
+> +	for (int i = 0; i < nr_data; i++) {
+> +		struct btrfs_io_stripe s = { 0 };
+> +		u64 slogical = full + (u64)i * BTRFS_STRIPE_LEN + off_in_stripe;
+> +		u64 slen = len;
+> +
+> +		if (i == target)
+> +			continue;
+> +
+> +		s.dev = bioc->stripes[i].dev;
+> +		ret = btrfs_get_raid_extent_offset(fs_info, slogical, &slen,
+> +						   bioc->map_type, 0, &s);
+> +		if (ret)
+> +			goto out;
+> +
+> +		folios[idx] = folio_alloc(GFP_NOFS, order);
+
+[Severity: High]
+Could this high-order allocation fail under memory pressure? Using
+folio_alloc() with GFP_NOFS without fallback for orders up to 8 can fail on
+fragmented systems, causing spurious -EIO read failures.
+
+> +		if (!folios[idx]) {
+> +			ret = -ENOMEM;
+> +			goto out;
+> +		}
+> +
+> +		ret = btrfs_rst_read_stripe(s.dev, s.physical, folios[idx], len);
+
+[Severity: Critical]
+Is it safe to pass the original len instead of the updated slen?
+
+btrfs_get_raid_extent_offset() may truncate slen. Reading past the physical
+boundary could fetch unrelated disk data and corrupt the reconstructed parity.
+
+> +		if (ret)
+> +			goto out;
+> +
+> +		bufs[idx] = folio_address(folios[idx]);
+> +		idx++;
+> +	}
+> +
+> +	folios[idx] = folio_alloc(GFP_NOFS, order);
+> +	if (!folios[idx]) {
+> +		ret = -ENOMEM;
+> +		goto out;
+> +	}
+> +
+> +	pstripe.dev = bioc->stripes[nr_data].dev;
+> +	ret = btrfs_get_parity_extent(fs_info, full + off_in_stripe, &plen,
+> +				      bioc->map_type, &pstripe);
+> +	if (ret)
+> +		goto out;
+> +
+> +	ret = btrfs_rst_read_stripe(pstripe.dev, pstripe.physical, folios[idx],
+> +				    len);
+> +	if (ret)
+> +		goto out;
+> +
+> +	bufs[idx] = folio_address(folios[idx]);
+> +	idx++;
+> +
+> +	xor_gen(bufs[idx - 1], bufs, idx - 1, len);
+
+[Severity: High]
+If the iteration over data stripes ignores -ENODATA and continues without
+incrementing idx, what happens when all other data stripes are missing?
+
+If idx equals 1 after the parity stripe is read, this calls xor_gen() with a
+source count of 0. Does this result in undefined behavior or out-of-bounds
+reads in the optimized crypto routines?
+
+> +
+> +	off = 0;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=9
+

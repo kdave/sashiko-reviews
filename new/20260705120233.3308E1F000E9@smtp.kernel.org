@@ -1,0 +1,107 @@
+From sashiko-bot@kernel.org Sun Jul  5 14:02:35 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 4/4] btrfs: use kvmalloc() for stripe buffer of
+ scrub_stripe
+Date: Sun, 05 Jul 2026 12:02:32 +0000
+Message-Id: <20260705120233.3308E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Unaligned kvmalloc memory causes incorrect DMA offsets, bio truncation, and data corruption on architectures with large page sizes.
+--
+
+commit 2797aea76c2d6da0e9b923bfdc2f1f06c2347998
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: use kvmalloc() for stripe buffer of scrub_stripe
+
+This commit converts scrub_stripe to use a 64K kvmalloc() buffer instead of
+an array of folios. This simplifies cross-page handling for checksum
+verification, RAID56 caching, and bio assembly.
+
+> diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+> index 2224bca96a46f..53779fdd1dfe9 100644
+> --- a/fs/btrfs/scrub.c
+> +++ b/fs/btrfs/scrub.c
+> @@ -348,9 +346,6 @@ static int init_scrub_stripe(struct btrfs_fs_info *fs_info,
+>  			     struct scrub_stripe *stripe)
+>  {
+[ ... ]
+> -	ret = btrfs_alloc_folio_array(BTRFS_STRIPE_LEN >> min_folio_shift,
+> -				      fs_info->block_min_order, stripe->folios,
+> -				      GFP_NOFS);
+> -	if (ret < 0)
+> +	stripe->buffer = kvmalloc(BTRFS_STRIPE_LEN, GFP_NOFS);
+> +	if (!stripe->buffer)
+>  		goto error;
+>  
+> +	/*
+> +	 * The allocated buffer should be page aligned as BTRFS_STRIPE_LEN
+> +	 * is power of 2 and at least one page.
+> +	 */
+> +	ASSERT(IS_ALIGNED((unsigned long)stripe->buffer, PAGE_SIZE));
+
+[Severity: Critical]
+Is it safe to assume kvmalloc() returns page-aligned memory here? On
+architectures where PAGE_SIZE is 64K (like ARM64 or PPC64), BTRFS_STRIPE_LEN
+is exactly one page, so kvmalloc() uses the kmalloc-64k SLUB cache. If SLUB
+debugging or KASAN is enabled, objects in this cache are not page-aligned
+due to inserted redzones or metadata, which would cause this ASSERT to
+trigger a kernel panic.
+
+[ ... ]
+> @@ -927,30 +904,36 @@ static void scrub_bio_add_sector(struct btrfs_bio *bbio, struct scrub_stripe *st
+>  				 int sector_nr)
+>  {
+>  	struct btrfs_fs_info *fs_info = bbio->inode->root->fs_info;
+> -	void *kaddr = scrub_stripe_get_kaddr(stripe, sector_nr);
+> +	const u32 offset = sector_nr << fs_info->sectorsize_bits;
+>  	int ret;
+>  
+> -	ret = bio_add_page(&bbio->bio, virt_to_page(kaddr), fs_info->sectorsize,
+> -			   offset_in_page(kaddr));
+[ ... ]
+> +	if (is_vmalloc_addr(stripe->buffer)) {
+> +		ret = bio_add_vmalloc(&bbio->bio, stripe->buffer + offset,
+> +				      fs_info->sectorsize);
+> +		ASSERT(ret == true);
+> +		return;
+> +	}
+> +	ret = bio_add_page(&bbio->bio, virt_to_page(stripe->buffer + offset),
+> +			   fs_info->sectorsize, offset_in_page(offset));
+
+[Severity: Critical]
+Does offset_in_page(offset) compute the correct DMA offset here? If the
+kmalloc buffer is not page-aligned (as mentioned above), passing only the
+internal stripe offset ignores the buffer's initial misalignment within the
+page. Would this cause the block layer to receive an incorrect physical
+address and write data to the wrong memory location? Should this use
+offset_in_page(stripe->buffer + offset) instead?
+
+[ ... ]
+>  static struct btrfs_bio *alloc_scrub_bbio(struct btrfs_fs_info *fs_info,
+> -					  unsigned int nr_vecs, blk_opf_t opf,
+> +					  blk_opf_t opf,
+>  					  u64 logical,
+>  					  btrfs_bio_end_io_t end_io, void *private)
+>  {
+>  	struct btrfs_bio *bbio;
+>  
+> -	bbio = btrfs_bio_alloc(nr_vecs, opf, BTRFS_I(fs_info->btree_inode),
+> +	/*
+> +	 * Stripe->buffer is allocated by kvmalloc(), which can be pages
+> +	 * at different physical addresses, we have to ensure the bbio
+> +	 * is large enough to contain the full stripe.
+> +	 */
+> +	bbio = btrfs_bio_alloc(BTRFS_STRIPE_LEN >> PAGE_SHIFT, opf,
+>  			       BTRFS_I(fs_info->btree_inode),
+
+[Severity: Critical]
+Could this allocate too few bio vectors? On architectures with a 64K page
+size, BTRFS_STRIPE_LEN >> PAGE_SHIFT evaluates to 1. If the kvmalloc buffer
+is unaligned and crosses a physical page boundary, a 64K buffer will span
+across 2 physical pages. Does this limit cause bio_add_page() to fail when
+adding the crossing sector, leading to bio truncation?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783251701.git.wqu@suse.com?part=4
+

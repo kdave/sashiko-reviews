@@ -1,0 +1,77 @@
+From sashiko-bot@kernel.org Mon Jun 15 15:39:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 6/6] btrfs: deny freezing devices undergoing a
+ replace
+Date: Mon, 15 Jun 2026 13:39:16 +0000
+Message-Id: <20260615133916.9BECA1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Device replace becomes permanently wedged and leaks the target device on early finishing failures.
+--
+
+commit b555c5dd9df622b38cd4cade7723383f6e59e573
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: deny freezing devices undergoing a replace
+
+This patch denies freezing of block devices while they are undergoing a
+device replace operation. It tracks the replace state and appropriately
+releases the deny references when the operation finishes, is suspended,
+or encounters an error. This guarantees that devices cannot be frozen
+while teardown or reconfiguration is in progress.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 0112aa6d7ab1c..4d6bd6b4b0394 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+
+[ ... ]
+
+> @@ -1146,8 +1165,9 @@ int btrfs_dev_replace_cancel(struct btrfs_fs_info *fs_info)
+>  			btrfs_dev_name(src_device), src_device->devid,
+>  			btrfs_dev_name(tgt_device));
+>  
+> +		/* A suspended replace never re-denied freezing; do not allow. */
+>  		if (tgt_device)
+> -			btrfs_destroy_dev_replace_tgtdev(tgt_device);
+> +			btrfs_destroy_dev_replace_tgtdev(tgt_device, false);
+>  		break;
+
+[Severity: High]
+This is a pre-existing issue, but I noticed a potential regression in how
+cancellations are handled in the BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED case
+located just above this modified code in btrfs_dev_replace_cancel().
+
+If btrfs_dev_replace_finishing() hits an early error (for example,
+btrfs_start_delalloc_roots() fails), it returns the error but leaves the
+replace state as BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED. The scrub thread
+then exits and releases BTRFS_EXCLOP_DEV_REPLACE.
+
+When a user subsequently calls the btrfs replace cancel ioctl,
+btrfs_dev_replace_cancel() will execute the STARTED case:
+
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+		...
+		ret = btrfs_scrub_cancel(fs_info);
+		if (ret < 0) {
+			result = BTRFS_IOCTL_DEV_REPLACE_RESULT_NOT_STARTED;
+		}
+
+Since the scrub thread already exited, btrfs_scrub_cancel() returns an
+error, causing this path to silently abort and skip cleaning up the
+wedged target device.
+
+Does this leave the device replace state permanently wedged in STARTED
+until the filesystem is unmounted?
+
+With the new changes introduced in this patch, the deny_freeze references
+would remain held while in this wedged STARTED state, which might prevent
+the filesystem from being frozen. Since BTRFS_EXCLOP_DEV_REPLACE is
+released, could users also erroneously start a concurrent balance
+operation, leading to potential chunk corruption?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260615-work-super-freeze_deny_upstream-v1-0-a6c72b840e7d@kernel.org?part=6
+

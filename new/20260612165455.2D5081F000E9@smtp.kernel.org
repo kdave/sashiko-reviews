@@ -1,0 +1,84 @@
+From sashiko-bot@kernel.org Fri Jun 12 18:55:01 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: release extent lock per folio in readahead
+Date: Fri, 12 Jun 2026 16:54:54 +0000
+Message-Id: <20260612165455.2D5081F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs_readahead() unconditionally unlocks extent ranges that were never locked when the readahead window is expanded dynamically.
+--
+
+commit 7d7eb36d246bf68b0685bd1ea3f51e59199f8e72
+Author: Boris Burkov <boris@bur.io>
+Subject: btrfs: release extent lock per folio in readahead
+
+This commit alters the extent locking behavior in the btrfs readahead path.
+Instead of unlocking the entire readahead range in one shot at the end, it
+unlocks the extent per folio inside the readahead loop to prevent stale
+page cache issues on overlapping reads when readahead fails.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 2275189b78605..594bd91106d62 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+[ ... ]
+> @@ -2704,12 +2704,21 @@ void btrfs_readahead(struct readahead_control *rac)
+>  	struct fsverity_info *vi = NULL;
+>  
+>  	lock_extents_for_read(inode, start, end, &cached_state);
+> +	/* We don't use cached state for a bulk unlock, just free it. */
+> +	btrfs_free_extent_state(cached_state);
+>  	if (start < i_size_read(vfs_inode))
+>  		vi = fsverity_get_info(vfs_inode);
+> -	while ((folio = readahead_folio(rac)) != NULL)
+> -		btrfs_do_readpage(folio, &em_cached, &bio_ctrl, vi);
+> +	while ((folio = readahead_folio(rac)) != NULL) {
+> +		/*
+> +		 * Read start and end before btrfs_do_readpage(). It unlocks the
+> +		 * folio, so our reference might not be valid after.
+> +		 */
+> +		const u64 folio_start = folio_pos(folio);
+> +		const u64 folio_end = folio_start + folio_size(folio) - 1;
+>  
+> -	btrfs_unlock_extent(&inode->io_tree, start, end, &cached_state);
+> +		btrfs_do_readpage(folio, &em_cached, &bio_ctrl, vi);
+> +		btrfs_unlock_extent(&inode->io_tree, folio_start, folio_end, NULL);
+
+[Severity: High]
+Does this unconditionally unlock extent ranges that were never initially
+locked if the readahead window is dynamically expanded?
+
+btrfs_readahead() calculates start and end based on the initial
+readahead_length() and locks exactly this range before the loop via
+lock_extents_for_read().
+
+However, inside the loop, btrfs_do_readpage() can dynamically expand the
+readahead window when encountering compressed extents:
+
+btrfs_do_readpage() {
+    ...
+    if (bio_ctrl->ractl &&
+        !btrfs_is_subpage(fs_info, folio) &&
+        compress_type != BTRFS_COMPRESS_NONE)
+        btrfs_readahead_expand(bio_ctrl->ractl, em);
+    ...
+}
+
+This expands the rac outwards, adding new folios to the readahead control.
+When the while loop yields these newly added folios, they fall outside the
+originally locked range, meaning their extents were never locked by this
+thread.
+
+If another concurrent thread (like a DIO write or truncate) holds the
+extent lock for that expanded range, could calling btrfs_unlock_extent()
+on these expanded folios silently drop their lock and break mutual
+exclusion?
+
+> +	}
+>  
+>  	if (em_cached)
+>  		btrfs_free_extent_map(em_cached);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/1c59582ab8eba7fabda0422856514019be95dfac.1781282522.git.boris@bur.io?part=1
+

@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Thu Jun 11 15:43:54 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: protect sb_write_pointer() reads with
+ invalidate lock
+Date: Thu, 11 Jun 2026 13:43:48 +0000
+Message-Id: <20260611134349.2E4601F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The superblock read path in `sb_write_pointer()` and `btrfs_read_disk_super()` fails to apply `offset_in_page()`, leading to invalid superblock reads when `PAGE_SIZE` is greater than 4KB.
+--
+
+commit 342238827ff19b67fe82431452fa9cf0ad9d63d0
+Author: Runyu Xiao <runyu.xiao@seu.edu.cn>
+
+btrfs: zoned: protect sb_write_pointer() reads with invalidate lock
+
+This commit adds filemap_invalidate_lock() and unlock() around the
+read_cache_page_gfp() calls in sb_write_pointer(). This ensures that the
+zoned superblock discovery reads share the same synchronization domain as
+the final read in btrfs_read_disk_super(), avoiding races with concurrent
+mapping updates.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 16dd87aa06f20..5f75cf0e14b95 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -131,8 +131,10 @@ static int sb_write_pointer(struct block_device *bdev, struct blk_zone *zones,
+>  			u64 bytenr = ALIGN_DOWN(zone_end, BTRFS_SUPER_INFO_SIZE) -
+>  						BTRFS_SUPER_INFO_SIZE;
+>  
+> +			filemap_invalidate_lock(mapping);
+>  			page[i] = read_cache_page_gfp(mapping,
+>  					bytenr >> PAGE_SHIFT, GFP_NOFS);
+> +			filemap_invalidate_unlock(mapping);
+>  			if (IS_ERR(page[i])) {
+>  				if (i == 1)
+>  					btrfs_release_disk_super(super[0]);
+>  				return PTR_ERR(page[i]);
+>  			}
+>  			super[i] = page_address(page[i]);
+
+[Severity: High]
+This is a pre-existing issue, but does this assignment miss the page offset
+for architectures where the page size is greater than 4KB?
+
+In Btrfs zoned mode, the superblock log is located at
+zone_end - BTRFS_SUPER_INFO_SIZE (which is 4096 bytes). On architectures
+with a page size larger than 4KB, such as 64KB on ARM64 or PPC64, bytenr
+will not be page-aligned.
+
+Since read_cache_page_gfp() retrieves the entire page, page_address() points
+to the beginning of the page. Without adding offset_in_page(bytenr), does
+this read arbitrary memory instead of the valid 4KB superblock?
+
+The same missing offset_in_page() logic appears to be present in
+btrfs_read_disk_super() when it maps the read page cache:
+
+fs/btrfs/volumes.c:btrfs_read_disk_super() {
+    ...
+    page = read_mapping_page(mapping, bytenr >> PAGE_SHIFT, NULL);
+    ...
+    super = page_address(page);
+    ...
+}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260611132450.971236-1-runyu.xiao@seu.edu.cn?part=1
+

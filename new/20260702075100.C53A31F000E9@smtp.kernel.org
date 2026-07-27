@@ -1,0 +1,47 @@
+From sashiko-bot@kernel.org Thu Jul  2 09:51:03 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/3] btrfs: replace btrfs_repair_io_failure() to use bio
+ for page iteration
+Date: Thu, 02 Jul 2026 07:51:00 +0000
+Message-Id: <20260702075100.C53A31F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Missing initialization of `bi_sector` in the dummy `bbio` causes metadata read repair to calculate a logical address of 0, resulting in silent repair failure or filesystem corruption.
+--
+
+commit d6bba1f891e3bd7de049079589573f507482cdc9
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: replace btrfs_repair_io_failure() to use bio for page iteration
+
+This commit refactors btrfs_repair_io_failure to use a bio and bvec_iter
+for page iteration instead of a physical address array. It also updates the
+caller in the metadata read repair path to allocate a dummy bbio.
+
+(Note: The format of this review has been altered to provide a free-form
+summary of the findings rather than inline diff quotes due to recitation
+restrictions.)
+
+[Severity: Critical]
+In fs/btrfs/disk-io.c:btrfs_repair_eb_io_failure(), when the dummy bbio is
+allocated, is bi_iter.bi_sector properly initialized?
+
+It looks like btrfs_bio_alloc() relies on bio_alloc_bioset(), which
+zero-initializes the bio. Because there is no explicit assignment to set
+bi_sector to the sector corresponding to the extent buffer start, the saved
+iterator stores a sector of 0 when saving bbio->bio.bi_iter.
+
+Consequently, when this iterator is passed to btrfs_repair_bbio_failure()
+in fs/btrfs/bio.c, the logical address is computed from iter.bi_sector
+shifted by SECTOR_SHIFT.
+
+Could this cause the target logical address to be calculated as 0 instead
+of the extent buffer's actual logical address?
+
+If btrfs_map_repair_block() performs a lookup at logical address 0, might
+this result in silent repair failures, or worse, writing the repaired
+metadata blocks to logical address 0 and causing severe filesystem
+corruption?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1782977445.git.wqu@suse.com?part=1
+

@@ -1,0 +1,99 @@
+From sashiko-bot@kernel.org Tue Jul 14 18:31:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] fstests: btrfs/348: test ambiguous generation
+ handling on raid1 profile
+Date: Tue, 14 Jul 2026 16:31:03 +0000
+Message-Id: <20260714163103.DC55C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] Misdirected patch adding fstests script to the Linux kernel repository.
+- [High] Flaky test logic: Ambiguous generation reproduction is non-deterministic due to PID-based mount-time metadata read policy.
+- [Medium] Incomplete device failure simulation leaves unblocked secondary superblocks and a corrupted device state.
+--
+
+--- Patch [1]: [PATCH 1/2] fstests: btrfs/348: test ambiguous generation handling on raid1 profile ---
+commit 8b31545890de10829b9a4f4a66c46b2fb0feef8e
+Author: Zhang Boyang <zhangboyang.id@gmail.com>
+
+fstests: btrfs/348: test ambiguous generation handling on raid1 profile
+    
+This commit adds a new test to simulate ambiguous generation handling on a
+RAID1 profile. It uses dm-dust and dm-error to simulate successive device
+failures during superblock writes to test filesystem recovery.
+
+> diff --git a/tests/btrfs/348 b/tests/btrfs/348
+> new file mode 100755
+> index 0000000000000..3fcaf744e54f5
+> --- /dev/null
+> +++ b/tests/btrfs/348
+> @@ -0,0 +1,79 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 Zhang Boyang.  All Rights Reserved.
+> +#
+> +# FS QA Test 348
+> +#
+> +# Test btrfs ambiguous generation handling on raid1 profile.
+> +# This can be caused by, for example, two successive power failures.
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick read_repair raid
+> +
+> +. ./common/filter
+> +. ./common/fail_make_request
+> +. ./common/dmdust
+
+[Severity: High]
+Was this patch mistakenly sent to the Linux kernel repository instead of the
+fstests (xfstests) repository?
+
+These test framework dependencies like common/preamble,
+common/fail_make_request, and functions like _btrfs_buffered_read_on_mirror
+do not exist in the Linux kernel source tree, so applying this patch here
+creates unrunnable test files.
+
+[ ... ]
+
+> +echo "Step 2: simulate failure #1"
+> +_init_dust
+> +_mount_dust -o notreelog
+> +# simulate dev1 disappears just before writing superblock
+> +for ((i = 0; i < 4096 / 512; i++)); do
+> +    $DMSETUP_PROG message $DUST_NAME 0 addbadblock $((0x10000 / 512 + $i)) 255
+> +done
+
+[Severity: Medium]
+Does this loop leave the secondary superblock unblocked, allowing it to be
+written with the new generation?
+
+Because only the 64 KiB primary superblock range is blocked by dm-dust,
+btrfs_commit_super() can successfully write the new generation to dev1's 64 MiB
+superblock. User-space tools scanning the device will then see the newer
+generation at 64 MiB, leaving the device in a state with mismatched
+superblocks. Should all superblock copies be blocked here?
+
+[ ... ]
+
+> +echo "Step 4: simulate recovery"
+> +_scratch_mount -o notreelog
+> +# this read should trigger resync
+> +_btrfs_buffered_read_on_mirror 0 2 "$testfile" 0 2K
+
+[Severity: High]
+Can this mount and read sequence cause the test to become flaky based on the
+PID of the mount command?
+
+When _scratch_mount is executed, Btrfs reads and caches the root tree block
+using the default RAID1 metadata read policy (current->pid % num_stripes). If
+the mount command has an even PID, it caches dev1's root block (expecting the
+0xaa child leaf checksum). If it has an odd PID, it caches dev2's root block
+(expecting the 0xbb child leaf checksum).
+
+Later, _btrfs_buffered_read_on_mirror forces the child leaf to be read from
+dev2. If dev1's root block was cached during mount, the 0xbb leaf will fail
+the parent's expected checksum check, triggering a read-repair that returns
+0xaa and causes the test to fail.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260714161044.7330-1-zhangboyang.id@gmail.com?part=1
+

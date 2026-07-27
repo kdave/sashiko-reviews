@@ -1,0 +1,137 @@
+From sashiko-bot@kernel.org Mon Jun 29 04:29:43 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: use kvmalloc() for stripe buffer of scrub_stripe
+Date: Mon, 29 Jun 2026 02:29:40 +0000
+Message-Id: <20260629022941.28B2C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [High] Incorrect page offset calculation for non-page-aligned kmalloc buffers causes SLUB metadata corruption and out-of-bounds array accesses.
+- [High] Missing stripe->buffer = NULL in release_scrub_stripe causes double free on error paths.
+
+Pre-existing issues:
+- [High] Concurrent updates to stripe->bitmaps in scrub_repair_read_endio lead to lost bitmap updates due to non-atomic read-modify-write operations.
+--
+
+commit e0088fc8048eaafa02e4e450b1e33af9bb15278c
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: use kvmalloc() for stripe buffer of scrub_stripe
+
+This patch replaces the scrub_stripe::folios array with a kvmalloc() buffer
+to store all contents of a stripe. This simplifies cross-page handling, bio
+assembly, and checksum verification by avoiding per-page iterations.
+
+> diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+> index d2f7ac5b6e961..440137d6d49ac 100644
+> --- a/fs/btrfs/scrub.c
+> +++ b/fs/btrfs/scrub.c
+> @@ -338,11 +336,7 @@ static void release_scrub_stripe(struct scrub_stripe *stripe)
+>  	if (!stripe)
+>  		return;
+>  
+> -	for (int i = 0; i < SCRUB_STRIPE_MAX_FOLIOS; i++) {
+> -		if (stripe->folios[i])
+> -			folio_put(stripe->folios[i]);
+> -		stripe->folios[i] = NULL;
+> -	}
+> +	kvfree(stripe->buffer);
+
+[Severity: High]
+Could this result in a double free on initialization failure paths?
+
+If a subsequent allocation inside init_scrub_stripe() fails, such as
+stripe->sectors = kzalloc_objs(...), it jumps to the error label and calls
+release_scrub_stripe(), freeing the buffer.
+
+The error then propagates up to scrub_setup_ctx(), which responds by calling
+scrub_free_ctx(). This iterates over all stripes and calls
+release_scrub_stripe() again. Since stripe->buffer is not set to NULL after
+kvfree(), this might trigger a double free on the same pointer.
+
+[ ... ]
+
+> @@ -897,6 +864,10 @@ static void scrub_repair_read_endio(struct btrfs_bio *bbio)
+>  
+>  	ASSERT(sector_nr < stripe->nr_sectors);
+>  
+> +	if (is_vmalloc_addr(stripe->buffer))
+> +		invalidate_kernel_vmap_range(
+> +			stripe->buffer + (sector_nr << fs_info->sectorsize_bits),
+> +			bio_size);
+>  	if (bbio->bio.bi_status) {
+>  		scrub_bitmap_set_io_error(stripe, sector_nr,
+>  					  bio_size >> fs_info->sectorsize_bits);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but is it possible for concurrent
+updates to stripe->bitmaps to be lost here?
+
+When the read repair worker submits multiple repair bios for different sectors
+in a stripe, these bios can complete concurrently on different CPUs. The
+completion handler scrub_repair_read_endio() invokes
+scrub_bitmap_set_io_error() or scrub_bitmap_clear_io_error().
+
+These helpers appear to rely on non-atomic __set_bit() and clear_bit()
+operations (via custom bitmap_set and bitmap_clear macros). Because multiple
+sectors share the same unsigned long word, concurrent handlers could perform
+non-atomic read-modify-write operations on the same word, potentially
+overwriting a set_error with a clear_error.
+
+[ ... ]
+
+> @@ -921,19 +892,19 @@ static void scrub_bio_add_sector(struct btrfs_bio *bbio, struct scrub_stripe *st
+>  				 int sector_nr)
+>  {
+>  	struct btrfs_fs_info *fs_info = bbio->inode->root->fs_info;
+> -	void *kaddr = scrub_stripe_get_kaddr(stripe, sector_nr);
+> +	const u32 offset = sector_nr << fs_info->sectorsize_bits;
+>  	int ret;
+>  
+> -	ret = bio_add_page(&bbio->bio, virt_to_page(kaddr), fs_info->sectorsize,
+> -			   offset_in_page(kaddr));
+[ ... ]
+> +	if (is_vmalloc_addr(stripe->buffer)) {
+> +		ret = bio_add_vmalloc(&bbio->bio, stripe->buffer + offset,
+> +				      fs_info->sectorsize);
+> +		ASSERT(ret == true);
+> +		return;
+> +	}
+> +	ret = bio_add_page(&bbio->bio, virt_to_page(stripe->buffer + offset),
+> +			   fs_info->sectorsize, offset_in_page(offset));
+
+[Severity: High]
+Does this code calculate the correct offset for non-page-aligned kmalloc
+buffers?
+
+If SLUB debugging, redzoning, or KASAN is enabled, large kmalloc buffers
+might not be page-aligned. Calling offset_in_page(offset) instead of
+offset_in_page(stripe->buffer + offset) passes an incorrect page offset
+(such as 0 instead of the SLUB redzone offset) to bio_add_page().
+
+This could cause block device DMA to overwrite the SLUB metadata preceding
+the buffer, leading to memory corruption.
+
+Additionally, upon bio completion, calc_sector_number() calculates the
+virtual address using the correct offset:
+
+fs/btrfs/scrub.c:calc_sector_number() {
+    ...
+    kaddr = page_address(virt_to_page(vaddr));
+    kaddr += offset_in_page(vaddr);
+    
+    if (kaddr == bvec_virt(first_bvec))
+        break;
+    ...
+}
+
+Since the bvec contains the incorrect offset from scrub_bio_add_sector(),
+this loop might fail to find a match and return stripe->nr_sectors.
+
+This would then cause scrub_read_endio() and scrub_repair_read_endio() to
+use an out-of-bounds index when updating the stripe->bitmaps array.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/81ffb27a9253b68241c362110ff8644c513b44c5.1782699520.git.wqu@suse.com?part=1
+

@@ -1,0 +1,105 @@
+From sashiko-bot@kernel.org Thu Jul 23 07:53:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC] btrfs: disable direct IOs to avoid dirty folios
+ without fs knowing
+Date: Thu, 23 Jul 2026 05:53:39 +0000
+Message-Id: <20260723055340.01F851F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [High] Returning `-EOPNOTSUPP` from VFS read_iter and write_iter callbacks for `O_DIRECT` files breaks userspace applications instead of correctly reporting unsupported features at `open()` time.
+- [High] The new `IOCB_DIRECT` rejection breaks `BTRFS_IOC_ENCODED_WRITE` when the file descriptor has `O_DIRECT` set.
+
+Pre-existing issues:
+- [Critical] Disabling BTRFS Direct I/O does not fix the root cause of the silent folio dirtying and leaves the filesystem vulnerable to the exact same bug via cross-filesystem GUP vectors.
+--
+
+--- Patch [1]: [PATCH RFC] btrfs: disable direct IOs to avoid dirty folios without fs knowing ---
+commit 646376950365a54a227f2559c5c5da8d04e3c92e
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: disable direct IOs to avoid dirty folios without fs knowing
+
+This patch disables direct I/O for non-experimental builds by returning
+-EOPNOTSUPP in the VFS read and write iterators. It aims to prevent an
+issue where direct reads into memory mapped from page cache result in
+dirty folios without the filesystem knowing, corrupting ordered extent
+accounting.
+
+Link: https://lore.kernel.org/linux-btrfs/f12f70e5-d84d-4a9f-ac94-693be4c863ac@linux.ibm.com/
+
+> diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+> index a2a2df2df7866..ae5264bf8d7d5 100644
+> --- a/fs/btrfs/file.c
+> +++ b/fs/btrfs/file.c
+> @@ -1442,6 +1442,11 @@ ssize_t btrfs_do_write_iter(struct kiocb *iocb, struct iov_iter *from,
+>  	if (encoded && (iocb->ki_flags & IOCB_NOWAIT))
+>  		return -EOPNOTSUPP;
+>  
+> +#ifndef CONFIG_BTRFS_EXPERIMENTAL
+> +	if (iocb->ki_flags & IOCB_DIRECT)
+> +		return -EOPNOTSUPP;
+> +#endif
+> +
+
+[Severity: High]
+Does returning -EOPNOTSUPP during write iteration break applications that
+probe for O_DIRECT support?
+
+In btrfs_file_open(), FMODE_CAN_ODIRECT is still set unconditionally:
+
+fs/btrfs/file.c:btrfs_file_open() {
+        ...
+        filp->f_mode |= FMODE_NOWAIT | FMODE_CAN_ODIRECT;
+        ...
+}
+
+Because of this, an application calling open() with O_DIRECT will succeed,
+but will subsequently error out on read or write. VFS does not fall back
+to buffered I/O when iterators return -EOPNOTSUPP. Can we report unsupported
+features during open() instead?
+
+[Severity: High]
+Does this blanket rejection of IOCB_DIRECT break BTRFS_IOC_ENCODED_WRITE
+when the file descriptor is opened with O_DIRECT?
+
+If a user calls BTRFS_IOC_ENCODED_WRITE on a file descriptor opened with
+O_DIRECT, init_sync_kiocb() initializes the kiocb with the IOCB_DIRECT flag.
+Since this new check precedes the encoded check below, won't it prematurely
+reject valid encoded writes?
+
+>  	if (encoded) {
+>  		num_written = btrfs_encoded_write(iocb, from, encoded);
+>  		num_sync = encoded->len;
+
+[ ... ]
+
+> @@ -3820,6 +3825,11 @@ static ssize_t btrfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+>  	if (btrfs_is_shutdown(inode_to_fs_info(file_inode(iocb->ki_filp))))
+>  		return -EIO;
+>  
+> +#ifndef CONFIG_BTRFS_EXPERIMENTAL
+> +	if (iocb->ki_flags & IOCB_DIRECT)
+> +		return -EOPNOTSUPP;
+> +#endif
+> +
+
+[Severity: Critical]
+This isn't a bug introduced by this patch, but does disabling btrfs direct
+I/O actually prevent the underlying problem with dirty folios?
+
+A user can still mmap a btrfs file, then use that memory mapping as the
+buffer for an O_DIRECT read from a different filesystem (like ext4) or a
+raw block device. The other filesystem will call get_user_pages(), which
+pins the btrfs folios and initiates DMA, bypassing this mitigation entirely.
+
+Can we prevent cross-filesystem get_user_pages() vectors using this
+approach?
+
+>  	if (iocb->ki_flags & IOCB_DIRECT) {
+>  		ret = btrfs_direct_read(iocb, to);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/3c7926222aa6e35b7d6efd381550fe93241fd18e.1784785202.git.wqu@suse.com?part=1
+

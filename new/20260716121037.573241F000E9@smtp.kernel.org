@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Thu Jul 16 14:10:39 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/5] btrfs: zoned: drop stale dirty btree buffers at
+ close_ctree()
+Date: Thu, 16 Jul 2026 12:10:36 +0000
+Message-Id: <20260716121037.573241F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] The patch unconditionally clears the dirty flag for all dirty extent buffers on a zoned filesystem during unmount, rather than strictly targeting the stale EXTENT_BUFFER_ZONED_ZEROOUT buffers. This masks bugs and risks silently discarding valid metadata if a metadata leak occurs.
+--
+
+--- Patch [2]: [PATCH 2/5] btrfs: zoned: drop stale dirty btree buffers at close_ctree() ---
+commit e976c37d9d4c064c1150029a6c91a7a5179c7461
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Subject: btrfs: zoned: drop stale dirty btree buffers at close_ctree()
+
+This patch drops the dirty state of stale, freed-but-dirty btree buffers at
+close_ctree() on zoned filesystems. It prevents unmount hangs that occur
+when these buffers are queued for writeback after the block groups and
+workqueues have been destroyed.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 274e2f0826b68..8e0e8cf458be6 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -3327,6 +3327,10 @@ static void invalidate_and_check_btree_folios(struct btrfs_fs_info *fs_info)
+>  		if (test_bit(EXTENT_BUFFER_READING, &eb->bflags))
+>  			wait_on_bit_io(&eb->bflags, EXTENT_BUFFER_READING,
+>  				       TASK_UNINTERRUPTIBLE);
+> +
+> +		if (btrfs_is_zoned(fs_info) &&
+> +		    test_bit(EXTENT_BUFFER_DIRTY, &eb->bflags))
+> +			btrfs_clear_stale_buffer_dirty(eb);
+
+[Severity: Medium]
+Does this broad check risk masking legitimately leaked dirty metadata buffers?
+
+By checking only EXTENT_BUFFER_DIRTY, this intercepts any dirty metadata and
+silently drops its state. If a filesystem bug causes an unwritten dirty
+metadata buffer (without EXTENT_BUFFER_ZONED_ZEROOUT set) to survive until
+unmount, this will clear its dirty bit and bypass the extent_buffer_under_io()
+check later in invalidate_and_check_btree_folios(), suppressing the
+WARN_ON_ONCE intended for detecting leaked metadata.
+
+Should this condition explicitly verify if EXTENT_BUFFER_ZONED_ZEROOUT is
+set so it only targets the intended deferred zero-out buffers?
+
+>  		/*
+>  		 * The refs threshold is 2, one held by us at the beginning
+>  		 * of the loop, one for the ownership in the buffer tree.
+
+[ ... ]
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 8e2937428ef3e..21e1023ccb7f9 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+> @@ -3799,6 +3799,18 @@ void btrfs_clear_buffer_dirty(struct btrfs_trans_handle *trans,
+>  	__btrfs_clear_buffer_dirty(eb);
+>  }
+>  
+> +/*
+> + * Drop the dirty state of a stale, already-freed metadata buffer, bypassing
+> + * the zoned EXTENT_BUFFER_ZONED_ZEROOUT deferral of btrfs_clear_buffer_dirty().
+> + */
+> +void btrfs_clear_stale_buffer_dirty(struct extent_buffer *eb)
+> +{
+> +	btrfs_tree_lock(eb);
+> +	clear_bit(EXTENT_BUFFER_ZONED_ZEROOUT, &eb->bflags);
+> +	__btrfs_clear_buffer_dirty(eb);
+> +	btrfs_tree_unlock(eb);
+> +}
+
+[Severity: Medium]
+Since this function unconditionally clears both ZONED_ZEROOUT and DIRTY flags,
+would it make sense to add an assertion or check here to ensure it is only
+called on buffers that actually had EXTENT_BUFFER_ZONED_ZEROOUT set to begin
+with?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260716115656.1319295-1-johannes.thumshirn@wdc.com?part=2
+

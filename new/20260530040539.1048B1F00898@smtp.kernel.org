@@ -1,0 +1,77 @@
+From sashiko-bot@kernel.org Sat May 30 06:05:43 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/3] btrfs: fix incorrect buffered IO fallback for
+ append direct writes
+Date: Sat, 30 May 2026 04:05:38 +0000
+Message-Id: <20260530040539.1048B1F00898@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Race condition during buffered write fallback with O_APPEND causes data to remain unsynced and corrupts the file offset.
+--
+
+commit b7167b0e97a04e2d7696ebab49593360645aaa03
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: fix incorrect buffered IO fallback for append direct writes
+
+This commit fixes an issue where a short direct write with the IOCB_APPEND
+flag incorrectly positions the fallback buffered write. It introduces fields
+to track and restore the old inode size when direct IO finishes short.
+
+Link: https://lore.kernel.org/linux-btrfs/20260528111659.87113-1-wqu@suse.com/
+
+> diff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c
+> index 88cb2e82a5076..fd53fac7186e2 100644
+> --- a/fs/btrfs/direct-io.c
+> +++ b/fs/btrfs/direct-io.c
+
+[ ... ]
+
+> @@ -637,6 +650,16 @@ static int btrfs_dio_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+>  			btrfs_mark_ordered_extent_truncated(dio_data->ordered, 0);
+>  			btrfs_finish_ordered_extent(dio_data->ordered,
+>  						    pos, length, true);
+> +			if (dio_data->updated_isize) {
+> +				u64 new_isize;
+> +
+> +				if (submitted == 0)
+> +					new_isize = dio_data->old_isize;
+> +				else
+> +					new_isize = max(pos, dio_data->old_isize);
+> +				i_size_write(inode, new_isize);
+> +				dio_data->updated_isize = false;
+> +			}
+>  		} else {
+
+[Severity: High]
+This isn't a bug introduced by this patch, but while reviewing the buffered
+IO fallback for append direct writes, could there be a pre-existing race
+condition in btrfs_direct_write() during the fallback?
+
+In btrfs_direct_write(), the inode lock is dropped before the fallback
+path. During this unlocked window, if a concurrent thread appends to the
+file, the i_size increases. The fallback code saves the stale position
+before calling btrfs_buffered_write():
+
+    pos = iocb->ki_pos;
+    written_buffered = btrfs_buffered_write(iocb, from);
+
+Inside btrfs_buffered_write(), the lock is reacquired and
+generic_write_checks() updates iocb->ki_pos to the new i_size due to the
+IOCB_APPEND flag. Data is then correctly written at the new EOF.
+
+However, when btrfs_buffered_write() returns, btrfs_direct_write() appears
+to use the stale pos to calculate the sync range and flushes the wrong
+range, potentially leaving the newly appended data unsynced:
+
+    endbyte = pos + written_buffered - 1;
+    ret = btrfs_fdatawrite_range(BTRFS_I(inode), pos, endbyte);
+
+Does it then also overwrite the correct file position with the stale value?
+
+    iocb->ki_pos = pos + written_buffered;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1780112003.git.wqu@suse.com?part=2
+

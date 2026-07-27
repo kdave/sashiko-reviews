@@ -1,0 +1,110 @@
+From sashiko-bot@kernel.org Tue Jul 21 22:34:05 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 15/23] xfs: use read ioend for fsverity data
+ verification
+Date: Tue, 21 Jul 2026 20:34:03 +0000
+Message-Id: <20260721203403.BAAAB1F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] Workqueue multiplexing and work_struct collision deadlocks when reading fsverity files.
+- [High] Logic error in xfs_read_ioend_compare breaks ioend merging and causes list self-deadlocks.
+--
+
+--- Patch [15]: [PATCH v13 15/23] xfs: use read ioend for fsverity data verification ---
+commit d3e990939059215315375f44b961a078aed2079b
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+Subject: xfs: use read ioend for fsverity data verification
+
+This commit modifies XFS to use read ioends for fsverity verification,
+attempting to separate metadata I/O into a different workqueue to prevent
+deadlocks. It passes fsverity_info to the ioend and adds helpers to
+distinguish file data from metadata.
+
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index c7843a8776b0a..135be711f9a40 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+> @@ -208,6 +209,23 @@ xfs_read_ioend_compare(
+>  	return 0;
+>  }
+
+[Severity: High]
+Can the strict inequalities in xfs_read_ioend_compare() miss metadata at
+exact alignment boundaries?
+
+If the file size is a multiple of XFS_FSVERITY_START_ALIGN, the metadata
+offset exactly equals i_size. The strict inequality ia->io_offset > i_size
+would fail for the metadata ioend, returning 0 and leaving the list unsorted.
+
+If a data ioend is processed before a metadata ioend from the same list,
+the newly added xfs_end_ioend_read() calls fsverity_verify_bio(), which
+synchronously waits for the metadata page to become uptodate. But the
+metadata ioend that would unlock the page is stuck behind the data ioend
+in the same list, deadlocking the worker.
+
+Additionally, since this returns 0 instead of falling back to
+iomap_ioend_compare(), does this break ioend merging by failing to sort data
+ioends by offset?
+
+> +/*
+> + * IO read completion.
+> + */
+> +static void
+> +xfs_end_ioend_read(
+> +	struct iomap_ioend	*ioend)
+> +{
+> +	struct xfs_inode	*ip = XFS_I(ioend->io_inode);
+> +
+> +	if (!ioend->io_bio.bi_status &&
+> +			xfs_fsverity_is_file_data(ip, ioend->io_offset))
+> +		fsverity_verify_bio(ioend->io_vi,
+> +				    &ioend->io_bio);
+> +	iomap_finish_ioends(ioend,
+> +		blk_status_to_errno(ioend->io_bio.bi_status));
+> +}
+
+[ ... ]
+
+> @@ -273,9 +290,14 @@ xfs_end_bio(
+>  	}
+>  
+>  	spin_lock_irqsave(&ip->i_ioend_lock, flags);
+> -	if (list_empty(&ip->i_ioend_list))
+> -		WARN_ON_ONCE(!queue_work(mp->m_unwritten_workqueue,
+> +	if (list_empty(&ip->i_ioend_list)) {
+> +		if (IS_ENABLED(CONFIG_FS_VERITY) && ioend->io_vi &&
+> +		    ioend->io_offset < xfs_fsverity_metadata_offset(ip))
+> +			fsverity_enqueue_verify_work(&ip->i_ioend_work);
+> +		else
+> +			WARN_ON_ONCE(!queue_work(mp->m_unwritten_workqueue,
+>  					 &ip->i_ioend_work));
+> +	}
+>  	list_add_tail(&ioend->io_list, &ip->i_ioend_list);
+>  	spin_unlock_irqrestore(&ip->i_ioend_lock, flags);
+>  }
+
+[Severity: Critical]
+Does this queueing logic introduce a work_struct collision or a list
+piggybacking deadlock?
+
+If a data read completes, ip->i_ioend_work is queued to
+fsverity_read_workqueue. The worker starts and blocks in
+fsverity_verify_bio() waiting for a metadata Merkle tree page.
+
+When the metadata bio completes, xfs_end_bio() will attempt to queue the
+same ip->i_ioend_work to m_unwritten_workqueue. Because the workqueue
+subsystem prevents concurrent execution of the same work_struct, the
+metadata completion is deferred until the current worker finishes. This
+would permanently block the current worker waiting for that metadata
+completion to unlock the page.
+
+Furthermore, the destination workqueue is only chosen on the 0-to-1 list
+transition. If a metadata read completes first, it queues to
+m_unwritten_workqueue. A concurrent data read will append to the same list.
+The data read is then processed on m_unwritten_workqueue, issuing further
+synchronous metadata I/O from a workqueue that the commit message explicitly
+warns will cause a deadlock.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=15
+

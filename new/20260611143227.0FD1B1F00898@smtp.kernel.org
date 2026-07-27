@@ -1,0 +1,117 @@
+From sashiko-bot@kernel.org Thu Jun 11 16:32:31 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: fix use-after-free on reloc root after error
+ in insert_dirty_subvol()
+Date: Thu, 11 Jun 2026 14:32:26 +0000
+Message-Id: <20260611143227.0FD1B1F00898@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Missing `btrfs_put_root(reloc_root)` in the `merge_reloc_roots()` error path causes a memory leak of the `reloc_root` structure.
+
+Pre-existing issues:
+- [High] Misplaced `smp_rmb()` in `reloc_root_is_dead()` fails to order loads, leading to potential use-after-free.
+--
+
+commit 48c1c68f4aa6f54dc049ed0646648f96b8661901
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix use-after-free on reloc root after error in insert_dirty_subvol()
+
+If insert_dirty_subvol() fails, the root's reloc_root could be left pointing
+to a freed reloc root. This patch resets root->reloc_root if an error
+occurs while merging a reloc root to prevent a use-after-free or double free.
+
+Link: https://lore.kernel.org/linux-btrfs/6a1ebde9.c1435f33.112120.0176.GAE@google.com/
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 3ebaf5880125f..877debdc2a9da 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+
+[ ... ]
+
+> @@ -1449,6 +1449,17 @@ static int insert_dirty_subvol(struct btrfs_trans_handle *trans,
+>  	return 0;
+>  }
+>  
+> +static void clear_reloc_root(struct btrfs_root *root)
+> +{
+> +	root->reloc_root = NULL;
+> +	/*
+> +	 * Need barrier to ensure clear_bit() only happens after
+> +	 * root->reloc_root = NULL. Pairs with have_reloc_root().
+> +	 */
+> +	smp_wmb();
+> +	clear_bit(BTRFS_ROOT_DEAD_RELOC_TREE, &root->state);
+> +}
+
+[Severity: High]
+This is a pre-existing issue, but looking at the reader side in
+reloc_root_is_dead(), the smp_rmb() is placed before the condition check:
+
+fs/btrfs/relocation.c:reloc_root_is_dead() {
+    ...
+	smp_rmb();
+	if (test_bit(BTRFS_ROOT_DEAD_RELOC_TREE, &root->state))
+		return true;
+    ...
+}
+
+Because the barrier precedes the condition, does it fail to order the
+test_bit() load against the subsequent read of root->reloc_root in
+have_reloc_root()?
+
+Could this allow the CPU to fetch the old root->reloc_root before checking
+the DEAD bit, potentially leading to a use-after-free if clear_reloc_root()
+is running concurrently?
+
+[ ... ]
+
+> @@ -1853,13 +1858,29 @@ void merge_reloc_roots(struct reloc_control *rc)
+>  				goto out;
+>  			}
+>  			ret = merge_reloc_root(rc, root);
+> -			btrfs_put_root(root);
+>  			if (ret) {
+> +				/*
+> +				 * Clear the reloc root since below we will call
+> +				 * free_reloc_roots(), otherwise we leave
+> +				 * root->reloc_root pointing to a freed reloc
+> +				 * root and trigger a use-after-free during
+> +				 * unmount or elsewhere.
+> +				 */
+> +				clear_reloc_root(root);
+> +				btrfs_put_root(root);
+> +				/*
+> +				 * We are adding the reloc_root to reloc_roots
+> +				 * list, so we call btrfs_put_root(reloc_root),
+> +				 * as we transfer our ref from the
+> +				 * rc->reloc_roots into local reloc_roots list.
+> +				 * free_reloc_roots() below will drop the ref.
+> +				 */
+>  				if (list_empty(&reloc_root->root_list))
+
+[Severity: High]
+The comment here documents that we are calling btrfs_put_root(reloc_root),
+but the actual function call seems to be missing from this code block.
+
+Because root->reloc_root was just set to NULL by clear_reloc_root(), the
+standard cleanup path during unmount will not drop this reference either.
+
+Does this missing call introduce a regression by leaking the reloc_root
+structure?
+
+>  					list_add_tail(&reloc_root->root_list,
+>  						      &reloc_roots);
+>  				goto out;
+>  			}
+> +			btrfs_put_root(root);
+>  		} else {
+>  			if (!IS_ERR(root)) {
+>  				if (root->reloc_root == reloc_root) {
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/11578e20664c94bea3b8f4c00f40976814c00da8.1781187150.git.fdmanana@suse.com?part=1
+

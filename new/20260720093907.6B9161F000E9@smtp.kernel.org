@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Mon Jul 20 11:39:11 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v12 08/21] xfs: introduce fsverity on-disk changes
+Date: Mon, 20 Jul 2026 09:39:07 +0000
+Message-Id: <20260720093907.6B9161F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Premature exposure of the VFS S_VERITY flag allows bypassing userspace integrity checks by serving unverified data.
+
+Pre-existing issues:
+- [High] xrep_inode_flags incorrectly clears valid inode flags and retains junk flags during xfs_scrub repair.
+--
+
+--- Patch [8]: [PATCH v12 08/21] xfs: introduce fsverity on-disk changes ---
+commit 33f3597e95546564abf5ab01920749b383a1318a
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: introduce fsverity on-disk changes
+
+Introduce XFS_DIFLAG2_VERITY for inodes with fsverity to indicate the inode
+has fs-verity enabled. Introduce XFS_SB_FEAT_RO_COMPAT_VERITY for
+filesystems having fsverity inodes, allowing read-only access for older
+kernels.
+
+> diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+> index dd0ed046fbe9c..7b0511eb03d03 100644
+> --- a/fs/xfs/libxfs/xfs_format.h
+> +++ b/fs/xfs/libxfs/xfs_format.h
+[ ... ]
+> @@ -1230,16 +1231,21 @@ static inline void xfs_dinode_put_rdev(struct xfs_dinode *dip, xfs_dev_t rdev)
+[ ... ]
+>  #define XFS_DIFLAG2_ANY \
+>  	(XFS_DIFLAG2_DAX | XFS_DIFLAG2_REFLINK | XFS_DIFLAG2_COWEXTSIZE | \
+> -	 XFS_DIFLAG2_BIGTIME | XFS_DIFLAG2_NREXT64 | XFS_DIFLAG2_METADATA)
+> +	 XFS_DIFLAG2_BIGTIME | XFS_DIFLAG2_NREXT64 | XFS_DIFLAG2_METADATA | \
+> +	 XFS_DIFLAG2_VERITY)
+
+[Severity: High]
+This is a pre-existing issue, but does the bitwise operation in
+fs/xfs/scrub/inode_repair.c:xrep_inode_flags() erroneously clear all valid
+flags instead of the junk ones when it uses ~XFS_DIFLAG_ANY and
+~XFS_DIFLAG2_ANY?
+
+In xrep_inode_flags(), when an inode has unrecognized flags:
+
+	/* Clear junk flags */
+	if (sc->ip->i_diflags & ~XFS_DIFLAG_ANY)
+		sc->ip->i_diflags &= ~XFS_DIFLAG_ANY;
+[ ... ]
+	/* Clear junk flags. */
+	if (sc->ip->i_diflags2 & ~XFS_DIFLAG2_ANY)
+		sc->ip->i_diflags2 &= ~XFS_DIFLAG2_ANY;
+
+Since ~XFS_DIFLAG_ANY and ~XFS_DIFLAG2_ANY evaluate to masks of invalid
+flags, doesn't this operation zero out all legitimate feature flags (like DAX,
+REFLINK, BIGTIME, and now VERITY) while permanently retaining the junk flags
+it intended to remove?
+
+Could clearing flags like REFLINK on a shared file cause the filesystem to
+overwrite shared blocks directly instead of copying on write, leading to
+severe data corruption?
+
+> diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+> index 6339f4956ecb3..11dc1a485ca73 100644
+> --- a/fs/xfs/xfs_iops.c
+> +++ b/fs/xfs/xfs_iops.c
+[ ... ]
+> @@ -1398,12 +1398,15 @@ xfs_diflags_to_iflags(
+>  		flags |= S_NOATIME;
+>  	if (init && xfs_inode_should_enable_dax(ip))
+>  		flags |= S_DAX;
+> +	if (xflags & FS_XFLAG_VERITY)
+> +		flags |= S_VERITY;
+
+[Severity: High]
+Since XFS has not yet implemented the fs-verity read verification hooks or
+fsverity_file_open() (which the commit message notes is deferred to a future
+patch), does prematurely mapping XFS_DIFLAG2_VERITY to the VFS S_VERITY flag
+allow bypassing userspace integrity checks?
+
+Because the read path completely skips Merkle tree verification and
+fsverity_get_info() returns NULL, if an attacker mounts a crafted XFS image
+with the VERITY flag set, wouldn't userspace tools checking STATX_ATTR_VERITY
+be tricked into reading and trusting unverified data?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260720090410.3487990-1-aalbersh@kernel.org?part=8
+

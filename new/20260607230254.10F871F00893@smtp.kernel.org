@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Mon Jun  8 01:02:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: lzo: add error message for invalid headers
+Date: Sun, 07 Jun 2026 23:02:53 +0000
+Message-Id: <20260607230254.10F871F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The inline extent LZO decompression function lacks a sufficient minimum length check, leading to a heap out-of-bounds read and an information leak via the newly added error message.
+--
+
+commit 9c9ff427215b90d76db8e9219c01080f28e58246
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: lzo: add error message for invalid headers
+    
+This commit adds missing error messages to the LZO decompression path to
+indicate exactly where and what kind of corruption occurred when headers
+are invalid.
+
+> diff --git a/fs/btrfs/lzo.c b/fs/btrfs/lzo.c
+> index 2de18c7b563af..2a9b1fc90c1c1 100644
+> --- a/fs/btrfs/lzo.c
+> +++ b/fs/btrfs/lzo.c
+> @@ -541,17 +541,26 @@ int lzo_decompress(struct list_head *ws, const u8 *data_in,
+>  	size_t max_segment_len = workspace_buf_length(fs_info);
+>  	int ret;
+>  
+> -	if (unlikely(srclen < LZO_LEN || srclen > max_segment_len + LZO_LEN * 2))
+> +	if (unlikely(srclen < LZO_LEN || srclen > max_segment_len + LZO_LEN * 2)) {
+
+[Severity: High]
+This is a pre-existing issue, but does this bounds check verify enough bytes
+for the two headers read in lzo_decompress()?
+
+Since LZO_LEN is 4, if srclen is between 4 and 7, this check passes. If an
+inline extent is exactly 4 bytes long with the value 04 00 00 00, it also
+passes the first header validation below where in_len == srclen.
+
+> +		btrfs_err(fs_info, "invalid header length, has %zu expect (%u, %zu)",
+> +			  srclen, LZO_LEN, max_segment_len + LZO_LEN * 2);
+>  		return -EUCLEAN;
+> +	}
+>  
+>  	in_len = get_unaligned_le32(data_in);
+> -	if (unlikely(in_len != srclen))
+> +	if (unlikely(in_len != srclen)) {
+> +		btrfs_err(fs_info, "invalid header length, has %zu expect %zu",
+> +			  in_len, srclen);
+>  		return -EUCLEAN;
+> +	}
+>  	data_in += LZO_LEN;
+>  
+>  	in_len = get_unaligned_le32(data_in);
+> -	if (unlikely(in_len != srclen - LZO_LEN * 2))
+> +	if (unlikely(in_len != srclen - LZO_LEN * 2)) {
+> +		btrfs_err(fs_info, "invalid segment length, has %zu expect %zu",
+> +			  in_len, srclen - LZO_LEN * 2);
+
+[Severity: High]
+If srclen was less than 8 bytes, the second get_unaligned_le32() reads past
+the end of the allocated buffer.
+
+Could printing the out-of-bounds in_len value in this newly added error
+message inadvertently create an information leak of kernel heap data to dmesg?
+
+>  		return -EUCLEAN;
+> +	}
+>  	data_in += LZO_LEN;
+>  
+>  	out_len = sectorsize;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/205f9c2da68cc36dbaa604b6bdd462ff871b2b83.1780872810.git.wqu@suse.com?part=1
+

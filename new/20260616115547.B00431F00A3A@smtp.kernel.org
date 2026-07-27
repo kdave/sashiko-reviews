@@ -1,0 +1,64 @@
+From sashiko-bot@kernel.org Tue Jun 16 13:55:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/7] btrfs: wait for an RCU grace period before freeing
+ a device on add error
+Date: Tue, 16 Jun 2026 11:55:47 +0000
+Message-Id: <20260616115547.B00431F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Missing revert of `latest_dev`, `sb->s_bdev`, and sprout setup on the `error_sysfs` unwind path when adding a seeding device, leading to dangling pointers.
+--
+
+commit 5b33e9efba75fcb643302fa163b429392cb878b4
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: wait for an RCU grace period before freeing a device on add error
+
+This commit adds a synchronize_rcu() call in the error_sysfs unwind path
+of btrfs_init_new_device() to ensure readers under rcu_read_lock() don't
+dereference a freed device. This matches the behavior of other device
+removal paths.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 6eab4cc73ce44..9c4cd8bdda055 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -3086,6 +3086,8 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  	btrfs_update_per_profile_avail(fs_info);
+>  	mutex_unlock(&fs_info->chunk_mutex);
+>  	mutex_unlock(&fs_info->fs_devices->device_list_mutex);
+> +	/* Pair the list_del_rcu() above with a grace period before the free. */
+> +	synchronize_rcu();
+
+[Severity: High]
+This is a pre-existing issue, but does this error path also need to revert
+the pointer assignments made earlier when adding a seeding device?
+
+If btrfs_init_new_device() adds a device to a seed filesystem, it calls
+btrfs_setup_sprout() and btrfs_assign_next_active_device() earlier in
+the function:
+
+    btrfs_assign_next_active_device(fs_info->fs_devices->latest_dev,
+                                    device);
+
+This overwrites fs_info->fs_devices->latest_dev with the new device and
+fs_info->sb->s_bdev with device->bdev.
+
+If a subsequent step fails (such as init_first_rw_device() or
+btrfs_add_dev_item()), the code jumps to error_sysfs. The unwind path
+frees the device and puts the block device, but doesn't seem to revert
+latest_dev, sb->s_bdev, or the sprout list changes.
+
+Could this leave the filesystem with dangling pointers to a freed device
+and a closed block device, leading to a use-after-free if VFS or Btrfs
+subsequently accesses them?
+
+>  error_trans:
+>  	if (trans)
+>  		btrfs_end_transaction(trans);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616-work-btrfs-preexisting-fixes-v1-0-c4abe2f6d4f0@kernel.org?part=1
+

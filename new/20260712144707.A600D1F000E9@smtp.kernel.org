@@ -1,0 +1,170 @@
+From sashiko-bot@kernel.org Sun Jul 12 16:47:11 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: test checksum handling for clone, dedupe and
+ swap on NOCOW files
+Date: Sun, 12 Jul 2026 14:47:07 +0000
+Message-Id: <20260712144707.A600D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Medium] Architectural Flaw: The commit incorrectly adds xfstests (fstests) scripts directly to the root of the Linux kernel source tree.
+- [Medium] The helper `_compare_range` used to verify deduped contents is not defined.
+- [Medium] Race Condition: Tests verify on-disk extent structures without synchronizing in-memory metadata to the block device.
+--
+
+--- Patch [1]: [PATCH] btrfs: test checksum handling for clone, dedupe and swap on NOCOW files ---
+commit 81c3e6dcbe1acc5e08dfd779d0d5d9eeb677bc78
+Author: Daan De Meyer <daan@amutable.com>
+
+btrfs: test checksum handling for clone, dedupe and swap on NOCOW files
+
+This commit adds two tests covering how checksummed and NOCOW extents
+interact. btrfs/348 verifies cloning and deduplication into NOCOW files,
+and btrfs/349 verifies NOCOW swap file behavior with checksummed extents.
+
+> diff --git a/tests/btrfs/348 b/tests/btrfs/348
+> new file mode 100755
+> index 0000000000000..4faf994edb13f
+> --- /dev/null
+> +++ b/tests/btrfs/348
+> @@ -0,0 +1,180 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+> +#
+> +# FS QA Test 348
+> +#
+> +# Verify that checksummed extents can be cloned and deduplicated into NOCOW
+> +# files.  The reverse direction must remain rejected because NOCOW extents do
+> +# not have checksums.
+> +#
+> +. ./common/preamble
+
+[Severity: Medium]
+Are these fstests (xfstests) scripts being mistakenly added to the kernel
+source tree?
+
+The script attempts to source external files like ./common/preamble which do
+not exist in the kernel repository, rendering the scripts unrunnable here.
+
+[ ... ]
+
+> +source=$SCRATCH_MNT/unshared_source
+> +dest=$SCRATCH_MNT/unshared_dest
+> +write_pattern "$source" 0x61
+> +make_nocow_file "$dest"
+> +_reflink_range "$source" 0 "$dest" 0 "$filesize" > /dev/null 2>&1
+> +get_extent_bytenr "$source"
+
+[Severity: Medium]
+Is there a missing synchronization step before checking the on-disk extent
+item here?
+
+Since btrfs caches metadata changes in memory until a transaction commit,
+querying the block device directly without issuing a sync or cycle_mount
+might read stale on-disk data.
+
+> +source_bytenr=$extent_bytenr
+
+[ ... ]
+
+> +	_fail "failed to write $dest"
+> +_dedupe_range "$source" 0 "$dest" "$filesize" "$filesize" \
+> +	> /dev/null 2>&1
+> +_scratch_cycle_mount
+> +get_extent_bytenr "$source"
+> +source_bytenr=$extent_bytenr
+> +get_extent_bytenr "$dest" "$((128 * 1024))"
+> +dest_bytenr=$extent_bytenr
+> +[ "$source_bytenr" = "$dest_bytenr" ] || \
+> +	_fail "dedupe did not share the source extent"
+> +_compare_range "$source" 0 "$dest" "$((128 * 1024))" "$((128 * 1024))" || \
+
+[Severity: Medium]
+Is _compare_range defined in any of the sourced common files or locally?
+
+It appears to be undefined, which might cause the test to reliably fail with
+a command not found error.
+
+> +	_fail "deduped range contents differ from the source"
+
+[ ... ]
+
+> +# Cloning or deduplicating a NOCOW source into a checksummed destination must
+> +# not share the source extent, since it has no checksums for destination reads.
+> +source=$SCRATCH_MNT/reverse_source
+> +clone_dest=$SCRATCH_MNT/reverse_clone_dest
+> +dedupe_dest=$SCRATCH_MNT/reverse_dedupe_dest
+> +make_nocow_file "$source"
+> +write_pattern "$source" 0x61
+> +touch "$clone_dest"
+> +_reflink_range "$source" 0 "$clone_dest" 0 "$filesize" > /dev/null 2>&1
+> +get_extent_bytenr "$source"
+> +source_bytenr=$extent_bytenr
+> +clone_bytenr=$(_btrfs_get_file_extent_item_bytenr "$clone_dest" 0)
+
+[Severity: Medium]
+Does this _btrfs_get_file_extent_item_bytenr check need to be preceded by a
+sync or cycle_mount?
+
+Similar to earlier instances, missing synchronization before querying the
+on-disk structure could silently mask potential kernel bugs if the clone
+succeeded but isn't on disk yet.
+
+> +if [ -n "$clone_bytenr" ] && [ "$clone_bytenr" = "$source_bytenr" ]; then
+> +	_fail "NOCOW to checksummed clone succeeded"
+> +fi
+> +write_pattern "$dedupe_dest" 0x61
+> +_dedupe_range "$source" 0 "$dedupe_dest" 0 "$filesize" > /dev/null 2>&1
+> +get_extent_bytenr "$dedupe_dest"
+
+[Severity: Medium]
+Could this dedupe extent check also require synchronization before querying?
+
+> +dedupe_bytenr=$extent_bytenr
+
+[ ... ]
+
+> diff --git a/tests/btrfs/349 b/tests/btrfs/349
+> new file mode 100755
+> index 0000000000000..66e0935a5cc3b
+> --- /dev/null
+> +++ b/tests/btrfs/349
+> @@ -0,0 +1,73 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+> +#
+> +# FS QA Test 349
+> +#
+> +# Verify that a NOCOW swap file containing a checksummed extent is rejected
+> +# even after the checksummed source is deleted and the extent is no longer
+> +# shared.
+> +#
+> +. ./common/preamble
+
+[Severity: Medium]
+As mentioned in the previous test file, are these fstests scripts intended
+for the main kernel tree?
+
+They depend on an external fstests framework that isn't present here.
+
+[ ... ]
+
+> +$XFS_IO_PROG -f -c "pwrite -q -S 0x61 0 $extent_size" -c fsync "$source" || \
+> +	_fail "failed to write checksummed source"
+> +_reflink_range "$source" 0 "$swap_file" "$dest_offset" "$extent_size" \
+> +	> /dev/null 2>&1
+> +source_bytenr=$(_btrfs_get_file_extent_item_bytenr "$source" 0)
+
+[Severity: Medium]
+Should there be a sync before querying _btrfs_get_file_extent_item_bytenr
+after the reflink operation?
+
+Without it, the on-disk metadata might not yet reflect the in-memory
+changes.
+
+> +swap_bytenr=$(_btrfs_get_file_extent_item_bytenr "$swap_file" "$dest_offset")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260712-push-kwzqkrlxwvnv-v1-1-e2466aff1bfd@amutable.com?part=1
+

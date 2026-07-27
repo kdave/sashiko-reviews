@@ -1,0 +1,175 @@
+From sashiko-bot@kernel.org Tue Jun 16 10:29:55 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 1/3] block: revert the iov_iter after a short copy in
+ bio_iov_iter_bounce_write()
+Date: Tue, 16 Jun 2026 08:29:53 +0000
+Message-Id: <20260616082953.E21061F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] `bio_iov_iter_align_down` incorrectly trims vectors and unpins wrong pages in `bio_iov_iter_bounce_read` due to an array layout mismatch.
+- [High] Memory leak when `bio_iov_iter_align_down` drops unaligned tail bvecs containing dynamically allocated bounce folios.
+- [High] Memory leak of the bounce folio in `bio_iov_iter_bounce_read` when `bio_iov_iter_align_down` fails.
+- [High] Pinned user pages and bounce buffer folios are permanently leaked when an atomic write results in a short bio.
+--
+
+commit 85e4c420464f66da861bbaf2162c898bfffe184b
+Author: Qu Wenruo <wqu@suse.com>
+
+block: revert the iov_iter after a short copy in bio_iov_iter_bounce_write()
+
+This commit updates bio_iov_iter_bounce_write() to revert the iov_iter when a
+short copy occurs. This prevents the iterator from containing unexpected garbage
+during retries. The revert size is properly compensated based on the difference
+between the queued length and the actually advanced length.
+
+> diff --git a/block/bio.c b/block/bio.c
+> index 5f10900b3f42a..d2fdfcb016c15 100644
+> --- a/block/bio.c
+> +++ b/block/bio.c
+> @@ -1321,6 +1321,7 @@ static int bio_iov_iter_bounce_write(struct bio *bio, struct iov_iter *iter,
+>  
+>  	do {
+>  		size_t this_len = min(total_len, SZ_1M);
+> +		size_t copied;
+>  		struct folio *folio;
+>  
+>  		if (this_len > minsize * 2)
+> @@ -1334,12 +1335,22 @@ static int bio_iov_iter_bounce_write(struct bio *bio, struct iov_iter *iter,
+>  			break;
+>  		bio_add_folio_nofail(bio, folio, this_len, 0);
+>  
+> -		if (copy_from_iter(folio_address(folio), this_len, iter) !=
+> -				this_len) {
+> +		copied = copy_from_iter(folio_address(folio), this_len, iter);
+> +		if (copied < this_len) {
+> +			/*
+> +			 * Need to revert the iov iter for all bytes we have
+> +			 * copied.
+> +			 *
+> +			 * However the bio size differs from the real copied
+> +			 * bytes as @this_len is queued but only advanced
+> +			 * less than that.
+> +			 * Need to compensate that for the revert.
+> +			 */
+> +			iov_iter_revert(iter, bio->bi_iter.bi_size - this_len +
+> +					copied);
+>  			bio_free_folios(bio);
+>  			return -EFAULT;
+>  		}
+> -
+>  		total_len -= this_len;
+>  	} while (total_len && bio->bi_vcnt < bio->bi_max_vecs);
+
+[Severity: High]
+This is a pre-existing issue, but does this code leak bounce folios if
+bio_iov_iter_align_down() drops unaligned tail bvecs?
+
+In bio_iov_iter_bounce_write(), when the total length requires multiple
+dynamically allocated folios, and the last allocated folio's size perfectly
+matches the unaligned tail size:
+
+block/bio.c:bio_iov_iter_bounce_write() {
+    ...
+    return bio_iov_iter_align_down(bio, iter, minsize - 1);
+}
+
+Inside bio_iov_iter_align_down(), it will subtract the entire length of the last
+bvec and decrement bio->bi_vcnt:
+
+block/bio.c:bio_iov_iter_align_down() {
+    ...
+    bio->bi_vcnt--;
+    nbytes -= bv->bv_len;
+    ...
+}
+
+Because bi_vcnt is reduced without explicitly freeing the kernel-allocated folio,
+the dropped folio is ignored by the cleanup loop in bio_free_folios(), which
+only iterates up to the new bi_vcnt. Does this cause a permanent memory leak of
+the bounce folio?
+
+[Severity: Critical]
+This is a pre-existing issue, but does bio_iov_iter_align_down() incorrectly
+trim vectors and unpin the wrong pages when called from
+bio_iov_iter_bounce_read()?
+
+In bio_iov_iter_bounce_read(), the bounce folio is placed at bio->bi_io_vec[0],
+and the bio->bi_vcnt (N) user bvecs are extracted into bio->bi_io_vec[1] through
+bio->bi_io_vec[N]:
+
+block/bio.c:bio_iov_iter_bounce_read() {
+    ...
+    bvec_set_folio(&bio->bi_io_vec[0], folio, bio->bi_iter.bi_size, 0);
+    if (iov_iter_extract_will_pin(iter))
+        bio_set_flag(bio, BIO_PAGE_PINNED);
+    return bio_iov_iter_align_down(bio, iter, minsize - 1);
+}
+
+The total number of valid elements is N + 1. However, bio_iov_iter_align_down()
+assumes the standard layout where bi_vcnt is the total number of elements and
+the last element is at index bi_vcnt - 1:
+
+block/bio.c:bio_iov_iter_align_down() {
+    ...
+    struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
+    ...
+}
+
+As a result, it targets bio->bi_io_vec[N - 1], skipping the last user bvec
+entirely. If N=1, does it incorrectly target the bounce folio at index 0,
+improperly shrinking it and unpinning it, leading to out-of-bounds array logic
+and data corruption?
+
+[Severity: High]
+This is a pre-existing issue, but does bio_iov_iter_bounce_read() leak the
+bounce folio if bio_iov_iter_align_down() fails?
+
+In bio_iov_iter_bounce_read(), a large folio is allocated for the bounce buffer
+via folio_alloc_greedy():
+
+block/bio.c:bio_iov_iter_bounce_read() {
+    ...
+    folio = folio_alloc_greedy(GFP_KERNEL, &len, minsize);
+    ...
+    return bio_iov_iter_align_down(bio, iter, minsize - 1);
+}
+
+If the subsequent call to bio_iov_iter_align_down() fails (for example, if it
+ends up trimming all extracted vectors, resulting in !bio->bi_vcnt and returning
+-EFAULT), the error is returned directly to the caller.
+
+Is the allocated bounce folio ever freed in this error path? The caller
+(iomap_dio_bio_iter_one()) receives -EFAULT and calls bio_put(bio), which frees
+the bio structure but does not free the attached folios, potentially resulting
+in a permanent memory leak.
+
+[Severity: High]
+This is a pre-existing issue, but are pinned user pages and bounce buffer folios
+permanently leaked when an atomic write results in a short bio?
+
+In fs/iomap/direct-io.c:iomap_dio_bio_iter_one(), if an atomic write is requested
+and the generated bio does not cover the complete length of the iter, it jumps
+to the out_put_bio error label:
+
+fs/iomap/direct-io.c:iomap_dio_bio_iter_one() {
+    ...
+    if ((op & REQ_ATOMIC) && WARN_ON_ONCE(ret != iomap_length(iter))) {
+        ret = -EINVAL;
+        goto out_put_bio;
+    }
+    ...
+out_put_bio:
+    bio_put(bio);
+    return ret;
+}
+
+The error path only calls bio_put(bio). Since bio_put() only frees the bio
+structure and its bvec array, and does not unpin user pages or free kernel
+folios attached to it, do any pages pinned or bounce folios allocated for the
+short atomic write permanently leak here?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1781597506.git.wqu@suse.com?part=1
+

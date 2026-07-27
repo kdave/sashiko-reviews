@@ -1,0 +1,153 @@
+From sashiko-bot@kernel.org Tue Jul 14 08:26:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/3] btrfs: roll back sprout setup after device add
+ failure
+Date: Tue, 14 Jul 2026 06:26:34 +0000
+Message-Id: <20260714062634.955121F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+
+New issues:
+- [Critical] lockdep_assert_held(&uuid_mutex) in btrfs_rollback_sprout() will trigger a crash on the post-commit error path, and rolling back state after a successful commit causes fatal inconsistency.
+- [High] btrfs_rollback_sprout() fails to remove and free 'old_devices' from the global fs_uuids list, leading to a permanent memory leak and duplicate FSID entries.
+- [High] btrfs_rollback_sprout() updates device->fs_devices after splicing devices back into fs_devices->devices, exposing an invalid pointer to concurrent RCU readers.
+
+Pre-existing issues:
+- [High] The error path in btrfs_init_new_device() removes the device from the RCU-protected device list and frees it immediately without an RCU grace period.
+--
+
+--- Patch [3]: [PATCH 3/3] btrfs: roll back sprout setup after device add failure ---
+commit 1b8a3c740586f9eb44b6b19b9ea65576efb1b18c
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: roll back sprout setup after device add failure
+
+This commit adds a rollback function for seed device sprouting when
+device addition fails. It aims to restore the original device state
+instead of leaving the filesystem in a partially initialized sprout
+state.
+
+Cc: stable@vger.kernel.org
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index a14f186f5b07f..9aba2762025bb 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+[ ... ]
+> @@ -2772,6 +2772,42 @@ static void btrfs_setup_sprout(struct btrfs_fs_info *fs_info,
+> +static void btrfs_rollback_sprout(struct btrfs_fs_info *fs_info,
+> +				  struct btrfs_fs_devices *seed_devices)
+> +{
+> +	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
+> +	struct btrfs_super_block *disk_super = fs_info->super_copy;
+> +	struct btrfs_device *device;
+> +	u64 super_flags;
+> +
+> +	lockdep_assert_held(&uuid_mutex);
+> +	lockdep_assert_held(&fs_devices->device_list_mutex);
+> +
+> +	list_del_init(&seed_devices->seed_list);
+> +	list_splice_init_rcu(&seed_devices->devices, &fs_devices->devices,
+> +			     synchronize_rcu);
+> +	list_for_each_entry(device, &fs_devices->devices, dev_list)
+> +		device->fs_devices = fs_devices;
+
+[Severity: High]
+Can this sequence expose a stale pointer to concurrent RCU readers?
+
+When list_splice_init_rcu() makes the devices visible in
+fs_devices->devices, readers could traverse them before the subsequent
+loop updates device->fs_devices.
+
+If an RCU reader holds a pointer to the old seed_devices, could it be
+left pointing to freed memory when free_fs_devices(seed_devices) is
+called immediately below without an RCU grace period?
+
+> +
+> +	fs_devices->seeding = true;
+> +	fs_devices->num_devices = seed_devices->num_devices;
+> +	fs_devices->open_devices = seed_devices->open_devices;
+> +	fs_devices->missing_devices = seed_devices->missing_devices;
+> +	fs_devices->rotating = seed_devices->rotating;
+> +	fs_devices->latest_dev = seed_devices->latest_dev;
+> +
+> +	memcpy(fs_devices->fsid, seed_devices->fsid, BTRFS_FSID_SIZE);
+> +	memcpy(fs_devices->metadata_uuid, seed_devices->metadata_uuid,
+> +	       BTRFS_FSID_SIZE);
+> +	memcpy(disk_super->fsid, seed_devices->fsid, BTRFS_FSID_SIZE);
+> +
+> +	super_flags = btrfs_super_flags(disk_super) | BTRFS_SUPER_FLAG_SEEDING;
+> +	btrfs_set_super_flags(disk_super, super_flags);
+> +
+> +	seed_devices->opened = 0;
+> +	free_fs_devices(seed_devices);
+
+[Severity: High]
+Does this rollback logic need to handle the cloned fs_devices?
+
+When a sprout operation is initiated, btrfs_init_sprout() clones the
+fs_devices and adds the old_devices clone to the global fs_uuids list.
+If we roll back the sprout state here, is it necessary to also remove
+and free old_devices from the fs_uuids list?
+
+Without removing it, could this leave a duplicate FSID entry and leak
+memory?
+
+> +}
+> +
+[ ... ]
+> @@ -3088,6 +3124,8 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  				    orig_super_total_bytes);
+>  	btrfs_set_super_num_devices(fs_info->super_copy,
+>  				    orig_super_num_devices);
+> +	if (seeding_dev)
+> +		btrfs_rollback_sprout(fs_info, seed_devices);
+
+[Severity: High]
+Could this rollback trigger a lockdep assertion or cause state
+inconsistency when called from the post-commit error path?
+
+If btrfs_init_new_device() successfully commits the transaction and
+drops the uuid_mutex, but then fails during btrfs_attach_transaction(),
+it jumps to error_sysfs:
+
+btrfs_init_new_device()
+    btrfs_commit_transaction(trans)
+    mutex_unlock(&uuid_mutex)
+    ...
+    trans = btrfs_attach_transaction()
+    if (IS_ERR(trans))
+        goto error_sysfs;
+
+Since uuid_mutex is no longer held on this path, calling
+btrfs_rollback_sprout() will trigger the lockdep_assert_held() for
+uuid_mutex.
+
+Additionally, does rolling back the in-memory sprout state after the
+transaction has already been committed to disk leave the filesystem
+in an inconsistent state?
+
+[Severity: High]
+This is a pre-existing issue, but does the error path free the device
+without an RCU grace period?
+
+In the error handling above this point:
+
+btrfs_init_new_device()
+    error_sysfs:
+        list_del_rcu(&device->dev_list);
+        ...
+    error_free_device:
+        btrfs_free_device()
+            kfree(device);
+
+If an RCU reader is traversing the device list when list_del_rcu() is
+called, could it access the device memory after it is freed?
+
+>  	btrfs_update_per_profile_avail(fs_info);
+>  	mutex_unlock(&fs_info->chunk_mutex);
+>  	mutex_unlock(&fs_info->fs_devices->device_list_mutex);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260714061037.1014-1-3497809730@qq.com?part=3
+

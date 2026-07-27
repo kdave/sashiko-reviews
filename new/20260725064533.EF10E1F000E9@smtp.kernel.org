@@ -1,0 +1,123 @@
+From sashiko-bot@kernel.org Sat Jul 25 08:45:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC PATCH] btrfs: trigger cow fixup via dirty_folio()
+Date: Sat, 25 Jul 2026 06:45:33 +0000
+Message-Id: <20260725064533.EF10E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] NULL pointer dereference in `btrfs_data_dirty_folio` when accessing dropped subpage state.
+- [High] Circular dependency and deadlock caused by using an ordered workqueue for fixup workers.
+- [High] Ignored `-ENOMEM` from `btrfs_queue_writepage_fixup` causes writeback livelock.
+--
+
+--- Patch [1]: [RFC PATCH] btrfs: trigger cow fixup via dirty_folio() ---
+commit 6edf6130969b22484215f304338e8ba923947408
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: trigger cow fixup via dirty_folio()
+
+This commit introduces a COW fixup mechanism for folios dirtied without
+delalloc reservations. It introduces a fixup worker and modifies the writepage
+path to enqueue work for these unnotified dirty blocks.
+
+Link: https://lore.kernel.org/linux-btrfs/20260721191152.101118-1-borntraeger@linux.ibm.com/
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 37fc0d6b960d9..c532c98806f67 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+[ ... ]
+> @@ -1967,6 +1968,9 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
+>  	fs_info->caching_workers =
+>  		btrfs_alloc_workqueue(fs_info, "cache", flags, max_active, 0);
+>  
+> +	fs_info->fixup_workers =
+> +		btrfs_alloc_ordered_workqueue(fs_info, "fixup", ordered_flags);
+> +
+
+[Severity: High]
+Does allocating this as an ordered workqueue introduce a deadlock under space
+pressure?
+
+In btrfs_writepage_fixup_worker(), the worker calls
+btrfs_delalloc_reserve_space(). This can block and trigger space reclaim,
+which flushes delalloc roots and initiates writeback on other dirty folios.
+
+If those other folios also have unnotified dirty blocks, writepage_fixup()
+will attempt to queue more items to fixup_workers via
+btrfs_queue_writepage_fixup(). Since the workqueue is ordered, the newly
+queued tasks cannot run until the current blocked worker completes, creating
+an ABBA circular dependency.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index d285bc98b0fb0..fd682918648a8 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+[ ... ]
+> @@ -1462,6 +1463,128 @@ static bool find_next_delalloc_bitmap(struct folio *folio,
+[ ... ]
+> +		bitmap_clear(bio_ctrl->submit_bitmap, bit, 1);
+> +		punt = true;
+> +	}
+> +	if (punt) {
+> +		btrfs_queue_writepage_fixup(inode, folio);
+> +		/*
+> +		 * Keep the folio dirty for the punted blocks.  If nothing
+> +		 * is left to submit this pass, the folio is done and we own
+> +		 * the unlock, matching the async-submission contract.
+> +		 */
+> +		folio_redirty_for_writepage(bio_ctrl->wbc, folio);
+
+[Severity: High]
+Can this ignored return value lead to an infinite writeback retry loop?
+
+The allocation in btrfs_queue_writepage_fixup() uses GFP_NOFS and can return
+-ENOMEM under heavy memory pressure. If that error is ignored, the folio is
+left dirty but without a queued fixup worker.
+
+During the next pass, the writeback loop finds the dirty folio again, calls
+writepage_fixup(), and attempts the allocation again. If memory pressure
+persists, it will repeatedly fail and redirty the folio, potentially stalling
+the system and preventing the memory pressure from resolving.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 0fcbfc3939462..7d9f0ac27fb8b 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -10583,6 +10786,63 @@ static const struct file_operations btrfs_dir_file_operations = {
+[ ... ]
+> +static bool btrfs_data_dirty_folio(struct address_space *mapping,
+> +				   struct folio *folio)
+> +{
+> +	struct btrfs_inode *inode = BTRFS_I(mapping->host);
+> +	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+> +	bool marked = false;
+> +
+> +	if (btrfs_is_subpage(fs_info, folio)) {
+> +		const struct btrfs_folio_state *bfs = folio_get_private(folio);
+> +		const u64 page_start = folio_pos(folio);
+> +		const u64 range_end = min_t(u64, page_start + folio_size(folio),
+> +					    round_up(i_size_read(&inode->vfs_inode),
+> +						     fs_info->sectorsize));
+> +
+> +		if (!READ_ONCE(bfs->reserving_dirty) &&
+
+[Severity: High]
+Is it possible for folio_get_private() to return NULL here, causing a NULL
+pointer dereference?
+
+If a clean, subpage-formatted folio is mapped shared and pinned by GUP,
+memory pressure or truncation operations could trigger filemap_release_folio().
+This will free the private btrfs_folio_state (bfs) and return success, even
+though the folio remains in the page cache due to the GUP pin.
+
+When the I/O completes and set_page_dirty() is called, this callback will
+unconditionally dereference the now-NULL bfs pointer via
+!READ_ONCE(bfs->reserving_dirty). Does this path need to re-validate or
+re-attach the private data, perhaps by calling set_folio_extent_mapped()
+before accessing it?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/6758d4f27be0bbdb865cee7dd5adc435c969f4a3.1784960646.git.boris@bur.io?part=1
+

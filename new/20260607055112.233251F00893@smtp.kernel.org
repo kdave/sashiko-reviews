@@ -1,0 +1,87 @@
+From sashiko-bot@kernel.org Sun Jun  7 07:51:14 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix use-after-free of reloc_control in
+ btrfs_reloc_cow_block
+Date: Sun, 07 Jun 2026 05:51:11 +0000
+Message-Id: <20260607055112.233251F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] The added `btrfs_commit_current_transaction()` synchronization barrier fails to wait for concurrent threads when the filesystem is in an error state, leaving the use-after-free vulnerability unresolved.
+- [Critical] The patch's synchronization barrier is placed too late in the teardown sequence, leaving `rc->data_inode` vulnerable to Use-After-Free by concurrent threads.
+--
+
+commit 7ae5f79570ac89424bedd928c9bef833e21f8bd7
+Author: Yun Zhou <yun.zhou@windriver.com>
+
+btrfs: fix use-after-free of reloc_control in btrfs_reloc_cow_block
+
+This commit attempts to fix a use-after-free vulnerability of the reloc_control
+object by adding a transaction commit barrier before freeing it. This ensures
+concurrent callers finish their transactions before the memory is released.
+
+Link: https://syzkaller.appspot.com/bug?extid=0eea49bba18051dea35e
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 3ebaf5880125f..a01262d0b2ab7 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+> @@ -5443,6 +5443,14 @@ int btrfs_relocate_block_group(struct btrfs_fs_info *fs_info, u64 group_start,
+>  	reloc_chunk_end(fs_info);
+>  out_put_bg:
+>  	btrfs_put_block_group(bg);
+> +	/*
+> +	 * Ensure no concurrent btrfs_reloc_cow_block() is still using rc.
+> +	 * After unset_reloc_control() new callers will see reloc_ctl == NULL
+> +	 * and return immediately. But callers that read reloc_ctl before unset
+> +	 * are still in a transaction. Wait for the current transaction to
+> +	 * complete so all such callers have finished using rc.
+> +	 */
+> +	btrfs_commit_current_transaction(fs_info->tree_root);
+
+[Severity: Critical]
+This is a pre-existing issue, but does placing the barrier here leave
+rc->data_inode vulnerable to a use-after-free?
+
+Just before this hunk at the "out:" label, iput(rc->data_inode) is called.
+If concurrent threads are still executing btrfs_reloc_cow_block(),
+they can enter get_new_location() and dereference the freed inode:
+
+fs/btrfs/relocation.c:get_new_location() {
+    struct btrfs_root *root = BTRFS_I(reloc_inode)->root;
+    ...
+}
+
+Should the barrier be placed before we drop the reference to rc->data_inode?
+
+[Severity: Critical]
+This isn't a bug introduced by this patch, but does this barrier actually
+wait if the filesystem has encountered an error?
+
+If the filesystem is in an error state (e.g. from an aborted transaction),
+start_transaction() immediately returns -EROFS. This causes
+btrfs_commit_current_transaction() to propagate the error without waiting:
+
+fs/btrfs/transaction.c:btrfs_commit_current_transaction() {
+    trans = btrfs_attach_transaction_barrier(root);
+    if (IS_ERR(trans)) {
+        int ret = PTR_ERR(trans);
+        return (ret == -ENOENT) ? 0 : ret;
+    }
+    ...
+}
+
+Because btrfs_relocate_block_group() ignores the return value of
+btrfs_commit_current_transaction() here, it will proceed directly to
+free_reloc_control(rc). 
+
+Will concurrent threads still using rc then trigger a use-after-free?
+
+>  	free_reloc_control(rc);
+>  	return ret;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260607053441.1629853-1-yun.zhou@windriver.com?part=1
+

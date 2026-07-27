@@ -1,0 +1,100 @@
+From sashiko-bot@kernel.org Sun Jul 12 12:03:26 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: add a new regression test for RAID56
+ RWM
+Date: Sun, 12 Jul 2026 10:03:23 +0000
+Message-Id: <20260712100323.845621F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Medium] The test script overwrites 64K of physical disk space instead of 32K, inadvertently corrupting space outside the intended file extent.
+- [Low] Fragile extraction of `chunk_logical` will cause a bash syntax error if multiple RAID5 chunks exist.
+- [Low] Redundant `_require_scratch_dev_pool 3` requirement declaration.
+--
+
+--- Patch [1]: [PATCH] fstests: btrfs: add a new regression test for RAID56 RWM ---
+commit 00720fefacff5d938cd90204428f66d444184dee
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a new regression test for RAID56 RWM
+
+This commit adds a new fstests case, tests/btrfs/352, to verify that btrfs
+RAID56 RMW correctly handles data checksums. It constructs a specific full
+stripe layout, intentionally corrupts on-disk data for a file, and then tests
+if an update via RMW properly detects the corruption.
+
+> diff --git a/tests/btrfs/352 b/tests/btrfs/352
+> new file mode 100755
+> index 0000000000000..435a3ec7433f2
+> --- /dev/null
+> +++ b/tests/btrfs/352
+[ ... ]
+> +if ! _check_btrfs_raid_type raid5; then
+> +	_notrun "requires either raid5 or raid6 support"
+> +fi
+> +
+> +# The file layout are all based on 4K block size.
+> +_require_btrfs_support_sectorsize 4096
+> +_require_scratch_dev_pool 3
+> +
+> +_fixed_by_kernel_commit xxxxxxxxxxxx \
+> +	"btrfs: raid56: fix an incorrect csum skip during rmw"
+> +
+> +_require_non_zoned_device "${SCRATCH_DEV}"
+> +_require_scratch_dev_pool 3
+
+[Severity: Low]
+This isn't a bug, but _require_scratch_dev_pool 3 is duplicated here.
+It was already called a few lines above.
+
+> +_scratch_dev_pool_get 3
+> +_scratch_pool_mkfs -d raid5 -m raid1  >> $seqres.full 2>&1
+> +
+> +# Use v2 cache, as v1 cache will use data space and screw up
+> +# the data layout inside a full stripe.
+> +_scratch_mount -o space_cache=v2,datasum
+> +
+> +# Balance data so that new data writes can always start at the beginning
+> +# of the data chunk.
+> +# The mkfs may put the first data stripe at a location that covers the
+> +# 2nd super block, that will cause the first data to be at the middle of the chunk
+> +# making it very hard to force the file layout.
+> +$BTRFS_UTIL_PROG balance start -d $SCRATCH_MNT >> $seqres.full
+> +
+> +chunk_logical=$($BTRFS_UTIL_PROG inspect-internal dump-tree -t chunk $SCRATCH_DEV |\
+> +	grep -B1 RAID5 | grep -o "[[:digit:]]\+)" | sed 's/)//')
+
+[Severity: Low]
+Could this regression in chunk_logical extraction produce multiple lines if
+the chunk tree contains more than one RAID5 chunk?
+
+If multiple chunks match, grep would output a multi-line string. This would
+then cause the [ "$logical" -ne "$chunk_logical" ] condition below to fail
+with a bash syntax error "integer expression expected" and crash the test.
+
+[ ... ]
+> +logical=$(_btrfs_get_first_logical $SCRATCH_MNT/file2)
+> +
+> +# Corrupt the data stripe which has checksum
+> +physical_d=$(_btrfs_get_physical ${logical} 1)
+> +devpath_d=$(_btrfs_get_device_path ${logical} 1)
+> +
+> +_scratch_unmount
+> +
+> +echo "Corrupt data stripe at devpath $devpath_d physical $physical_d" \
+> +	>> $seqres.full
+> +$XFS_IO_PROG -c "pwrite -S 0x00 $physical_d 64K" -c sync $devpath_d \
+> +	>> $seqres.full
+
+[Severity: Medium]
+Does this test script regression cause an overwrite of space outside the
+intended file extent?
+
+file2 is 32K and located at a 32K offset within a 64K data stripe. Using a 64K
+pwrite to the raw block device starting at physical_d will cross the stripe
+boundary and overwrite the adjacent 32K on the physical device. Could this
+inadvertently corrupt unrelated chunks, metadata, or the superblock, leading
+to spurious test failures?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260712095708.182997-1-wqu@suse.com?part=1
+

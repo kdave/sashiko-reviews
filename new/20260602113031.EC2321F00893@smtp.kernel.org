@@ -1,0 +1,56 @@
+From sashiko-bot@kernel.org Tue Jun  2 13:30:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 7/8] erofs: open via dedicated fs bdev helpers
+Date: Tue, 02 Jun 2026 11:30:31 +0000
+Message-Id: <20260602113031.EC2321F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] The early return for `flatdev` mounts in `erofs_map_dev` bypasses the newly introduced `erofs_is_shutdown(sb)` check.
+--
+
+commit 641242824d1c688aed7f1e9fecc6e7b6be574613
+Author: Christian Brauner <brauner@kernel.org>
+
+erofs: open via dedicated fs bdev helpers
+
+This commit routes block device opens through dedicated filesystem bdev
+helpers to ensure registration against the correct superblock. It also
+introduces shutdown and dead-device states to fence I/O when backing
+devices are removed.
+
+> diff --git a/fs/erofs/data.c b/fs/erofs/data.c
+> index 44da21c9d7776..5220585293dfe 100644
+> --- a/fs/erofs/data.c
+> +++ b/fs/erofs/data.c
+[ ... ]
+> @@ -236,6 +239,9 @@ int erofs_map_dev(struct super_block *sb, struct erofs_map_dev *map)
+>  		}
+>  		up_read(&devs->rwsem);
+>  	}
+> +	if (erofs_is_shutdown(sb) ||
+> +	    (map->m_dif && READ_ONCE(map->m_dif->dead)))
+> +		return -EIO;
+
+[Severity: High]
+Does the early return for flatdev configurations bypass this new shutdown
+check?
+
+Earlier in erofs_map_dev(), if the filesystem is mounted with devs->flatdev,
+the function exits early:
+
+        if (devs->flatdev) {
+                map->m_pa += erofs_pos(sb, dif->uniaddr);
+                up_read(&devs->rwsem);
+                return 0;
+        }
+
+Since this returns directly, it skips the newly added erofs_is_shutdown(sb)
+and dead device checks at the end of the function. Could this allow I/O to be
+falsely submitted to a dead primary device during flatdev mappings?
+
+>  	return 0;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260602-work-super-bdev_holder_global-v1-0-bb0fd82f3861@kernel.org?part=7
+

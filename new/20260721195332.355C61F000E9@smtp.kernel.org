@@ -1,0 +1,99 @@
+From sashiko-bot@kernel.org Tue Jul 21 21:53:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v13 09/23] xfs: introduce fsverity on-disk changes
+Date: Tue, 21 Jul 2026 19:53:31 +0000
+Message-Id: <20260721195332.355C61F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [Critical] XFS sets S_VERITY on inodes but silently returns unverified data for fs-verity files.
+
+Pre-existing issues:
+- [High] Online scrub repair logic for inode flags clears valid flags and preserves junk flags due to an inverted bitwise operation.
+--
+
+--- Patch [9]: [PATCH v13 09/23] xfs: introduce fsverity on-disk changes ---
+commit 235a0aecaeccd8cfb99b98cd84c9a5744bd06136
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: introduce fsverity on-disk changes
+
+Introduce XFS_DIFLAG2_VERITY for inodes with fsverity. This flag indicates
+that the inode has fs-verity enabled. The patch also introduces
+XFS_SB_FEAT_RO_COMPAT_VERITY for filesystems having fsverity inodes.
+
+> diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+> --- a/fs/xfs/libxfs/xfs_format.h
+> +++ b/fs/xfs/libxfs/xfs_format.h
+
+[ ... ]
+
+> @@ -1230,16 +1231,21 @@ static inline void xfs_dinode_put_rdev(struct xfs_dinode *dip, xfs_dev_t rdev)
+>   */
+>  #define XFS_DIFLAG2_METADATA_BIT	5
+>  
+> +/* inodes sealed with fs-verity */
+> +#define XFS_DIFLAG2_VERITY_BIT		6
+>  
+>  #define XFS_DIFLAG2_DAX		(1ULL << XFS_DIFLAG2_DAX_BIT)
+>  #define XFS_DIFLAG2_REFLINK	(1ULL << XFS_DIFLAG2_REFLINK_BIT)
+>  #define XFS_DIFLAG2_COWEXTSIZE	(1ULL << XFS_DIFLAG2_COWEXTSIZE_BIT)
+>  #define XFS_DIFLAG2_BIGTIME	(1ULL << XFS_DIFLAG2_BIGTIME_BIT)
+>  #define XFS_DIFLAG2_NREXT64	(1ULL << XFS_DIFLAG2_NREXT64_BIT)
+>  #define XFS_DIFLAG2_METADATA	(1ULL << XFS_DIFLAG2_METADATA_BIT)
+> +#define XFS_DIFLAG2_VERITY	(1ULL << XFS_DIFLAG2_VERITY_BIT)
+>  
+>  #define XFS_DIFLAG2_ANY \
+>  	(XFS_DIFLAG2_DAX | XFS_DIFLAG2_REFLINK | XFS_DIFLAG2_COWEXTSIZE | \
+> -	 XFS_DIFLAG2_BIGTIME | XFS_DIFLAG2_NREXT64 | XFS_DIFLAG2_METADATA)
+> +	 XFS_DIFLAG2_BIGTIME | XFS_DIFLAG2_NREXT64 | XFS_DIFLAG2_METADATA | \
+> +	 XFS_DIFLAG2_VERITY)
+
+[Severity: High]
+This is a pre-existing issue, but does the online scrub repair logic in
+fs/xfs/scrub/inode_repair.c:xrep_inode_flags() correctly handle corrupted
+flags?
+
+When an inode's flags are corrupted with unknown bits, the scrub repair
+logic attempts to clear them like this:
+
+fs/xfs/scrub/inode_repair.c:xrep_inode_flags() {
+    if (sc->ip->i_diflags & ~XFS_DIFLAG_ANY)
+        sc->ip->i_diflags &= ~XFS_DIFLAG_ANY;
+        
+    if (sc->ip->i_diflags2 & ~XFS_DIFLAG2_ANY)
+        sc->ip->i_diflags2 &= ~XFS_DIFLAG2_ANY;
+}
+
+Does this bitwise AND with the inverted mask destroy all valid flags
+while leaving the corruption intact?
+
+> diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+> --- a/fs/xfs/xfs_iops.c
+> +++ b/fs/xfs/xfs_iops.c
+
+[ ... ]
+
+> @@ -1398,12 +1398,15 @@ xfs_diflags_to_iflags(
+>  		flags |= S_NOATIME;
+>  	if (init && xfs_inode_should_enable_dax(ip))
+>  		flags |= S_DAX;
+> +	if (xflags & FS_XFLAG_VERITY)
+> +		flags |= S_VERITY;
+
+[Severity: Critical]
+Does setting S_VERITY here safely handle read operations?
+
+XFS does not yet initialize the fsverity_info structure via
+fsverity_file_open() or similar. The iomap buffered read path skips
+fsverity_verify_blocks() when this structure is missing, returning
+completely unverified data from the disk.
+
+Could an attacker who modifies the underlying block device have their
+tampered data served to userspace without detection, bypassing the
+integrity protection of fs-verity?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260721184346.416657-1-aalbersh@kernel.org?part=9
+

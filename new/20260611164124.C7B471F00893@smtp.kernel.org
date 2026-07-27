@@ -1,0 +1,128 @@
+From sashiko-bot@kernel.org Thu Jun 11 18:41:29 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5] btrfs: fix use-after-free on reloc root after error
+ in insert_dirty_subvol()
+Date: Thu, 11 Jun 2026 16:41:24 +0000
+Message-Id: <20260611164124.C7B471F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Missing smp_wmb() in merge_reloc_roots() success path allows a BUG_ON kernel panic during concurrent snapshot creation.
+- [High] Misplaced smp_rmb() in reloc_root_is_dead() combined with newly added clear_reloc_root() leads to NULL pointer dereference.
+--
+
+commit e640c09e4a056037decc7a53374d793829603486
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix use-after-free on reloc root after error in insert_dirty_subvol()
+
+This patch fixes a use-after-free issue during unmount by ensuring a
+root's reloc_root field is properly reset to NULL if an error occurs while
+trying to merge a reloc root.
+
+Link: https://lore.kernel.org/linux-btrfs/6a1ebde9.c1435f33.112120.0176.GAE@google.com/
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 3ebaf5880125f..f72fcc7577f03 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+> @@ -1449,6 +1449,17 @@ static int insert_dirty_subvol(struct btrfs_trans_handle *trans,
+>  	return 0;
+>  }
+>  
+> +static void clear_reloc_root(struct btrfs_root *root)
+> +{
+> +	root->reloc_root = NULL;
+> +	/*
+> +	 * Need barrier to ensure clear_bit() only happens after
+> +	 * root->reloc_root = NULL. Pairs with have_reloc_root().
+> +	 */
+> +	smp_wmb();
+> +	clear_bit(BTRFS_ROOT_DEAD_RELOC_TREE, &root->state);
+> +}
+> +
+
+[ ... ]
+
+> @@ -1853,13 +1858,32 @@ void merge_reloc_roots(struct reloc_control *rc)
+>  			}
+>  			ret = merge_reloc_root(rc, root);
+> -			btrfs_put_root(root);
+>  			if (ret) {
+> -				if (list_empty(&reloc_root->root_list))
+> +				/*
+> +				 * Clear the reloc root since below we will call
+> +				 * free_reloc_roots(), otherwise we leave
+> +				 * root->reloc_root pointing to a freed reloc
+> +				 * root and trigger a use-after-free during
+> +				 * unmount or elsewhere.
+> +				 */
+> +				clear_reloc_root(root);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does adding this
+clear_reloc_root() call here create a triggerable race window for
+concurrent snapshot operations?
+
+Looking at reloc_root_is_dead(), the smp_rmb() is placed before the
+test_bit(), which fails to provide the required ordering:
+
+fs/btrfs/relocation.c:reloc_root_is_dead() {
+    smp_rmb();
+    if (test_bit(BTRFS_ROOT_DEAD_RELOC_TREE, &root->state))
+        return true;
+}
+
+Because there is no barrier between the test_bit() load and the subsequent
+root->reloc_root load in have_reloc_root(), the CPU can reorder these
+loads.
+
+If have_reloc_root() races with this newly added clear_reloc_root(), the
+CPU might fetch the old, non-NULL root->reloc_root, then read the updated
+BTRFS_ROOT_DEAD_RELOC_TREE bit.
+
+Since rc->merge_reloc_tree is still true here, a racing
+btrfs_reloc_pre_snapshot() could return true from have_reloc_root(),
+proceed past the merge_reloc_tree check, and then re-read root->reloc_root
+as NULL, potentially causing a NULL pointer dereference.
+
+[Severity: High]
+This is also a pre-existing issue, but should the success path in
+merge_reloc_roots() be updated to use the new clear_reloc_root() helper
+as well?
+
+Currently, when btrfs_root_refs is 0, the success path in
+merge_reloc_roots() clears the reloc root manually without a memory
+barrier:
+
+fs/btrfs/relocation.c:merge_reloc_roots() {
+    ...
+    } else {
+        if (!IS_ERR(root)) {
+            if (root->reloc_root == reloc_root) {
+                root->reloc_root = NULL;
+                btrfs_put_root(reloc_root);
+            }
+            clear_bit(BTRFS_ROOT_DEAD_RELOC_TREE, &root->state);
+    ...
+}
+
+Because the CPU can reorder these writes, a concurrent
+btrfs_reloc_pre_snapshot() may observe the bit as cleared but still read
+the old, non-NULL root->reloc_root.
+
+This could lead to it dereferencing root->reloc_root and hitting a
+kernel panic because the orphan root has 0 refs.
+
+> +				btrfs_put_root(root);
+> +				/*
+> +				 * We are adding the reloc_root to the local
+> +				 * reloc_roots list, so we add a ref for this
+> +				 * list which will be dropped below by the call
+> +				 * to free_reloc_roots().
+> +				 */
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cf84f1a217c719e25b6b69e4298dd7afd36c9427.1781194426.git.fdmanana@suse.com?part=1
+

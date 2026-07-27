@@ -1,0 +1,101 @@
+From sashiko-bot@kernel.org Mon Jun  8 10:49:17 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: tree-checker: validate inode_ref and root_ref
+ name lengths
+Date: Mon, 08 Jun 2026 08:49:14 +0000
+Message-Id: <20260608084915.659DC1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Bypass of the tree-checker name length validation via blind key casting in btrfs_get_name()
+- [High] Incomplete validation of directory entry name lengths; INODE_EXTREF items are not bounded.
+--
+
+commit 4db0430416a7575f04b7f73dccd72c58fd009177
+Author: Weiming Shi <bestswngs@gmail.com>
+
+btrfs: tree-checker: validate inode_ref and root_ref name lengths
+
+This patch adds validation to the tree-checker to ensure that INODE_REF and
+ROOT_REF/ROOT_BACKREF item name lengths do not exceed BTRFS_NAME_LEN. It
+aims to prevent a stack out-of-bounds write in btrfs_get_name().
+
+>     For example btrfs_get_name(), used by the NFS/exportfs ->get_name op,
+>     copies the inode_ref/root_ref name into the caller's NAME_MAX + 1 byte
+>     stack buffer with no bound of its own, which a crafted leaf with
+>     name_len = 4096 overflows. It is reachable from a mounted untrusted
+>     btrfs image via open_by_handle_at(), and on btrfs exported over NFS:
+
+[Severity: Critical]
+This is a pre-existing issue, but does this fix fully prevent the crash in
+btrfs_get_name()?
+
+When resolving subvolume names (ino == BTRFS_FIRST_FREE_OBJECTID),
+btrfs_get_name() searches for a BTRFS_ROOT_BACKREF_KEY with offset -1.
+Because this key never exists exactly, btrfs_search_slot() returns > 0, and
+the code decrements path->slots[0]:
+
+fs/btrfs/export.c:btrfs_get_name() {
+    ...
+    if (ino == BTRFS_FIRST_FREE_OBJECTID)
+        path->slots[0]--;
+    ...
+    if (ino == BTRFS_FIRST_FREE_OBJECTID) {
+        rref = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_root_ref);
+        name_len = btrfs_root_ref_name_len(leaf, rref);
+    }
+    ...
+    read_extent_buffer(leaf, name, name_ptr, name_len);
+}
+
+If an attacker crafts a filesystem where the item at this decremented slot
+is a completely different key type (e.g., BTRFS_ROOT_ITEM_KEY), the
+maliciously placed item bypasses the tree-checker entirely, since the
+tree-checker only validates the name_len of actual ROOT_BACKREF items.
+
+The attacker-controlled data is then blindly cast to struct btrfs_root_ref,
+interpreted as a 16-bit name_len (up to 65535), and copied into the
+256-byte stack buffer name[NAME_MAX+1]. Doesn't this still trigger the exact
+stack-out-of-bounds KASAN panic this patch attempts to fix?
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 1f15d0793a9c9..95f36cce07e76 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+
+[ ... ]
+
+> @@ -1915,6 +1921,36 @@ static int check_inode_extref(struct extent_buffer *leaf,
+>  	return 0;
+>  }
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does check_inode_extref() also
+need bounding for the name length?
+
+The patch adds bounds checking (namelen <= BTRFS_NAME_LEN) for INODE_REF and
+ROOT_REF/ROOT_BACKREF items, but seems to entirely miss the equivalent check
+for INODE_EXTREF items in check_inode_extref():
+
+fs/btrfs/tree-checker.c:check_inode_extref() {
+    ...
+    namelen = btrfs_inode_extref_name_len(leaf, extref);
+    if (unlikely(ptr + sizeof(*extref) + namelen > end)) {
+        inode_ref_err(leaf, slot,
+            "inode extref overflow, ptr %lu end %lu namelen %u",
+            ptr, end, namelen);
+        return -EUCLEAN;
+    }
+    ...
+}
+
+An attacker could craft a filesystem with an INODE_EXTREF item containing an
+overly long name_len (up to the maximum item size, ~16KB), which bypasses
+the intended tree-checker protection. Could this trigger buffer overflows in
+downstream consumers that assume name lengths are strictly bounded to 255
+bytes?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260608083509.3907960-2-bestswngs@gmail.com?part=1
+

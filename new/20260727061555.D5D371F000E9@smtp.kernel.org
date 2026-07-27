@@ -1,0 +1,156 @@
+From sashiko-bot@kernel.org Mon Jul 27 08:16:06 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: trigger cow fixup via dirty_folio()
+Date: Mon, 27 Jul 2026 06:15:55 +0000
+Message-Id: <20260727061555.D5D371F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] Partially uptodate subpage folios are incorrectly handled in btrfs_folio_set_fixup_dirty(), leading to an empty dirty bitmap and -EUCLEAN during writeback.
+- [High] Unsafe use of ihold() during writeback can trigger VFS_BUG_ON_INODE and Use-After-Free.
+- [High] Concurrent lockless dirtying triggers a spurious -EUCLEAN failure and aborts writeback.
+- [High] TOCTOU race in btrfs_folio_set_fixup_dirty leads to a permanent space leak in production builds.
+--
+
+--- Patch [1]: [PATCH v2] btrfs: trigger cow fixup via dirty_folio() ---
+commit 3057c7c2fbee21fb7a27c697d16040507f5bc017
+Author: Boris Burkov <boris@bur.io>
+Subject: btrfs: trigger cow fixup via dirty_folio()
+
+This commit reintroduces the COW fixup mechanism for folios dirtied without
+a space reservation, adding support for subpage block sizes. It intercepts
+out-of-band dirtying to mark blocks for fixup and queues an async worker to
+reserve space before writeback proceeds.
+
+Link: https://lore.kernel.org/linux-btrfs/20260721191152.101118-1-borntraeger@linux.ibm.com/
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+[ ... ]
+> @@ -1492,6 +1601,10 @@ static noinline_for_stack int writepage_delalloc(struct btrfs_inode *inode,
+>  	/* Save the dirty bitmap as our submission bitmap will be a subset of it. */
+>  	btrfs_copy_subpage_dirty_bitmap(fs_info, folio, bio_ctrl->submit_bitmap);
+>  
+> +	ret = writepage_fixup(inode, folio, bio_ctrl);
+
+[Severity: High]
+Does this sequence leave a race window during writeback?
+
+If a concurrent out-of-band dirty operation (like zap_pte_range() locklessly
+calling set_page_dirty()) occurs after btrfs_copy_subpage_dirty_bitmap()
+but before writepage_fixup(), it will set the folio's dirty bit and the
+fixup_pending flag.
+
+When writepage_fixup() runs, it will see the fixup_pending flag is set, but
+since it iterates over the stale bio_ctrl->submit_bitmap snapshot, it won't
+find any bits requiring fixup. This falls through to the failure path, prints
+a warning, and returns -EUCLEAN, spuriously aborting writeback.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -2812,6 +2812,163 @@ int btrfs_set_extent_delalloc(struct btrfs_inode *inode, u64 start, u64 end,
+[ ... ]
+> +static void btrfs_writepage_fixup_worker(struct btrfs_work *work)
+> +{
+[ ... ]
+> +		/*
+> +		 * Any task that sets EXTENT_DELALLOC clears the fixup bits
+> +		 * under the folio lock, so it should be impossible to observe
+> +		 * both under the lock. Setting delalloc twice would wrongly
+> +		 * double account the space.
+> +		 */
+> +		if (IS_ENABLED(CONFIG_BTRFS_DEBUG) &&
+> +		    unlikely(btrfs_test_range_bit_exists(&inode->io_tree, start,
+> +							 start + sectorsize - 1,
+> +							 EXTENT_DELALLOC))) {
+> +			DEBUG_WARN("fixup worker: delalloc and fixup conflict. ino %llu start %llu",
+> +				   btrfs_ino(inode), start);
+> +			btrfs_folio_clear_fixup(fs_info, folio, start, sectorsize);
+> +			continue;
+> +		}
+
+[Severity: High]
+Can this lead to a permanent space reservation leak in production kernels?
+
+The collision resolution logic here clears the fixup bit when it detects both
+EXTENT_DELALLOC and fixup are set. However, it is guarded by
+IS_ENABLED(CONFIG_BTRFS_DEBUG), which is compiled out in production builds.
+
+If a reserving write races with the lockless folio_test_dirty() check in
+btrfs_folio_set_fixup_dirty() for non-subpage folios, it can incorrectly set
+fixup_pending on a folio that already has EXTENT_DELALLOC.
+
+When that happens in a production kernel, the collision check is skipped, and
+the worker proceeds to set the bit in delalloc_bitmap. At the end of the
+worker function, it will skip releasing the space it reserved for this block,
+permanently double-accounting and leaking the reserved space.
+
+[ ... ]
+> +int btrfs_queue_writepage_fixup(struct btrfs_inode *inode, struct folio *folio)
+> +{
+> +	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+> +	struct btrfs_writepage_fixup *fixup;
+> +
+> +	fixup = kzalloc_obj(*fixup, GFP_NOFS);
+> +	if (!fixup)
+> +		return -ENOMEM;
+> +
+> +	/*
+> +	 * The worker's space reservation happens outside the folio lock, and
+> +	 * folio->mapping cannot be trusted outside of it. Pin the inode
+> +	 * alongside the folio.
+> +	 */
+> +	ihold(&inode->vfs_inode);
+
+[Severity: High]
+Is it safe to use ihold() on the inode here?
+
+Background writeback frequently operates on inodes residing on the LRU list
+with an i_count of 0 (protected by I_SYNC).
+
+Calling ihold() directly on an inode with a zero reference count will trigger
+VFS_BUG_ON_INODE. If assertions are disabled, it un-safely increments the
+count to 1. When the fixup worker completes, btrfs_add_delayed_iput() will
+drop the count back to 0, prematurely freeing the inode while the writeback
+thread might still be operating on it.
+
+[ ... ]
+> @@ -10548,6 +10711,31 @@ static const struct file_operations btrfs_dir_file_operations = {
+[ ... ]
+> +static bool btrfs_data_dirty_folio(struct address_space *mapping,
+> +				   struct folio *folio)
+> +{
+> +	struct btrfs_inode *inode = BTRFS_I(mapping->host);
+> +	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+> +	const u64 page_start = folio_pos(folio);
+> +	const u64 range_end = min_t(u64, folio_next_pos(folio),
+> +				    round_up(i_size_read(&inode->vfs_inode),
+> +					     fs_info->sectorsize));
+> +
+> +	if (range_end > page_start)
+> +		btrfs_folio_set_fixup_dirty(fs_info, folio, page_start,
+> +					    range_end - page_start);
+> +	return filemap_dirty_folio(mapping, folio);
+> +}
+
+[Severity: High]
+Could this cause writeback to fail with -EUCLEAN for partially uptodate
+subpage folios?
+
+If an out-of-band dirtying path (like a DIO read) dirties a subpage folio
+that is only partially uptodate, btrfs_folio_set_fixup_dirty() will bail out
+early because folio_test_uptodate() is false. The master PG_uptodate flag
+is only set when the entire subpage folio is uptodate.
+
+However, filemap_dirty_folio() is then unconditionally called, setting the
+master PG_dirty flag.
+
+During writeback, writepage_delalloc() copies an empty subpage dirty bitmap.
+Then, writepage_fixup() sees the folio is dirty but has an empty
+submit_bitmap, causing it to fail its sanity check and return -EUCLEAN.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/9f7a81cdd022d9e3f69d347a17c0a25438ccec14.1785131713.git.boris@bur.io?part=1
+

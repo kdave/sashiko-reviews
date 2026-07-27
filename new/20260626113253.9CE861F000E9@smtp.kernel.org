@@ -1,0 +1,68 @@
+From sashiko-bot@kernel.org Fri Jun 26 13:32:58 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: add EM_WARN_ON_ONCE() to dump the extent map on
+ a warning
+Date: Fri, 26 Jun 2026 11:32:53 +0000
+Message-Id: <20260626113253.9CE861F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] The `EM_WARN_ON_ONCE` macro updates its rate-limiting flag `__warned` after calling the slow `btrfs_dump_extent_map()` function, leaving a wide race window where multiple threads can concurrently spam the logs.
+--
+
+commit f93c19a76de7204d370f2745021c3272c39d8ed0
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: add EM_WARN_ON_ONCE() to dump the extent map on a warning
+
+This commit adds an EM_WARN_ON_ONCE macro and a btrfs_dump_extent_map helper.
+These allow the kernel to dump the geometry, flags, refcount, and list/tree
+membership of an offending extent map before triggering a warning and stack
+trace.
+
+> diff --git a/fs/btrfs/extent_map.h b/fs/btrfs/extent_map.h
+> index 6f685f3c93272..1d2efd4a56655 100644
+> --- a/fs/btrfs/extent_map.h
+> +++ b/fs/btrfs/extent_map.h
+
+[ ... ]
+
+> @@ -175,6 +177,26 @@ int btrfs_split_extent_map(struct btrfs_inode *inode, u64 start, u64 len, u64 pr
+>  
+>  struct extent_map *btrfs_alloc_extent_map(void);
+>  void btrfs_free_extent_map(struct extent_map *em);
+> +void btrfs_dump_extent_map(const struct extent_map *em, const char *prefix);
+> +
+> +/*
+> + * Warn once about a condition involving an extent map, dumping the offending
+> + * map's contents (geometry, flags, refcount and list/tree membership) before
+> + * the warning and stack trace, much like VM_WARN_ON_ONCE_FOLIO() does for
+> + * folios.
+> + */
+> +#define EM_WARN_ON_ONCE(cond, em) ({					\
+> +	static bool __section(".data..once") __warned;			\
+> +	int __ret_warn_once = !!(cond);					\
+> +									\
+> +	if (unlikely(__ret_warn_once && !__warned)) {			\
+> +		btrfs_dump_extent_map((em),				\
+> +			"EM_WARN_ON_ONCE(" __stringify(cond) ")");	\
+> +		__warned = true;					\
+> +		WARN_ON(1);						\
+> +	}								\
+> +	unlikely(__ret_warn_once);					\
+> +})
+
+[Severity: Medium]
+Could multiple threads concurrently hitting this condition evaluate !__warned
+as true and race through this block before the __warned flag is updated?
+
+Setting the rate-limiting flag after the btrfs_dump_extent_map call leaves a
+wide race window because the dump involves multiple log print operations.
+If multiple threads enter the block simultaneously, the intended rate limiting
+could be defeated, resulting in duplicate log spam.
+
+Should __warned = true be moved before calling the dump function, similar to
+how the VM_WARN_ON_ONCE_FOLIO macro handles its warning flags?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260626-em-warn-on-dump-v1-1-365600d9473c@kernel.org?part=1
+

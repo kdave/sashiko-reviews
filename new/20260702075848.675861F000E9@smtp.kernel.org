@@ -1,0 +1,32 @@
+From sashiko-bot@kernel.org Thu Jul  2 09:58:50 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/3] btrfs: use a shared helper to calculate data
+ checksum for a bio
+Date: Thu, 02 Jul 2026 07:58:47 +0000
+Message-Id: <20260702075848.675861F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] The patch is completely missing the error message formatting changes described in the commit message.
+--
+
+commit 58440ede90e2114c07cff17ca648a8ee0c67bd2b
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: use a shared helper to calculate data checksum for a bio
+
+This patch extracts the generation part of data checksum calculation into
+btrfs_bio_gen_data_csum(), replacing the paddrs[] array based solution
+in csum_one_bio() to reduce on-stack memory usage.
+
+> Since we're here, also slightly change the error message to mention the
+> rootid number, also for metadata inode, use btree inode for root/ino
+> output.
+
+[Severity: Medium]
+I don't see any changes to error messages (such as btrfs_print_data_csum_error
+in fs/btrfs/inode.c) in the diff. Was this part of the patch split out into a
+different commit while leaving the commit message unchanged?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1782977445.git.wqu@suse.com?part=3
+

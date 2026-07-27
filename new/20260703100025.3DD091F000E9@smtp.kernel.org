@@ -1,0 +1,84 @@
+From sashiko-bot@kernel.org Fri Jul  3 12:08:30 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 2/3] btrfs: add "rescue=usebackuproot" into
+ "rescue=all" shortcut
+Date: Fri, 03 Jul 2026 10:00:24 +0000
+Message-Id: <20260703100025.3DD091F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Multiple rescue options are formatted with colons in `/proc/mounts`, which the VFS mount API cannot parse, breaking remounts.
+- [High] Adding `USEBACKUPROOT` to `rescue=all` fails to recover corrupted sub-trees because `IGNOREBADROOTS` masks the errors and short-circuits the fallback.
+--
+
+commit 440083cb61c8fa91b225d380d34ccbe8fc60ad6c
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: add "rescue=usebackuproot" into "rescue=all" shortcut
+
+The mount option "rescue=all" should be a shortcut to include all
+"rescue=" mount options. But unfortunately "rescue=usebackuproot" is not
+included.
+
+Include that option so "rescue=all" has a better chance to mount a
+corrupted fs.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index bbb841f590528..bb091dc011881 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+> @@ -619,6 +619,7 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+>  			btrfs_set_opt(ctx->mount_opt, IGNORESUPERFLAGS);
+>  			btrfs_set_opt(ctx->mount_opt, IGNOREBADROOTS);
+>  			btrfs_set_opt(ctx->mount_opt, NOLOGREPLAY);
+> +			btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but adding USEBACKUPROOT to 
+rescue=all combines it with IGNOREBADROOTS, which appears to mask sub-tree 
+load failures.
+
+In fs/btrfs/disk-io.c:load_global_roots_objectid():
+
+	if (!btrfs_test_opt(fs_info, IGNOREBADROOTS))
+		ret = ret ? ret : -ENOENT;
+	else
+		ret = 0;
+
+If ret is 0, then in fs/btrfs/disk-io.c:init_tree_roots():
+
+	ret = btrfs_read_roots(fs_info);
+	if (ret < 0) {
+		handle_error = true;
+		continue;
+	}
+
+Does this short-circuit the USEBACKUPROOT fallback? If a global sub-tree is
+corrupted, will IGNOREBADROOTS cause us to skip the backup root entirely and
+mount in a severely degraded state instead of utilizing the fallback?
+
+[Severity: High]
+This is a pre-existing issue, but does adding more options to rescue=all
+exacerbate a problem with remounting?
+
+When mounting with multiple rescue options (like rescue=all),
+fs/btrfs/super.c:print_rescue_option() formats them with colons:
+
+	seq_printf(seq, "%s%s", (*printed) ? ":" : ",rescue=", s);
+
+This populates /proc/mounts with a colon-separated list like
+rescue=nologreplay:usebackuproot.
+
+During a remount, the mount operation reads this string and passes it to the
+kernel. The VFS mount API parse logic for Opt_rescue expects an exact string 
+match and cannot tokenize colon-separated lists. Will this cause remount
+operations (e.g. mount -o remount,ro /mnt) to fail with -EINVAL?
+
+>  			break;
+>  		default:
+>  			btrfs_info(NULL, "unrecognized rescue option '%s'",
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783071857.git.wqu@suse.com?part=2
+

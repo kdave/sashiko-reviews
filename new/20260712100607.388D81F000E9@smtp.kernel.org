@@ -1,0 +1,112 @@
+From sashiko-bot@kernel.org Sun Jul 12 12:06:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: add a new regression test for RAID56
+ RWM
+Date: Sun, 12 Jul 2026 10:06:06 +0000
+Message-Id: <20260712100607.388D81F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Medium] The test writes 64K to physically corrupt `file2`, which is only 32K long and starts at the midpoint of the 64K data stripe, causing an unintended overwrite of the subsequent physical block on the device.
+- [Medium] Missing layout validation for `file2` and `file3`, which could lead to false test passes.
+- [Low] Redundant call to `_require_scratch_dev_pool 3`.
+--
+
+--- Patch [1]: [PATCH] fstests: btrfs: add a new regression test for RAID56 RWM ---
+commit e40db14f0b842dfc72476c91bfd7c9f266cd2eb7
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a new regression test for RAID56 RWM
+
+This commit adds a new regression test for a btrfs RAID56 RMW issue where
+data checksum verification can be incorrectly skipped. It sets up a specific
+full stripe layout, corrupts a data stripe, and triggers a new write to
+test the Read-Modify-Write behavior.
+
+> diff --git a/tests/btrfs/352 b/tests/btrfs/352
+> new file mode 100755
+> index 0000000000000..435a3ec7433f2
+> --- /dev/null
+> +++ b/tests/btrfs/352
+> @@ -0,0 +1,103 @@
+
+[ ... ]
+
+> +_require_btrfs_support_sectorsize 4096
+> +_require_scratch_dev_pool 3
+> +
+> +_fixed_by_kernel_commit xxxxxxxxxxxx \
+> +	"btrfs: raid56: fix an incorrect csum skip during rmw"
+> +
+> +_require_non_zoned_device "${SCRATCH_DEV}"
+> +_require_scratch_dev_pool 3
+
+[Severity: Low]
+Is this second call to _require_scratch_dev_pool necessary?
+
+It appears to duplicate the requirement check performed just a few lines
+earlier.
+
+[ ... ]
+
+> +$XFS_IO_PROG -f -c "pwrite -S 0xdc 0 32K" -c sync \
+> +	$SCRATCH_MNT/file2 >> $seqres.full
+> +
+> +logical=$(_btrfs_get_first_logical $SCRATCH_MNT/file2)
+> +
+> +# Corrupt the data stripe which has checksum
+
+[Severity: Medium]
+Should we verify the logical address of file2 against the expected layout?
+
+The test mechanics rely on file1 and file2 being packed precisely into the
+same RAID5 full stripe. If filesystem fragmentation or internal allocation
+differences cause file2 to be placed elsewhere, wouldn't that mask the
+kernel bug and produce a false pass?
+
+Could we check if the logical address matches the expected offset
+(chunk_logical + 32K) here?
+
+> +physical_d=$(_btrfs_get_physical ${logical} 1)
+> +devpath_d=$(_btrfs_get_device_path ${logical} 1)
+> +
+> +_scratch_unmount
+> +
+> +echo "Corrupt data stripe at devpath $devpath_d physical $physical_d" \
+> +	>> $seqres.full
+> +$XFS_IO_PROG -c "pwrite -S 0x00 $physical_d 64K" -c sync $devpath_d \
+> +	>> $seqres.full
+
+[Severity: Medium]
+Does this overwrite cross the expected data stripe boundary?
+
+The script writes 64K to physically corrupt file2, but file2 is only 32K
+long and starts at the midpoint of the 64K data stripe.
+
+Could this unintentionally overwrite the subsequent physical block on the
+device, potentially hitting metadata or other stripes and causing the test
+to fail for unrelated reasons?
+
+> +
+> +$BTRFS_UTIL_PROG check --check-data-csum $SCRATCH_DEV >> $seqres.full 2>&1
+> +_scratch_mount -o space_cache=v2,datasum
+> +
+> +# Do a write that updates part of the stripe. This requires RMW, and
+> +# with unpatched kernel, the csum verification will be skipped and generate
+> +# parity using the corrupted data.
+> +$XFS_IO_PROG -f -c "pwrite -S 0x42 0 64K" $SCRATCH_MNT/file3 -c sync \
+> +	>> $seqres.full
+
+[Severity: Medium]
+Are we certain file3 is written to the expected contiguous space?
+
+Like file2, if file3 is allocated elsewhere, writing it might not trigger
+the intended Read-Modify-Write cycle on the corrupted stripe.
+
+Would it make sense to fetch and verify the logical address of file3
+to ensure it resides in the same full stripe (chunk_logical + 64K)?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260712095759.183211-1-wqu@suse.com?part=1
+

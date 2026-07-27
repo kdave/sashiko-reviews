@@ -1,0 +1,68 @@
+From sashiko-bot@kernel.org Fri Jul  3 11:02:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/3] btrfs: add "rescue=usebackuproot" into forced
+ read-only options
+Date: Fri, 03 Jul 2026 09:02:16 +0000
+Message-Id: <20260703090216.946691F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Forcing an initial RO mount for 'usebackuproot' disables automatic space cache clearing, leading to severe tree corruption on RW remount.
+--
+
+commit 53b22570fd000364574d1f9b51141f9b51a7669c
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: add "rescue=usebackuproot" into forced read-only options
+
+This commit enforces that the "usebackuproot" mount option requires a
+read-only mount. This unifies its behavior with other rescue options as
+documented in the btrfs(5) man page.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index a7d804219bec3..6d429055c79a2 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+> @@ -691,7 +691,8 @@ bool btrfs_check_options(const struct btrfs_fs_info *info,
+>  	bool ret = true;
+>  
+>  	if (!(flags & SB_RDONLY) &&
+> -	    (check_ro_option(info, *mount_opt, BTRFS_MOUNT_NOLOGREPLAY, "nologreplay") ||
+> +	    (check_ro_option(info, *mount_opt, BTRFS_MOUNT_USEBACKUPROOT, "usebackuproot") ||
+> +	     check_ro_option(info, *mount_opt, BTRFS_MOUNT_NOLOGREPLAY, "nologreplay") ||
+
+[Severity: Critical]
+Does forcing an initial read-only mount for 'usebackuproot' prevent the space
+cache from being cleared upon a later read-write remount?
+
+The 'usebackuproot' option is intended to clear the space cache because the
+on-disk cache is untrusted when rolling back to an older tree root (the legacy
+option explicitly sets CLEAR_CACHE). 
+
+Prior to this patch, mounting read-write directly allowed
+btrfs_start_pre_rw_mount() to see the CLEAR_CACHE flag and safely invalidate
+the space tree before writes occurred. 
+
+By forcing 'usebackuproot' to be mounted read-only, btrfs_start_pre_rw_mount()
+is bypassed during the initial mount. Immediately after, oneshot options are
+cleared:
+
+btrfs_clear_oneshot_options() {
+        ...
+        btrfs_clear_opt(fs_info->mount_opt, CLEAR_CACHE);
+        ...
+}
+
+When the filesystem is subsequently remounted read-write to perform repairs,
+the CLEAR_CACHE flag is already gone. The cache is never cleared, and the
+filesystem could begin allocating blocks using an untrusted space cache,
+overwriting valid blocks.
+
+While a subsequent patch in this series removes the legacy option, the modern
+'rescue=usebackuproot' option fails to set CLEAR_CACHE at all. This patch
+ensures that even if 'rescue=usebackuproot' is fixed to properly set
+CLEAR_CACHE, the forced read-only requirement structurally guarantees the flag
+will be stripped before a read-write remount can act on it.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783068013.git.wqu@suse.com?part=1
+

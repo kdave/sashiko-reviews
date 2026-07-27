@@ -1,0 +1,115 @@
+From sashiko-bot@kernel.org Fri Jun 12 12:19:24 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 3/4] iomap: reject NOWAIT and BOUNCE direct IOs
+Date: Fri, 12 Jun 2026 10:19:17 +0000
+Message-Id: <20260612101917.C2B2A1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Non-bounced NOWAIT direct I/O can sleep during memory allocation because GFP_KERNEL is used.
+- [High] iomap direct I/O does not set the REQ_NOWAIT flag on bios unless IOCB_HIPRI is set.
+- [High] The error code from `iomap_dio_bio_iter_one` is lost if sub-block tail zeroing occurs.
+--
+
+commit b25fad2629d7fd091a928ae66e96e8ebb07cbc36
+Author: Qu Wenruo <wqu@suse.com>
+Date:   Fri Jun 12 09:51:14 2026 +0000
+
+    iomap: reject NOWAIT and BOUNCE direct IOs
+    
+    If a direct IO requires bounced pages for stable buffer, it will always
+    allocate memory, and both bio_iov_iter_bounce_write() and
+    bio_iov_iter_bounce_read() are allocating pages using GFP_KERNEL, which
+    can sleep and break NOWAIT requirement.
+    
+    So we need to reject such NOWAIT and BOUNCE direct IO in
+    iomap_dio_bio_iter().
+    
+    Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+> diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c
+> index b36ee619cdcdd..d1601122f0b56 100644
+> --- a/fs/iomap/direct-io.c
+> +++ b/fs/iomap/direct-io.c
+> @@ -412,6 +412,10 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+>  	unsigned int alignment;
+>  	ssize_t ret = 0;
+>  
+> +	/* Bounced direct IO will need to allocate memory, breaking NOWAIT flag. */
+> +	if (unlikely(iter->flags & IOMAP_NOWAIT && dio->flags & IOMAP_DIO_BOUNCE))
+> +		return -EAGAIN;
+> +
+
+[Severity: High]
+This isn't a bug introduced by this patch, but while we are addressing NOWAIT
+direct I/O, does the bio allocation still risk sleeping?
+
+In iomap_dio_alloc_bio(), we unconditionally use GFP_KERNEL:
+
+fs/iomap/direct-io.c:iomap_dio_alloc_bio() {
+    ...
+    return bio_alloc(iter->iomap.bdev, nr_vecs, opf, GFP_KERNEL);
+}
+
+Similarly, in iomap_dio_bio_iter_one(), fscrypt context allocation uses
+GFP_KERNEL:
+
+    fscrypt_set_bio_crypt_ctx(bio, iter->inode, pos, GFP_KERNEL);
+
+Since GFP_KERNEL includes __GFP_DIRECT_RECLAIM, won't these memory
+allocations block waiting for direct reclaim if the memory pool is
+exhausted, thereby breaking the non-blocking guarantee of IOMAP_NOWAIT?
+
+[Severity: High]
+This is a pre-existing issue, but I noticed the bio operational flags
+might be missing REQ_NOWAIT for non-polled requests.
+
+In iomap_dio_bio_iter(), bio_opf is initialized without REQ_NOWAIT:
+
+    blk_opf_t bio_opf = REQ_SYNC | REQ_IDLE;
+
+And the only place where REQ_NOWAIT seems to be conditionally added is for
+polled requests in iomap_dio_submit_bio():
+
+    if ((iocb->ki_flags & IOCB_HIPRI) && !is_sync_kiocb(iocb)) {
+        bio_set_polled(bio, iocb);
+    }
+
+If IOMAP_NOWAIT is specified but polling is not requested (!IOCB_HIPRI),
+does iomap fail to add the REQ_NOWAIT flag to the bio? Could this cause
+the block layer to sleep waiting for tags or hardware queues to drain?
+
+[Severity: High]
+This is also a pre-existing issue, but does the error handling during
+tail zeroing overwrite the error code?
+
+If iomap_dio_bio_iter_one() returns a negative error code like -ENOMEM,
+the loop breaks:
+
+    ret = iomap_dio_bio_iter_one(iter, dio, pos, alignment, bio_opf);
+    if (unlikely(ret < 0)) {
+        break;
+    }
+
+Then, if tail zeroing is required, iomap_dio_zero() is called:
+
+    if (need_zeroout || ...) {
+        pad = pos & (fs_block_size - 1);
+        if (pad)
+            ret = iomap_dio_zero(iter, dio, pos, fs_block_size - pad);
+    }
+
+If iomap_dio_zero() succeeds and returns 0, won't it overwrite the original
+error code stored in ret? If the failure occurred on the first iteration,
+could the function silently return 0 instead of accurately reporting the
+error?
+
+>  	/*
+>  	 * File systems that write out of place and always allocate new blocks
+>  	 * need each bio to be block aligned as that's the unit of allocation.
+>  	 */
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1781253428.git.wqu@suse.com?part=3
+

@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Tue Jul  7 13:44:27 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] fstests: generic: add a basic cachestat test case
+Date: Tue, 07 Jul 2026 11:44:23 +0000
+Message-Id: <20260707114424.2E9A61F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Unsafe bash integer comparison skips explicit failure logic if command output is empty.
+--
+
+--- Patch [1]: [PATCH v2] fstests: generic: add a basic cachestat test case ---
+commit 3db545a8aad0da41c30e8ed97dda217d47b6fab7
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: generic: add a basic cachestat test case
+
+This commit adds a test case inspired by LTP to test cachestat() after an
+fsync(). It verifies that dirty pages are reported as 0 and cached pages
+remain the same.
+
+Link: https://bugzilla.suse.com/show_bug.cgi?id=1270397
+
+> diff --git a/tests/generic/798 b/tests/generic/798
+> new file mode 100755
+> index 0000000000000..8888f6a3bbbcb
+> --- /dev/null
+> +++ b/tests/generic/798
+
+[ ... ]
+
+> +	# Basic cached number reporting
+> +	$XFS_IO_PROG -f -c "pwrite -b $pagesize 0 $size" \
+> +		$SCRATCH_MNT/foobar >> $seqres.full
+> +	$XFS_IO_PROG -c "cachestat 0 $size" $SCRATCH_MNT/foobar > $tmp.output
+> +	cat $tmp.output >> $seqres.full
+> +	cached=$(cat $tmp.output | cut -f1 -d, | $AWK_PROG '{print $2}')
+> +	dirtied=$(cat $tmp.output | cut -f2 -d, | $AWK_PROG '{print $2}')
+> +
+> +	if [ "$cached" -ne "$num_page" ]; then
+
+[Severity: Medium]
+What happens if the cachestat command fails and $cached or $dirtied end up
+as empty strings?
+
+Evaluating [ "" -ne "$num_page" ] will cause a bash syntax error ("integer
+expression expected") and skip the _fail block entirely, bypassing the
+explicit failure logic. 
+
+While xfstests might catch the unexpected stderr output, this breaks the script's
+intended control flow and masks the actual root cause of the failure.
+
+> +		_fail "cached not matching the page number"
+> +	fi
+> +
+> +	if [ "$cached" -ne "$dirtied" ]; then
+> +		_fail "dirtied not matching the page number"
+> +	fi
+> +	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foobar
+> +
+> +	# Test dirty page number reporting after a fsync.
+> +	$XFS_IO_PROG -c "cachestat 0 $size" $SCRATCH_MNT/foobar > $tmp.output
+> +	cat $tmp.output >> $seqres.full
+> +	_scratch_unmount
+> +	cached=$(cat $tmp.output | cut -f1 -d, | $AWK_PROG '{print $2}')
+> +	dirtied=$(cat $tmp.output | cut -f2 -d, | $AWK_PROG '{print $2}')
+> +
+> +	if [ "$cached" -ne "$num_page" ]; then
+
+[Severity: Medium]
+Will this evaluation also suffer from the same bash syntax error if $cached
+or $dirtied is empty after the fsync and unmount?
+
+> +		_fail "cached not matching the page number"
+> +	fi
+> +	if [ "$dirtied" -ne 0 ]; then
+> +		_fail "dirtied pages not zero"
+> +	fi
+> +done
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260707113454.120001-1-wqu@suse.com?part=1
+

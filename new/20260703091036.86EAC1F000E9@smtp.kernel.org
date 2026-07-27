@@ -1,0 +1,102 @@
+From sashiko-bot@kernel.org Fri Jul  3 11:32:52 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: reset active_meta_bg on zone finish
+Date: Fri, 03 Jul 2026 09:10:36 +0000
+Message-Id: <20260703091036.86EAC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] The patch introduces a Use-After-Free and ABA Double Free vulnerability by moving the `*active_bg` reference drop into `do_zone_finish()` while `check_bg_is_active()` relies on it lockless.
+--
+
+commit bf94efd4afe46e1722914c7ae9760dfaceee2f76
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: reset active_meta_bg on zone finish
+
+do_zone_finish() clears BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE and removes the
+block group from zone_active_bgs, but only the path in check_bg_is_active()
+resets fs_info->active_meta_bg / active_system_bg. Any other finish path
+leaves active_meta_bg / active_system_bg pointing at an inactive, fully
+written block group. This patch resets the corresponding active_meta_bg and
+active_system_bg pointers in do_zone_finish() so they can never go stale.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 97f06dd016932..23f7d862c590d 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> @@ -2632,6 +2633,20 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+>  	/* For active_bg_list */
+>  	btrfs_put_block_group(block_group);
+>  
+> +	if (block_group->flags & BTRFS_BLOCK_GROUP_SYSTEM)
+> +		active_bg = &fs_info->active_system_bg;
+> +	else if (block_group->flags & BTRFS_BLOCK_GROUP_METADATA)
+> +		active_bg = &fs_info->active_meta_bg;
+> +
+> +	if (active_bg) {
+> +		btrfs_zoned_meta_io_lock(fs_info);
+> +		if (*active_bg == block_group) {
+> +			btrfs_put_block_group(block_group);
+> +			*active_bg = NULL;
+> +		}
+> +		btrfs_zoned_meta_io_unlock(fs_info);
+> +	}
+> +
+
+[Severity: High]
+Could this result in a use-after-free in check_bg_is_active()?
+
+Looking at check_bg_is_active(), it borrows *active_bg into a local variable
+without taking its own reference, and then drops the lock:
+
+fs/btrfs/zoned.c:check_bg_is_active() {
+    ...
+    struct btrfs_block_group *tgt = *active_bg;
+    ...
+    btrfs_zoned_meta_io_unlock(fs_info);
+    wait_eb_writebacks(tgt);
+    ...
+}
+
+If a concurrent thread calls do_zone_finish(tgt) before wait_eb_writebacks()
+completes, it will now drop the *active_bg reference:
+
+Thread 1: check_bg_is_active()
+    tgt = *active_bg;
+    btrfs_zoned_meta_io_unlock(fs_info);
+
+Thread 2: do_zone_finish(tgt)
+    if (*active_bg == block_group) {
+        btrfs_put_block_group(block_group); // Last reference dropped
+        *active_bg = NULL;
+    }
+
+Thread 1: check_bg_is_active()
+    wait_eb_writebacks(tgt); // UAF on tgt
+
+Additionally, is there a risk of an ABA double-free here?
+
+fs/btrfs/zoned.c:check_bg_is_active() {
+    ...
+    do_zone_finish(tgt, true);
+    btrfs_zoned_meta_io_lock(fs_info);
+    if (*active_bg == tgt) {
+        btrfs_put_block_group(tgt);
+        *active_bg = NULL;
+    }
+    ...
+}
+
+Since do_zone_finish() now drops the reference and sets *active_bg to NULL,
+the check (*active_bg == tgt) will normally fail. However, if tgt was freed
+and a new block group was allocated at the same memory address and set as
+*active_bg, would this incorrectly drop the new block group's reference?
+
+>  	clear_and_wake_up_bit(BTRFS_FS_NEED_ZONE_FINISH, &fs_info->flags);
+>  
+>  	return 0;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260703084559.136605-1-johannes.thumshirn@wdc.com?part=1
+

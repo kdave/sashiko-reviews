@@ -1,0 +1,77 @@
+From sashiko-bot@kernel.org Tue Jun 16 14:02:28 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/7] btrfs: drain replace writes before freeing the
+ target on start failure
+Date: Tue, 16 Jun 2026 12:02:14 +0000
+Message-Id: <20260616120214.D18891F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] The patch attempts to fix a use-after-free on `tgt_device` by draining in-flight bios before freeing the device, but the fix is incomplete because Btrfs's I/O completion path decrements `bio_counter` before it finishes accessing the device.
+--
+
+commit 7db692e980df4dd29324d551c73013f105ba552c
+Author: Christian Brauner <brauner@kernel.org>
+
+    btrfs: drain replace writes before freeing the target on start failure
+
+This commit fixes a use-after-free by draining in-flight bios before freeing
+the target device during a btrfs_dev_replace_start() failure. It adds calls
+to btrfs_rm_dev_replace_blocked() and btrfs_rm_dev_replace_unblocked() to
+wait for bio_counter to reach zero before device destruction.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 318ddb7904292..51665ed09798a 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+
+[ ... ]
+
+> @@ -690,7 +692,11 @@ static int btrfs_dev_replace_start(struct btrfs_fs_info *fs_info,
+>  		dev_replace->srcdev = NULL;
+>  		dev_replace->tgtdev = NULL;
+>  		up_write(&dev_replace->rwsem);
+> -		goto leave;
+> +		/* Drain writes already duplicated to tgtdev before freeing it. */
+> +		btrfs_rm_dev_replace_blocked(fs_info);
+> +		btrfs_destroy_dev_replace_tgtdev(tgt_device);
+> +		btrfs_rm_dev_replace_unblocked(fs_info);
+> +		return ret;
+>  	}
+>  
+>  	ret = btrfs_commit_transaction(trans);
+
+[Severity: Critical]
+This is a pre-existing issue, but does this completely prevent the
+use-after-free?
+
+Looking at fs/btrfs/bio.c:orig_write_end_io_work(), the bio_counter is
+decremented before the device is accessed:
+
+fs/btrfs/bio.c:orig_write_end_io_work() {
+    ...
+	btrfs_bio_counter_dec(bioc->fs_info);
+
+	if (bio->bi_status) {
+		atomic_inc(&bioc->error);
+		btrfs_log_dev_io_error(bio, stripe->dev);
+	}
+    ...
+}
+
+If bio_counter drops to zero here, btrfs_rm_dev_replace_blocked() will unblock
+and btrfs_destroy_dev_replace_tgtdev() can free the target device while the
+workqueue thread is still inside orig_write_end_io_work() and about to call
+btrfs_log_dev_io_error(bio, stripe->dev).
+
+Since orig_write_end_io_work() runs in a workqueue, the synchronize_rcu() inside
+btrfs_destroy_dev_replace_tgtdev() wouldn't wait for it to finish, leaving a
+window where stripe->dev is accessed after being freed.
+
+Can the decrement of bio_counter in orig_write_end_io_work() be moved after
+the device access, or is there another way to safely synchronize this drain?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616-work-btrfs-preexisting-fixes-v1-0-c4abe2f6d4f0@kernel.org?part=3
+

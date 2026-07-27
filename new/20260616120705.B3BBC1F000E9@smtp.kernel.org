@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Tue Jun 16 14:07:07 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 7/7] btrfs: keep the exclusive op held while a
+ dev-replace is suspended in-mount
+Date: Tue, 16 Jun 2026 12:07:05 +0000
+Message-Id: <20260616120705.B3BBC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Dangling `dev_replace->replace_task` pointer allows `btrfs_map_block` lock bypass and leads to NULL pointer dereference.
+--
+
+commit 313686a5e1f6b07fa377710aa39b0f7ba12391f0
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: keep the exclusive op held while a dev-replace is suspended in-mount
+
+This commit prevents concurrent balance and dev-replace operations by keeping
+the exclusive operation token held when a device replace is suspended. It
+updates btrfs_dev_replace_finishing() to report suspension status and modifies
+callers to retain the token accordingly.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 6420f235ccd72..2f2b775478df9 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+[ ... ]
+> @@ -911,6 +915,7 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+>  	ret = btrfs_start_delalloc_roots(fs_info, LONG_MAX, false);
+>  	if (ret) {
+>  		btrfs_dev_replace_set_suspended(fs_info);
+> +		*suspended = true;
+>  		mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+>  		return ret;
+>  	}
+
+[Severity: High]
+This is a pre-existing issue, but does leaving dev_replace->replace_task set
+when returning an error here lead to a lock bypass?
+
+If the task that initiated the replace exits, its task_struct is freed. If a
+new thread is later spawned and its task_struct happens to be allocated at the
+same memory address, could it bypass the lock in btrfs_map_block()?
+
+fs/btrfs/volumes.c:btrfs_map_block() {
+	...
+	if (dev_replace->replace_task != current)
+		down_read(&dev_replace->rwsem);
+	...
+}
+
+Because the replace state is suspended, btrfs_dev_replace_is_ongoing() remains
+true. This allows the new lock-bypassing thread to execute
+handle_ops_on_dev_replace() concurrently with btrfs_dev_replace_cancel().
+
+Since btrfs_dev_replace_cancel() clears the device pointers without resetting
+replace_task:
+
+fs/btrfs/dev-replace.c:btrfs_dev_replace_cancel() {
+	...
+		dev_replace->tgtdev = NULL;
+		dev_replace->srcdev = NULL;
+		dev_replace->replace_state =
+				BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED;
+	...
+}
+
+Could the lock-bypassing thread evaluate dev_replace->tgtdev != NULL just
+before cancel clears it, and then dereference the newly zeroed
+dev_replace->srcdev in handle_ops_on_dev_replace()?
+
+The same dangling pointer can also occur if btrfs_start_transaction() fails
+at the end of btrfs_dev_replace_start(). Should replace_task be explicitly
+cleared to NULL on all error, suspension, and cancel paths?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260616-work-btrfs-preexisting-fixes-v1-0-c4abe2f6d4f0@kernel.org?part=7
+

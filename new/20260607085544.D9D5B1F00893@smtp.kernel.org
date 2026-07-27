@@ -1,0 +1,71 @@
+From sashiko-bot@kernel.org Sun Jun  7 10:55:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix use-after-free after relocation failure
+ with concurrent COW
+Date: Sun, 07 Jun 2026 08:55:44 +0000
+Message-Id: <20260607085544.D9D5B1F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Unconditional call to `put_reloc_control()` with a potentially NULL pointer leads to a kernel panic.
+--
+
+commit 2cc7a45eaa89e132dd60bbe799db31927dad556f
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix use-after-free after relocation failure with concurrent COW
+
+This commit fixes a use-after-free issue on the relocation control
+structure (fs_info->reloc_ctl) during relocation failures. It introduces
+reference counting for the reloc control structure and adds a spinlock
+to safely protect reading and writing the pointer.
+
+Link: https://lore.kernel.org/linux-btrfs/6a1df323.bb0696ed.125a22.000a.GAE@google.com/
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 80aac9fcd6279..67241503a2c85 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+[ ... ]
+> +static void put_reloc_control(struct reloc_control *rc)
+> +{
+> +	if (refcount_dec_and_test(&rc->refs)) {
+> +		struct mapping_node *node, *tmp;
+[ ... ]
+> +/* Helper to delete the 'address of tree root -> reloc tree' mapping. */
+> +static void __del_reloc_root(struct btrfs_root *root)
+> +{
+> +	struct btrfs_fs_info *fs_info = root->fs_info;
+> +	struct rb_node *rb_node;
+> +	struct mapping_node AUTO_KFREE(node);
+> +	struct reloc_control *rc;
+> +	bool put_ref = false;
+> +
+> +	rc = get_reloc_control(fs_info);
+> +	if (rc && root->node) {
+[ ... ]
+> +	spin_lock(&fs_info->trans_lock);
+> +	if (!list_empty(&root->root_list)) {
+> +		put_ref = true;
+> +		list_del_init(&root->root_list);
+> +	}
+> +	spin_unlock(&fs_info->trans_lock);
+> +	if (put_ref)
+> +		btrfs_put_root(root);
+> +	put_reloc_control(rc);
+> +}
+
+[Severity: High]
+Can this lead to a NULL pointer dereference?
+
+Looking at __del_reloc_root(), get_reloc_control() can return NULL if
+relocation is not active or has been unset. 
+
+However, we unconditionally pass rc to put_reloc_control() at the end
+of the function. Since put_reloc_control() immediately evaluates
+refcount_dec_and_test(&rc->refs) without checking if rc is NULL,
+will this trigger a kernel panic when error recovery paths call
+__del_reloc_root() after clearing the relocation control structure?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/dd567347262d3f2a204f1afa46386d3983fff870.1780821106.git.fdmanana@suse.com?part=1
+

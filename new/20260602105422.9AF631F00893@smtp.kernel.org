@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Tue Jun  2 12:54:28 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 4/8] xfs: port to fs_bdev_file_open_by_path()
+Date: Tue, 02 Jun 2026 10:54:22 +0000
+Message-Id: <20260602105422.9AF631F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The error path in `xfs_open_devices()` explicitly double-frees block device files (`rtdev_file`, `logdev_file`) and leaves dangling pointers in the mount structure, leading to deterministic Use-After-Free (UAF) and double-frees during superblock teardown.
+--
+
+commit b370d61680246767ad833d90e6f7a03f39eb885b
+Author: Christian Brauner <brauner@kernel.org>
+
+xfs: port to fs_bdev_file_open_by_path()
+
+This patch routes block device opens through fs_bdev_file_open_by_path() to
+register external devices against the superblock. It also converts the
+corresponding release calls to use fs_bdev_file_release().
+
+> diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+> index f8de44443e81c..3046672106959 100644
+> --- a/fs/xfs/xfs_super.c
+> +++ b/fs/xfs/xfs_super.c
+
+[ ... ]
+
+> @@ -538,10 +538,10 @@ xfs_open_devices(
+>  	xfs_free_buftarg(mp->m_ddev_targp);
+>   out_close_rtdev:
+>  	 if (rtdev_file)
+> -		bdev_fput(rtdev_file);
+> +		fs_bdev_file_release(rtdev_file, mp->m_super);
+>   out_close_logdev:
+>  	if (logdev_file)
+> -		bdev_fput(logdev_file);
+> +		fs_bdev_file_release(logdev_file, mp->m_super);
+>  	return error;
+>  }
+
+[Severity: High]
+This is a pre-existing issue, but does this error path lead to a double-free
+and use-after-free?
+
+If an allocation fails later in xfs_open_devices() (for instance, the
+logdev_file buftarg allocation), the error handling jumps to
+out_free_rtdev_targ and calls xfs_free_buftarg() on the previously allocated
+buftargs.
+
+As seen in fs/xfs/xfs_buf.c, xfs_free_buftarg() releases the file reference:
+
+fs/xfs/xfs_buf.c:xfs_free_buftarg() {
+    ...
+    if (btp->bt_bdev != btp->bt_mount->m_super->s_bdev)
+        fs_bdev_file_release(btp->bt_file, btp->bt_mount->m_super);
+    kfree(btp);
+}
+
+The execution then falls through to out_close_rtdev and out_close_logdev,
+where it checks the uncleared local variables (rtdev_file, logdev_file) and
+releases them a second time, which would trigger a double fput().
+
+Additionally, the mount structure's pointers (like mp->m_rtdev_targp) are not
+set to NULL here. Later, when the mount fails, VFS teardown will call
+kill_block_super() -> xfs_kill_sb() -> xfs_mount_free().
+
+xfs_mount_free() will observe the dangling pointers left behind:
+
+fs/xfs/xfs_super.c:xfs_mount_free() {
+    ...
+    if (mp->m_rtdev_targp && mp->m_rtdev_targp != mp->m_ddev_targp)
+        xfs_free_buftarg(mp->m_rtdev_targp);
+    ...
+}
+
+Will this cause a use-after-free on the buftarg and a secondary double-free
+during the superblock teardown?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260602-work-super-bdev_holder_global-v1-0-bb0fd82f3861@kernel.org?part=4
+

@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Tue Jul 14 00:26:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix a lockdep caused by path resolution during
+ device scan
+Date: Mon, 13 Jul 2026 22:26:43 +0000
+Message-Id: <20260713222643.B23341F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The device path update and logging logic for already-mounted devices is mathematically unreachable (dead code).
+- [High] Device path updates are silently ignored if the block device's `devt` remains the same, breaking device renames and symlinks.
+--
+
+--- Patch [1]: [PATCH] btrfs: fix a lockdep caused by path resolution during device scan ---
+commit 501796bd268b3d8d757fbd12107a12d692f3ed1c
+Author: Qu Wenruo <wqu@suse.com>
+btrfs: fix a lockdep caused by path resolution during device scan
+
+This commit avoids a circular locking dependency between device_list_mutex,
+tree_log_mutex, and path resolution locks. It replaces the full path lookup
+with a dev_t comparison to check if two device paths refer to the same
+block device.
+
+Link: https://lore.kernel.org/linux-btrfs/5a9d9847-4ae6-43c4-afdc-6e5fa51d6117@linux.ibm.com/
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 6eab4cc73ce44..8bcc6cb837695 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+[ ... ]
+> @@ -895,7 +860,7 @@ static noinline struct btrfs_device *device_list_add(const char *path,
+>  				MAJOR(path_devt), MINOR(path_devt),
+>  				current->comm, task_pid_nr(current));
+>  
+> -	} else if (!device->name || !is_same_device(device, path)) {
+> +	} else if (!device->name || device->devt != path_devt) {
+
+[Severity: High]
+If a block device is accessed via a different path or symlink but still
+has the same underlying devt, does this condition skip updating the device
+path?
+
+Since device->devt == path_devt in that scenario, we will bypass this block
+and device->name remains unchanged. Could this cause mount failures if the
+original path is renamed or deleted?
+
+[Severity: High]
+Is the path update logic for already-mounted devices in this block now
+unreachable?
+
+For an already-mounted device (device->bdev != NULL), device->name is
+guaranteed to be non-NULL. This means we only enter this block if
+device->devt != path_devt.
+
+However, looking at the code later in this same block:
+
+		if (device->bdev) {
+			if (device->devt != path_devt) {
+				mutex_unlock(&fs_devices->device_list_mutex);
+				btrfs_warn(NULL, ...);
+				return ERR_PTR(-EEXIST);
+			}
+			btrfs_info(NULL, ...);
+
+Since device->devt != path_devt must be true to reach this code, it will
+always take the ERR_PTR(-EEXIST) path. Does this prevent the path from
+ever being updated and logged for mounted devices?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/56200caf69e60463157fd4a49cf805802536bb6e.1783980768.git.wqu@suse.com?part=1
+

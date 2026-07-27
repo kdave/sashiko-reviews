@@ -1,0 +1,259 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:32:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 08/15] btrfs: implement RAID stripe-tree RAID5 writes
+Date: Fri, 19 Jun 2026 09:32:40 +0000
+Message-Id: <20260619093240.B7EB81F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 10 potential issue(s) to consider:
+- [Critical] Silent data corruption of parity due to double-XORing after bio split.
+- [Critical] Missing device checks in parity bio submission causes NULL pointer dereference on degraded mounts.
+- [Critical] Use-After-Free of `bioc` via dangling `pstripe` pointer in stripe set.
+- [High] TOCTOU race in stripe set allocation causes duplicate instances and parity loss.
+- [High] Invalid use of __GFP_NOFAIL with costly allocation order leads to kernel warnings and potential NULL dereference.
+- [High] bvec_virt() dereferences unmapped HIGHMEM pages, causing kernel panic on 32-bit architectures.
+- [High] Unconditional ASSERT(0) for RAID6 profiles silently drops parity and leaks memory in production.
+- [High] Initial `bioc` reference is leaked on every data chunk write.
+- [High] Parity write errors are silently ignored, corrupting the stripe tree state.
+- [High] Fsync durability guarantees are broken by asynchronous parity submission and completion.
+--
+
+commit 570e961082fcec3cd5b523eda94c9efe5e64b2c3
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Subject: btrfs: implement RAID stripe-tree RAID5 writes
+
+This commit implements RAID5 write support using the new stripe-tree. It
+accumulates data across device segments into a shared parity buffer and
+writes the parity to the parity device once all columns are folded. It then
+inserts both data and parity locations into the stripe-tree.
+
+> diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+> index a16d11c6e2511..3245a706a8958 100644
+> --- a/fs/btrfs/bio.c
+> +++ b/fs/btrfs/bio.c
+[ ... ]
+> +static void raid56_write_end_io_work(struct work_struct *work)
+> +{
+> +	struct btrfs_bio *bbio = container_of(work, struct btrfs_bio, end_io_work);
+> +	struct bio *bio = &bbio->bio;
+> +	struct btrfs_io_stripe *stripe = bio->bi_private;
+> +
+> +	if (bio_is_zone_append(bio) && !bio->bi_status)
+> +		stripe->physical = bio->bi_iter.bi_sector << SECTOR_SHIFT;
+> +
+> +	btrfs_bio_end_io(bbio, bbio->bio.bi_status);
+> +}
+
+[Severity: High]
+Does completing the data bio here break fsync durability guarantees? This
+finishes the data ordered extent immediately upon data write completion,
+allowing an fsync to report success to userspace. However, the parity bio
+might still be accumulating, in-flight, or waiting to insert its stripe tree
+metadata asynchronously. If a crash occurs right after fsync returns, the
+data is left on disk without its parity protection or metadata.
+
+[ ... ]
+> +static void btrfs_submit_raid56_write(struct bio *bio, struct btrfs_io_context *bioc)
+> +{
+> +	struct btrfs_bio *bbio = btrfs_bio(bio);
+> +	struct btrfs_io_stripe *smap;
+> +	u64 length = bio->bi_iter.bi_size;
+> +	int stripe_nr = btrfs_bioc_to_stripe_nr(bioc);
+> +
+> +	bioc->size = length;
+> +	smap = &bioc->stripes[stripe_nr];
+> +	smap->bioc = bioc;
+> +
+> +	bbio->orig_physical = smap->physical;
+> +	bio->bi_iter.bi_sector = smap->physical >> SECTOR_SHIFT;
+> +	bio->bi_private = smap;
+> +	bio->bi_end_io = raid56_write_endio;
+> +	btrfs_get_bioc(bioc);
+> +	btrfs_submit_dev_bio(smap->dev, bio);
+> +}
+
+[Severity: High]
+btrfs_map_block() allocates bioc with a reference count of 1. When
+bio->bi_end_io is unconditionally overwritten here, does this leak the
+initial reference on the bioc? The new raid56_write_endio only drops the
+reference it acquires via btrfs_get_bioc(bioc), and ordered extent
+completion drops one, but the base allocation reference appears to remain
+leaked for every chunk write.
+
+[ ... ]
+> @@ -789,6 +858,16 @@ static bool btrfs_submit_chunk(struct btrfs_bio *bbio, int mirror_num)
+>  
+>  	bbio->can_use_append = btrfs_use_zone_append(bbio);
+>  
+> +	if (btrfs_is_rst_raid56_bioc(bioc) &&
+> +	    btrfs_op(bio) == BTRFS_MAP_WRITE) {
+> +		ret = btrfs_rst_raid56_write(bbio, bioc);
+> +		if (ret) {
+> +			btrfs_bio_counter_dec(fs_info);
+> +			status = errno_to_blk_status(ret);
+> +			goto end_bbio;
+> +		}
+> +	}
+> +
+>  	map_length = min(map_length, length);
+>  	if (bbio->can_use_append)
+>  		map_length = btrfs_append_map_length(bbio, map_length);
+>  
+>  	if (map_length < length) {
+>  		struct btrfs_bio *split;
+>  
+>  		split = btrfs_split_bio(fs_info, bbio, map_length);
+
+[Severity: Critical]
+Since btrfs_rst_raid56_write() computes parity before the bio is split to
+map_length, it folds the entire unsplit orig->bio.bi_iter.bi_size into the
+parity buffer. When the caller loops to submit the remainder,
+btrfs_rst_raid56_write() will be called again on the remainder. Does this
+cause the remainder's data to be folded into the parity buffer twice,
+effectively cancelling it out and silently corrupting the parity stripe?
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 48436b0561917..28aa5e5b21bd6 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+[ ... ]
+> +static struct btrfs_stripe_set *btrfs_stripe_set_alloc(
+> +						struct btrfs_io_context *bioc,
+> +						u64 len)
+> +{
+[ ... ]
+> +	for (int i = 0; i < nr_parity; i++) {
+> +		struct btrfs_io_stripe *pstripe = bioc->stripes + nr_data + i;
+> +		gfp_t gfp = GFP_NOFS | __GFP_ZERO | __GFP_NOFAIL;
+> +		struct folio *folio;
+> +		struct bio *bio;
+> +
+> +		bio = bio_alloc(pstripe->dev->bdev, 1, REQ_OP_WRITE, gfp);
+> +		folio = folio_alloc(gfp, get_order(BTRFS_STRIPE_LEN));
+> +
+> +		set->stripe_units[i].bio = bio;
+> +		set->stripe_units[i].folio = folio;
+> +		set->stripe_units[i].pstripe = pstripe;
+
+[Severity: Critical]
+Does storing a direct pointer to bioc->stripes here risk a use-after-free?
+The stripe set structure does not increment the reference count on bioc.
+Because bioc is freed when the data bios finish, the asynchronous parity bio
+completion and its workqueue task (insert_parity_stripe_work) will
+dereference pstripe->dev and pstripe->physical after the memory has been
+released.
+
+[Severity: High]
+For a standard 64KB BTRFS_STRIPE_LEN on a system with 4KB pages, this
+requests an order-4 allocation. Is it safe to use __GFP_NOFAIL here? The
+MM subsystem prohibits __GFP_NOFAIL for allocations larger than
+PAGE_ALLOC_COSTLY_ORDER (order 3), causing the page allocator to warn and
+ignore the flag. If the allocation fails under fragmentation, folio will
+be NULL, which will crash in the subsequent bio_add_folio_nofail() call.
+
+[ ... ]
+> +static bool btrfs_stripe_set_calc_parity_raid5(struct btrfs_stripe_set *set,
+> +					       struct btrfs_bio *orig,
+> +					       struct btrfs_io_context *bioc)
+> +{
+[ ... ]
+> +	spin_lock(&set->lock);
+> +	bio_for_each_segment(bvec, &orig->bio, iter) {
+> +		u8 *src = bvec_virt(&bvec);
+> +		u32 chunk = min_t(u32, bvec.bv_len, to_fold - done);
+> +		void *xsrc = src;
+
+[Severity: High]
+Since Btrfs data bios can contain page cache pages that reside in high
+memory on 32-bit architectures, is it safe to use bvec_virt() here?
+bvec_virt() relies on page_address(), which returns NULL for unmapped
+highmem pages, leading to a fatal use-after-free or NULL pointer dereference
+in xor_gen(). Should bvec_kmap_local() be used instead?
+
+[ ... ]
+> +static bool btrfs_stripe_set_calc_parity(struct btrfs_stripe_set *set,
+> +					 struct btrfs_bio *orig,
+> +					 struct btrfs_io_context *bioc)
+> +{
+> +	switch (set->npar) {
+> +	case 1:
+> +		return btrfs_stripe_set_calc_parity_raid5(set, orig, bioc);
+> +	default:
+> +		/* TODO: multiple parity (RAID6) calculation. */
+> +		ASSERT(0, "unsupported number of parity stripes %u", set->npar);
+> +		return false;
+> +	}
+> +}
+
+[Severity: High]
+This code can be reached if BTRFS_BLOCK_GROUP_RAID56_MASK includes RAID6
+profiles. In production kernels without CONFIG_BTRFS_ASSERT, this evaluate
+to a no-op and returns false. Will this silently leak the stripe_set
+allocation and drop all parity redundancy for RAID6 volumes?
+
+[ ... ]
+> +static void btrfs_stripe_set_finalize(struct btrfs_stripe_set *set)
+> +{
+[ ... ]
+> +	bio_set_dev(bio, pstripe->dev->bdev);
+> +	bio->bi_iter.bi_sector = physical >> SECTOR_SHIFT;
+> +	bio->bi_end_io = raid56_write_endio;
+> +	bio->bi_private = set;
+> +
+> +	btrfs_stripe_set_get(set);
+> +	atomic_inc(&set->pending_ios);
+> +	submit_bio(bio);
+> +}
+
+[Severity: Critical]
+In a degraded RAID56 array, the missing device's bdev is NULL. Does calling
+bio_set_dev(bio, pstripe->dev->bdev) directly followed by submit_bio()
+panic the kernel when it attempts to dereference the NULL block device?
+Standard Btrfs I/O uses btrfs_submit_dev_bio(), which verifies device
+presence and safely aborts I/O to missing devices.
+
+[ ... ]
+> +static void raid56_write_endio(struct bio *bio)
+> +{
+> +	struct btrfs_stripe_set *set = bio->bi_private;
+> +	struct btrfs_fs_info *fs_info = set->fs_info;
+> +	struct folio_iter fi;
+> +
+> +	if (bio_is_zone_append(bio) && !bio->bi_status)
+> +		set->stripe_units[0].pstripe->physical =
+> +			bio->bi_iter.bi_sector << SECTOR_SHIFT;
+> +
+> +	if (atomic_dec_and_test(&set->pending_ios))
+> +		queue_work(fs_info->endio_workers, &set->work);
+
+[Severity: High]
+If the parity bio fails (bio->bi_status indicates an IO error), does
+unconditionally queueing the insert_parity_stripe_work corrupt the stripe
+tree state? The asynchronous work will insert the
+BTRFS_RAID_STRIPE_PARITY_KEY into the stripe tree using a stale or unwritten
+physical address, which could cause future degraded reads to silently
+consume unwritten garbage from the disk.
+
+[ ... ]
+> +int btrfs_rst_raid56_write(struct btrfs_bio *orig,
+> +			   struct btrfs_io_context *bioc)
+> +{
+[ ... ]
+> +	set = btrfs_stripe_set_lookup(bioc, full_stripe_len);
+> +	if (!set) {
+> +		set = btrfs_stripe_set_alloc(bioc, full_stripe_len);
+> +		if (IS_ERR(set))
+> +			return PTR_ERR(set);
+> +		created = true;
+> +	}
+
+[Severity: High]
+Is there a TOCTOU race condition here when concurrent data writes occur for
+different columns of the same full stripe? Both could observe a NULL set
+from btrfs_stripe_set_lookup() and allocate duplicate stripe sets. If this
+happens, they would fold their columns into isolated parity buffers, neither
+would reach the full_stripe_len threshold, and the parity bio would
+permanently leak without ever being submitted.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=8
+

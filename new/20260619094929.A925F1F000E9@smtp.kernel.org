@@ -1,0 +1,233 @@
+From sashiko-bot@kernel.org Fri Jun 19 11:49:34 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC 12/15] btrfs: compute RAID stripe-tree RAID5 parity for
+ sub-stripe writes
+Date: Fri, 19 Jun 2026 09:49:29 +0000
+Message-Id: <20260619094929.A925F1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 7 potential issue(s) to consider:
+- [Critical] Premature finalization of shared RAID stripes destroys parity for earlier writes in the same logical stripe.
+- [Critical] Interior partial writes bypass parity finalization, breaking fsync durability and causing memory leaks.
+- [High] Concurrent modification of the lockless `pending` list in `btrfs_rst_flush_stripe_sets()` causes a kernel infinite loop.
+- [High] Asynchronous parity bio submission in `sync_fs` leads to Use-After-Free and lost RST updates on unmount.
+- [High] The first partial stripe of an ordered extent spanning multiple stripes is permanently leaked.
+- [Medium] High-order `folio_alloc` with `__GFP_NOFAIL` triggers page allocator warnings and risks livelock.
+- [Medium] `btrfs_rst_destroy_stripe_sets` leaks struct bio allocations by calling `bio_io_error` on unsubmitted bios.
+--
+
+commit 34ad5615e7233f189e200781b11dee1e92543f4e
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Subject: btrfs: compute RAID stripe-tree RAID5 parity for sub-stripe writes
+
+The RAID5 write path accumulates a full stripe's parity and submits it once
+all of its data columns have been folded. A sub-stripe tail - a file tail
+shorter than a full stripe - never fills its stripe, so its parity would
+never be submitted and the tail would be left unprotected.
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index abe0ad10ee87d..513bb5bba2efb 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+[ ... ]
+> @@ -792,9 +802,9 @@ static struct btrfs_stripe_set *btrfs_stripe_set_alloc(
+>  		bio_add_folio_nofail(bio, folio, BTRFS_STRIPE_LEN, 0);
+>  	}
+
+[Severity: Medium]
+Does btrfs_stripe_set_alloc() allocate a high-order folio with __GFP_NOFAIL?
+Because BTRFS_STRIPE_LEN is typically 64KB, this requests an order-4
+allocation. The memory management subsystem prohibits __GFP_NOFAIL on
+allocations with order > 1. Can this trigger page allocator warnings or
+cause an infinite loop under memory pressure, considering the function
+already handles and returns ENOMEM?
+
+> -	spin_lock(&fs_info->stripe_set_list_lock);
+> +	spin_lock_irqsave(&fs_info->stripe_set_list_lock, flags);
+>  	list_add_tail(&set->list, &fs_info->stripe_sets);
+> -	spin_unlock(&fs_info->stripe_set_list_lock);
+> +	spin_unlock_irqrestore(&fs_info->stripe_set_list_lock, flags);
+>  
+>  	return set;
+>  }
+[ ... ]
+> @@ -915,6 +936,114 @@ int btrfs_rst_raid56_write(struct btrfs_bio *orig,
+>  	return 0;
+>  }
+>  
+> +/*
+> + * Finalize the parity of a partial tail stripe once its data ordered extent has
+> + * completed (so the data columns are committed). Complete stripes are submitted
+> + * by btrfs_rst_raid56_write(). The only stripe that can still be pending here
+> + * is the one holding the last byte of ordered's data. If a data extent
+> + * continues right after ordered, that stripe spans two ordered extents and
+> + * will be completed by the next one's data, so it is left alone.
+> + */
+> +void btrfs_rst_raid56_finish_ordered(struct btrfs_ordered_extent *ordered)
+> +{
+> +	struct btrfs_inode *inode = ordered->inode;
+> +	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+> +	const u64 logical_end = ordered->disk_bytenr + ordered->disk_num_bytes;
+> +	struct btrfs_stripe_set *set, *found = NULL;
+> +	unsigned long flags;
+> +
+> +	if (!fs_info->stripe_root)
+> +		return;
+> +
+> +	spin_lock_irqsave(&fs_info->stripe_set_list_lock, flags);
+> +	list_for_each_entry(set, &fs_info->stripe_sets, list) {
+> +		if (set->finalized)
+> +			continue;
+> +		if (in_range(logical_end - 1, set->full_stripe_logical,
+> +			     set->full_stripe_len)) {
+> +			found = set;
+> +			btrfs_stripe_set_get(set);
+> +			break;
+> +		}
+> +	}
+
+[Severity: High]
+Does this permanently leak the first partial stripe of an ordered extent
+that spans multiple stripes? If an ordered extent spans into a second stripe,
+this loop only looks up and finalizes the second stripe. The stripe set for
+the first stripe would be ignored, leaving its parity unwritten until a
+global sync_fs is called.
+
+> +	spin_unlock_irqrestore(&fs_info->stripe_set_list_lock, flags);
+> +
+> +	if (!found)
+> +		return;
+> +
+> +	/*
+> +	 * If the file extends past this ordered extent, more data
+> +	 * will land in this stripe and complete it eagerly, so leave it alone.
+> +	 * Only when this ordered extent reaches i_size is the stripe a genuine
+> +	 * tail.
+> +	 */
+> +	if (ordered->file_offset + ordered->num_bytes <
+> +	    i_size_read(&inode->vfs_inode)) {
+> +		btrfs_stripe_set_put(fs_info, found);
+> +		return;
+> +	}
+
+[Severity: Critical]
+Can this premature finalization destroy parity for earlier writes in the same
+logical stripe? The stripe_set is globally shared by full_stripe_logical.
+If File A writes 4KB and finishes, the extent reaches its i_size and
+finalizes the set. If File B later writes to the adjacent space in the same
+stripe, btrfs_rst_raid56_write() will allocate a new, zero-initialized set
+because the first was finalized. File B's parity overwrite would then destroy
+the parity protection for File A's data without a read-modify-write.
+
+[Severity: Critical]
+Will this also cause interior partial writes to bypass parity finalization
+entirely? If an interior partial overwrite occurs, the condition evaluates
+to true and the parity bio is never submitted. If the user then calls fsync(),
+this would leave the data on disk without its parity protection, breaking
+durability guarantees.
+
+> +	btrfs_stripe_set_finalize(found);
+> +	btrfs_stripe_set_put(fs_info, found);
+> +}
+> +
+> +void btrfs_rst_flush_stripe_sets(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct btrfs_stripe_set *set, *tmp;
+> +	unsigned long flags;
+> +	LIST_HEAD(pending);
+> +
+> +	if (!fs_info->stripe_root)
+> +		return;
+> +
+> +	spin_lock_irqsave(&fs_info->stripe_set_list_lock, flags);
+> +	list_splice_init(&fs_info->stripe_sets, &pending);
+> +	spin_unlock_irqrestore(&fs_info->stripe_set_list_lock, flags);
+> +
+> +	list_for_each_entry_safe(set, tmp, &pending, list)
+> +		btrfs_stripe_set_finalize(set);
+> +}
+
+[Severity: High]
+Can this cause a kernel lockup due to concurrent list modification? The
+btrfs_stripe_set_finalize() function calls list_del_init() on the set's list
+node. Because the node is currently in the pending list being iterated
+locklessly here, list_del_init() will reinitialize the node's pointers to
+point to itself. If the concurrent list_for_each_entry_safe() uses this node
+as the tmp pointer, it will infinitely follow tmp->next == tmp.
+
+> +/*
+> + * Free any stripe sets still pending at unmount of an aborted filesystem.
+> + *
+> + * When the filesystem is forced read-only mid-write, the data ordered extents
+> + * complete with an error and never reach btrfs_rst_raid56_finish_ordered(), so
+> + * the partial-tail stripe sets they allocated are never finalized: their parity
+> + * bios/folios are never submitted and the sets stay on fs_info->stripe_sets.
+> + * Tear them down here (we cannot submit parity on a read-only fs) so the list
+> + * is empty and close_ctree() does not trip its ASSERT.
+> + */
+> +void btrfs_rst_destroy_stripe_sets(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct btrfs_stripe_set *set, *tmp;
+> +	unsigned long flags;
+> +	LIST_HEAD(pending);
+> +
+> +	if (!fs_info->stripe_root)
+> +		return;
+> +
+> +	spin_lock_irqsave(&fs_info->stripe_set_list_lock, flags);
+> +	list_splice_init(&fs_info->stripe_sets, &pending);
+> +	spin_unlock_irqrestore(&fs_info->stripe_set_list_lock, flags);
+> +
+> +	list_for_each_entry_safe(set, tmp, &pending, list) {
+> +		ASSERT(!set->finalized);
+> +		ASSERT(atomic_read(&set->pending_ios) == 0);
+> +
+> +		for (int i = 0; i < set->npar; i++) {
+> +			struct btrfs_stripe_unit *unit = &set->stripe_units[i];
+> +
+> +			if (unit->folio)
+> +				folio_put(unit->folio);
+> +			if (unit->bio)
+> +				bio_io_error(unit->bio);
+> +		}
+
+[Severity: Medium]
+Does calling bio_io_error() on unsubmitted bios leak the bio memory?
+Since the bio was never finalized, its bi_end_io callback is still NULL.
+The bio_endio() function will return without freeing it because there is no
+explicit bio_put(), causing a leak on the error path.
+
+> +		btrfs_stripe_set_put(fs_info, set);
+> +	}
+> +}
+[ ... ]
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index a7d804219bec3..4cd829193e52f 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -1023,6 +1024,14 @@ int btrfs_sync_fs(struct super_block *sb, int wait)
+>  
+>  	btrfs_wait_ordered_roots(fs_info, U64_MAX, NULL);
+>  
+> +	/*
+> +	 * All ordered extents are now on disk, so any RAID56 stripe-tree set
+> +	 * still pending is a genuine partial stripe (e.g. an interior partial
+> +	 * write) that finish_ordered left for a completion that will never
+> +	 * come. Finalize them now, before they leak past unmount.
+> +	 */
+> +	btrfs_rst_flush_stripe_sets(fs_info);
+> +
+>  	trans = btrfs_attach_transaction_barrier(root);
+
+[Severity: High]
+Does this asynchronous parity submission cause a use-after-free and lost
+RST updates during unmount? By calling btrfs_rst_flush_stripe_sets() and
+immediately committing the transaction without waiting for the bios to
+complete, the unmount process will proceed to free fs_info and stop the
+endio_workers workqueue. When the bios eventually complete, the endio
+callback will queue work to the destroyed endio_workers using a freed
+fs_info pointer.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260619090211.497100-1-johannes.thumshirn@wdc.com?part=12
+

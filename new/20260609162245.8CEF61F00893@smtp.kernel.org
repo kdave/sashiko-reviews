@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Tue Jun  9 18:22:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix use-after-free on reloc root after error in
+ insert_dirty_subvol()
+Date: Tue, 09 Jun 2026 16:22:44 +0000
+Message-Id: <20260609162245.8CEF61F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] The patch shifts a use-after-free from unmount time to an immediate UAF in `clean_dirty_subvols()` instead of fixing the root cause of the reference count imbalance.
+--
+
+commit f3ccbd71b9fe3434646ce11c636b42a1377f1c12
+Author: Filipe Manana <fdmanana@suse.com>
+btrfs: fix use-after-free on reloc root after error in insert_dirty_subvol()
+
+This commit attempts to fix a use-after-free during unmount by ensuring that
+failed subvolume roots are added to the dirty_subvol_roots list. This is
+intended to allow clean_dirty_subvols() to clear the root->reloc_root pointer
+if btrfs_update_reloc_root() fails.
+
+Link: https://lore.kernel.org/linux-btrfs/6a1ebde9.c1435f33.112120.0176.GAE@google.com/
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 3ebaf5880125f..b3221cafcc29a 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+[ ... ]
+> @@ -1438,15 +1438,22 @@ static int insert_dirty_subvol(struct btrfs_trans_handle *trans,
+>  	btrfs_set_root_drop_level(reloc_root_item, 0);
+>  	btrfs_set_root_refs(reloc_root_item, 0);
+>  	ret = btrfs_update_reloc_root(trans, root);
+> -	if (ret)
+> -		return ret;
+> -
+> +	/*
+> +	 * Even if an error happened, add the root to the dirty_subvol_roots
+> +	 * list, so that clean_dirty_subvols() will set the root->reloc_root to
+> +	 * NULL and merge_reloc_roots() frees the root (with a call to
+> +	 * free_reloc_roots()), otherwise we have a use-after-free when
+> +	 * btrfs_update_reloc_root() above returns an error, as the root has a
+> +	 * ->reloc_root field pointing to a reloc root we already freed and
+> +	 * during unmount we will call btrfs_put_root() against this already
+> +	 * freed reloc root.
+> +	 */
+>  	if (list_empty(&root->reloc_dirty_list)) {
+>  		btrfs_grab_root(root);
+>  		list_add_tail(&root->reloc_dirty_list, &rc->dirty_subvol_roots);
+>  	}
+>  
+> -	return 0;
+> +	return ret;
+>  }
+
+[Severity: Critical]
+Does this change shift the use-after-free from unmount time to an earlier point
+during error recovery?
+
+By unconditionally adding the root to dirty_subvol_roots, the root will be
+processed by clean_dirty_subvols() later in relocate_block_group().
+
+As noted in the commit message's step 4, the reloc_root is already freed by
+free_reloc_roots() in merge_reloc_roots() during error handling. When
+clean_dirty_subvols() later processes this list, it sets root->reloc_root to
+NULL, but then it immediately passes the previously saved and already freed
+reloc_root pointer to btrfs_drop_snapshot():
+
+fs/btrfs/relocation.c:clean_dirty_subvols() {
+    ...
+            struct btrfs_root *reloc_root = root->reloc_root;
+
+            list_del_init(&root->reloc_dirty_list);
+            root->reloc_root = NULL;
+    ...
+            if (reloc_root) {
+                ...
+                ret2 = btrfs_drop_snapshot(reloc_root, false, true);
+    ...
+}
+
+Since btrfs_drop_snapshot() dereferences reloc_root, will this cause an
+immediate use-after-free instead of resolving the underlying reference count
+imbalance?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/910f7fff6c9a588271afa591b1c533d92246ca85.1781021231.git.fdmanana@suse.com?part=1
+

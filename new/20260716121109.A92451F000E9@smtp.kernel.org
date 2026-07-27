@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Thu Jul 16 14:11:14 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 5/5] btrfs: zoned: avoid ordered_operations_mutex when
+ finishing a zone
+Date: Thu, 16 Jul 2026 12:11:09 +0000
+Message-Id: <20260716121109.A92451F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The memory allocation failure fallback in btrfs_wait_ordered_roots_nolock() reintroduces the exact deadlock the patch aims to fix.
+- [High] Lockless traversal of ordered_roots using a cached limit combined with concurrent list rotation skips roots, leading to premature zone finishing.
+--
+
+--- Patch [5]: [PATCH 5/5] btrfs: zoned: avoid ordered_operations_mutex when finishing a zone ---
+commit 388225eddae313f32fb8d9fd9c050766141349f3
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: avoid ordered_operations_mutex when finishing a zone
+
+This commit introduces btrfs_wait_ordered_roots_nolock() to wait for ordered
+extents in a block group without taking the ordered_operations_mutex. This
+aims to prevent a deadlock that occurs when an ordered extent flush worker
+attempts to finish a zone while the reclaim task holds the mutex.
+
+> diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+> --- a/fs/btrfs/ordered-data.c
+> +++ b/fs/btrfs/ordered-data.c
+[ ... ]
+> +void btrfs_wait_ordered_roots_nolock(struct btrfs_fs_info *fs_info,
+> +				     const struct btrfs_block_group *bg)
+> +{
+[ ... ]
+> +	spin_lock(&fs_info->ordered_root_lock);
+> +	cap = list_count_nodes(&fs_info->ordered_roots);
+> +	spin_unlock(&fs_info->ordered_root_lock);
+> +	if (!cap)
+> +		return;
+> +
+> +	roots = kvmalloc_array(cap, sizeof(*roots), GFP_NOFS);
+> +	if (!roots) {
+> +		btrfs_wait_ordered_roots(fs_info, U64_MAX, bg);
+> +		return;
+> +	}
+
+[Severity: High]
+Does this fallback path reintroduce the exact deadlock this patch is trying
+to fix?
+
+If memory pressure causes kvmalloc_array() with GFP_NOFS to fail, the code
+falls back to calling btrfs_wait_ordered_roots(). 
+
+If this is reached from an ordered extent flush worker (e.g., via
+do_zone_finish()), btrfs_wait_ordered_roots() will attempt to acquire the
+ordered_operations_mutex, which is already held by the reclaim task waiting
+for this flush worker.
+
+> +
+> +	spin_lock(&fs_info->ordered_root_lock);
+> +	list_for_each_entry(root, &fs_info->ordered_roots, ordered_root) {
+> +		if (nr_roots >= cap)
+> +			break;
+
+[Severity: High]
+Can this bounded loop silently skip roots that were concurrently rotated to
+the end of the list?
+
+The code computes cap = list_count_nodes(&fs_info->ordered_roots), drops the
+ordered_root_lock to allocate memory, and then collects up to cap roots.
+
+If a concurrent btrfs_add_ordered_root() adds a new root to the tail of the
+list, and a concurrent btrfs_wait_ordered_roots() rotates an existing, older
+root to the tail (after the newly added one), this loop will hit the
+nr_roots >= cap break condition when encountering the newly added root.
+
+Would this cause the older rotated root to be skipped entirely, potentially
+finishing a zone prematurely while ordered extents are still pending?
+
+> +		if (!btrfs_grab_root(root))
+> +			continue;
+> +		roots[nr_roots++] = root;
+> +	}
+> +	spin_unlock(&fs_info->ordered_root_lock);
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260716115656.1319295-1-johannes.thumshirn@wdc.com?part=5
+

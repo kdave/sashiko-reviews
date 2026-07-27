@@ -1,0 +1,54 @@
+From sashiko-bot@kernel.org Fri Jul  3 11:01:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/3] btrfs: add "rescue=usebackuproot" into
+ "rescue=all" shortcut
+Date: Fri, 03 Jul 2026 08:56:43 +0000
+Message-Id: <20260703085643.BAD4D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Adding USEBACKUPROOT to 'rescue=all' without explicitly setting CLEAR_CACHE allows the filesystem to mount with a backup root while continuing to trust an invalid on-disk space cache, leading to data corruption.
+--
+
+commit 4be2660c20ad9abcafefb7be98eed45a0bd2266b
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: add "rescue=usebackuproot" into "rescue=all" shortcut
+
+This commit adds the "usebackuproot" rescue option into the "rescue=all"
+shortcut. The goal is to improve the chances of successfully mounting a
+corrupted filesystem when using the rescue=all option.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index 6d429055c79a2..48de3ba80d183 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -619,6 +619,7 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+>  			btrfs_set_opt(ctx->mount_opt, IGNORESUPERFLAGS);
+>  			btrfs_set_opt(ctx->mount_opt, IGNOREBADROOTS);
+>  			btrfs_set_opt(ctx->mount_opt, NOLOGREPLAY);
+> +			btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+
+[Severity: High]
+Does adding USEBACKUPROOT here without also setting CLEAR_CACHE introduce a
+space cache corruption issue?
+
+If a user mounts a corrupted filesystem with "-o rescue=all", the mount
+succeeds using a backup root. Because CLEAR_CACHE is not explicitly set by
+rescue=all, the block group space caches on disk are not invalidated in memory.
+
+When the initial mount completes, USEBACKUPROOT is cleared from the
+persistent mount options. If the user subsequently remounts read-write, the
+read-only restriction on USEBACKUPROOT no longer applies.
+
+Could the filesystem then begin allocating space using the obsolete
+free-space cache, leading to data corruption by overwriting extents that
+are actually in use by the backup root?
+
+>  			break;
+>  		default:
+>  			btrfs_info(NULL, "unrecognized rescue option '%s'",
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783068013.git.wqu@suse.com?part=2
+

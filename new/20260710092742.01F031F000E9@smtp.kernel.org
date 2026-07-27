@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:27:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 15/20] xfs: remove unwritten extents after
+ preallocations in fsverity metadata
+Date: Fri, 10 Jul 2026 09:27:41 +0000
+Message-Id: <20260710092742.01F031F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Double unlock of the inode's ILOCK (`XFS_ILOCK_EXCL`) on the `xfs_bunmapi()` error path.
+--
+
+--- Patch [15]: [PATCH v11 15/20] xfs: remove unwritten extents after preallocations in fsverity metadata ---
+commit ecd9a706d5d895be4bbbb102b8129944064400f5
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: remove unwritten extents after preallocations in fsverity metadata
+
+This commit introduces a new function to cancel unwritten extents past EOF
+for fsverity. It iterates over extents in the fsverity metadata region and
+removes any unwritten ones left over from preallocations.
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index 0d66aec433836..31faa95c396d3 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+[ ... ]
+> +static int
+> +xfs_fsverity_cancel_unwritten(
+> +	struct xfs_inode	*ip,
+> +	loff_t			start,
+> +	loff_t			end)
+> +{
+[ ... ]
+> +		if (imap.br_state == XFS_EXT_UNWRITTEN) {
+> +			xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+> +
+> +			error = xfs_bunmapi(tp, ip, imap.br_startoff,
+> +					imap.br_blockcount, 0, 1, &done);
+> +			if (error)
+> +				goto out_cancel;
+[ ... ]
+> +	return error;
+> +out_cancel:
+> +	xfs_trans_cancel(tp);
+> +	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+> +	return error;
+> +}
+
+[Severity: High]
+Does this error path cause a double unlock of the inode if xfs_bunmapi()
+fails?
+
+If xfs_bmapi_read() fails earlier in the loop, jumping to out_cancel
+works correctly because the transaction doesn't own the lock yet, so the
+explicit xfs_iunlock() correctly drops it.
+
+However, if xfs_bunmapi() fails, xfs_trans_ijoin() has already been called
+with XFS_ILOCK_EXCL, transferring ownership of the inode lock to the
+transaction. 
+
+When xfs_trans_cancel() runs in this scenario, it aborts the transaction
+and automatically drops any joined locks. Wouldn't the subsequent
+xfs_iunlock() then try to drop the same lock a second time?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=15
+

@@ -1,0 +1,101 @@
+From sashiko-bot@kernel.org Thu Jun 11 00:42:51 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: tree-checker: validate INODE_REF's namelen
+Date: Wed, 10 Jun 2026 22:42:49 +0000
+Message-Id: <20260610224249.EC78A1F00899@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] BTRFS_ROOT_REF_KEY and BTRFS_ROOT_BACKREF_KEY items are completely omitted from the tree-checker, leaving an exploitable stack buffer overflow vulnerability in btrfs_get_name().
+- [High] The patch adds name length validation for BTRFS_INODE_REF_KEY items in check_inode_ref(), but fails to add equivalent validation for BTRFS_INODE_EXTREF_KEY items in check_inode_extref().
+--
+
+commit de46f0dc5f5b4c903523540ca80906f4e3cb6db1
+Author: Weiming Shi <bestswngs@gmail.com>
+
+btrfs: tree-checker: validate INODE_REF's namelen
+
+This commit fixes a crash caused by out-of-bounds access from corrupted 
+INODE_REF items by validating the namelen against BTRFS_NAME_LEN.
+
+Link: https://lore.kernel.org/linux-btrfs/aik0hEV6ehKx6Ldv@Air.local/
+
+> [FIX]
+> Add extra namelen verification for INODE_REF, just like what we have
+> done in ROOT_REF checks.
+
+[Severity: Critical]
+This is a pre-existing issue, but are BTRFS_ROOT_REF_KEY and 
+BTRFS_ROOT_BACKREF_KEY items actually validated in the tree-checker?
+
+The commit message mentions we have done this in ROOT_REF checks, but looking 
+at check_leaf_item() in fs/btrfs/tree-checker.c, it seems handlers for 
+BTRFS_ROOT_REF_KEY and BTRFS_ROOT_BACKREF_KEY are completely omitted from the 
+switch statement.
+
+Could this allow a corrupted root backref to bypass validation and cause a 
+stack buffer overflow in btrfs_get_name()?
+
+fs/btrfs/export.c:btrfs_get_name() {
+    ...
+	if (ino == BTRFS_FIRST_FREE_OBJECTID) {
+		rref = btrfs_item_ptr(leaf, path->slots[0],
+				     struct btrfs_root_ref);
+		name_ptr = (unsigned long)(rref + 1);
+		name_len = btrfs_root_ref_name_len(leaf, rref);
+	} else {
+    ...
+	read_extent_buffer(leaf, name, name_ptr, name_len);
+
+	/*
+	 * have to add the null termination to make sure that reconnect_path
+	 * gets the right len for strlen
+	 */
+	name[name_len] = '\0';
+}
+
+Because the name buffer is a fixed 256-byte stack buffer provided by 
+exportfs_decode_fh_raw(), reading an unvalidated name_len could write out 
+of bounds.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 1f15d0793a9c9..fb661414f816f 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -1865,6 +1865,12 @@ static int check_inode_ref(struct extent_buffer *leaf,
+>  
+>  		iref = (struct btrfs_inode_ref *)ptr;
+>  		namelen = btrfs_inode_ref_name_len(leaf, iref);
+> +		if (unlikely(namelen == 0 || namelen > BTRFS_NAME_LEN)) {
+> +			inode_ref_err(leaf, slot,
+> +				"invalid inode ref name length, has %u expect [1, %u]",
+> +				namelen, BTRFS_NAME_LEN);
+> +			return -EUCLEAN;
+> +		}
+>  		if (unlikely(ptr + sizeof(*iref) + namelen > end)) {
+>  			inode_ref_err(leaf, slot,
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does check_inode_extref() 
+also need this validation for BTRFS_INODE_EXTREF_KEY items?
+
+It appears that check_inode_extref() parses these items but only checks if 
+the name fits within the item boundaries, omitting the semantic check 
+against BTRFS_NAME_LEN:
+
+fs/btrfs/tree-checker.c:check_inode_extref() {
+    ...
+		extref = (struct btrfs_inode_extref *)ptr;
+		namelen = btrfs_inode_extref_name_len(leaf, extref);
+		if (unlikely(ptr + sizeof(*extref) + namelen > end)) {
+    ...
+}
+
+Should we apply the same namelen validation there to prevent corrupted 
+INODE_EXTREF items from bypassing the tree-checker and causing similar 
+out-of-bounds accesses downstream?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/581e4f2fddc1a4cbf1ba6954ece973c36da60dd1.1781130368.git.wqu@suse.com?part=1
+

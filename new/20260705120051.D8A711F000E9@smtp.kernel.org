@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Sun Jul  5 14:00:54 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 2/4] btrfs: extract the common scrub read endio into
+ a helper
+Date: Sun, 05 Jul 2026 12:00:51 +0000
+Message-Id: <20260705120051.D8A711F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Concurrent updates to the scrub stripe bitmaps via non-atomic bitwise operations can lead to lost error flags.
+--
+
+commit 9281f96c3e235ae5618d5f12ac52322ae4ecf9aa
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: extract the common scrub read endio into a helper
+
+This commit extracts the common read endio logic from
+scrub_repair_read_endio() and scrub_read_endio() into a new shared helper
+function scrub_read_endio_common(). It centralizes the bitmap updates and
+bio put operations to reduce code duplication.
+
+> diff --git a/fs/btrfs/scrub.c b/fs/btrfs/scrub.c
+> index 5ec04c91e12d9..d95002edc20e6 100644
+> --- a/fs/btrfs/scrub.c
+> +++ b/fs/btrfs/scrub.c
+> @@ -877,30 +877,41 @@ static int calc_sector_number(struct scrub_stripe *stripe, struct bio_vec *first
+
+[ ... ]
+
+> +static void scrub_read_endio_common(struct btrfs_bio *bbio)
+> +{
+> +	struct scrub_stripe *stripe = bbio->private;
+> +	struct btrfs_fs_info *fs_info = stripe->bg->fs_info;
+> +	int sector_nr = calc_sector_number(stripe, bio_first_bvec_all(&bbio->bio));
+> +	const u32 bio_size = bio_get_size(&bbio->bio);
+> +	const u32 sectors = bio_size >> fs_info->sectorsize_bits;
+>  
+>  	ASSERT(sector_nr < stripe->nr_sectors);
+>  
+>  	if (bbio->bio.bi_status) {
+> -		scrub_bitmap_set_io_error(stripe, sector_nr,
+> -					  bio_size >> fs_info->sectorsize_bits);
+> -		scrub_bitmap_set_error(stripe, sector_nr,
+> -				       bio_size >> fs_info->sectorsize_bits);
+> +		scrub_bitmap_set_io_error(stripe, sector_nr, sectors);
+> +		scrub_bitmap_set_error(stripe, sector_nr, sectors);
+>  	} else {
+> -		scrub_bitmap_clear_io_error(stripe, sector_nr,
+> -					  bio_size >> fs_info->sectorsize_bits);
+> +		scrub_bitmap_clear_io_error(stripe, sector_nr, sectors);
+>  	}
+
+[Severity: High]
+This is a pre-existing issue, but since this code is being refactored here,
+could concurrent bio completions cause a data race when updating these bitmaps?
+
+If multiple bios are submitted for a single stripe (e.g., during repair reads
+or due to gaps in has_extent), their btrfs_bio_end_io work items can execute
+concurrently on different CPUs. Because these scrub_bitmap_* functions
+eventually use non-atomic bitmap_set() and bitmap_clear() on the shared
+stripe->bitmaps array, couldn't concurrent read-modify-write operations
+overwrite each other?
+
+For example, if one CPU sets an error bit while another clears a neighboring
+bit in the same unsigned long word, could scrub silently lose error flags
+and leave corrupted data unrepaired?
+
+Notice that scrub_write_endio() uses stripe->write_error_lock to protect its
+bitmap updates. Does scrub_read_endio_common() need a similar lock to safely
+update the read error bitmaps?
+
+>  	bio_put(&bbio->bio);
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1783251701.git.wqu@suse.com?part=2
+

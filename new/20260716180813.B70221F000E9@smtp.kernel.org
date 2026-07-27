@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Thu Jul 16 20:08:15 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: raid56: fix inverted bio-list check in scrub
+ read assembly
+Date: Thu, 16 Jul 2026 18:08:13 +0000
+Message-Id: <20260716180813.B70221F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] This problem wasn't introduced by this patch, but lockless access to `rbio->bio_list` causes a data race, leading to leaked bios, hung tasks, or NULL pointer dereferences.
+--
+
+--- Patch [1]: [PATCH] btrfs: raid56: fix inverted bio-list check in scrub read assembly ---
+commit 15f8180fc7a9445598d654bbef01b428d1c03041
+Author: Mykola Lysenko <nickolay.lysenko@gmail.com>
+
+btrfs: raid56: fix inverted bio-list check in scrub read assembly
+
+This commit fixes a logic inversion in scrub_assemble_read_bios() where
+sectors present in the bio list were incorrectly skipped, resulting in no
+reads being submitted during parity scrubs. It restores the proper check
+so missing sectors are successfully read from disk, preventing silent parity
+corruption.
+
+CC: stable@vger.kernel.org # 7.1+
+
+> diff --git a/fs/btrfs/raid56.c b/fs/btrfs/raid56.c
+> index 00a01b97cc0c4..93de764d70100 100644
+> --- a/fs/btrfs/raid56.c
+> +++ b/fs/btrfs/raid56.c
+> @@ -2910,11 +2910,11 @@ static int scrub_assemble_read_bios(struct btrfs_raid_bio *rbio)
+
+[ ... ]
+
+> -		paddrs = sector_paddrs_in_rbio(rbio, stripe, sectornr, 1);
+> -		if (paddrs == NULL)
+> +		if (sector_paddrs_in_rbio(rbio, stripe, sectornr, 1))
+>  			continue;
+>  
+
+[Severity: High]
+This is a pre-existing issue, but does lockless access to rbio->bio_list
+cause a data race leading to leaked bios or hung tasks?
+
+Looking at rbio_orig_end_io() in fs/btrfs/raid56.c, if Thread A encounters
+an error during RMW (e.g., rmw_read_wait_recover() fails), it jumps to the
+error path and calls bio_list_get() locklessly while the rbio is still
+globally visible:
+
+Thread A in rbio_orig_end_io():
+    struct bio *cur = bio_list_get(&rbio->bio_list);
+
+Concurrently, Thread B (another writer) can call lock_stripe_add(), find
+the rbio, and call merge_rbio() which mutates the same list under the lock:
+
+Thread B in merge_rbio():
+    bio_list_merge_init(&dest->bio_list, &victim->bio_list);
+
+Since Thread A's lockless bio_list_get() clears bl->head and bl->tail, could
+compiler or CPU reordering (e.g., setting tail = NULL then head = NULL)
+cause Thread B to see an empty list and assign new_rbio to head, only for
+Thread A's delayed head = NULL store to overwrite and leak new_rbio?
+
+Could this permanently hang Thread B, or cause a NULL dereference if there
+is a compiler reload of bl->tail in Thread B?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260716174511.8738-1-nickolay.lysenko@gmail.com?part=1
+

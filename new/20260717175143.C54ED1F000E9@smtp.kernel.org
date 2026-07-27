@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Fri Jul 17 19:51:45 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/4] btrfs: handle ENOMEM from btrfs_insert_dir_item()
+ without aborting
+Date: Fri, 17 Jul 2026 17:51:43 +0000
+Message-Id: <20260717175143.C54ED1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] The ENOMEM error path in btrfs_create_new_inode() clears the in-memory inode's nlink and adds an orphan item, but fails to call btrfs_update_inode() to persist the nlink=0 state to the on-disk INODE_ITEM. If a crash occurs before VFS eviction, the inode is permanently leaked.
+--
+
+--- Patch [3]: [PATCH 3/4] btrfs: handle ENOMEM from btrfs_insert_dir_item() without aborting ---
+commit 7a94fe4db2da79c8253cdf19e7ebf4709dd46141
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: handle ENOMEM from btrfs_insert_dir_item() without aborting
+
+This commit updates btrfs_create_new_inode() and btrfs_add_link() to handle
+-ENOMEM gracefully instead of aborting the transaction. When adding a link
+fails due to memory pressure, it converts the newly created inode into an
+orphan to ensure it is cleaned up during eviction or crash recovery.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index b7b4e61771355..4d9947ae08f72 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+
+[ ... ]
+
+> @@ -6676,7 +6676,20 @@ int btrfs_create_new_inode(struct btrfs_trans_handle *trans,
+>  	} else {
+>  		ret = btrfs_add_link(trans, BTRFS_I(dir), BTRFS_I(inode), name,
+>  				     false, BTRFS_I(inode)->dir_index);
+> -		if (unlikely(ret)) {
+> +		if (ret == -ENOMEM) {
+> +			/*
+> +			 * The ENOMEM came before the DIR_ITEM was inserted,
+> +			 * so the btree has our INODE_ITEM + INODE_REF but no
+> +			 * directory entry. Convert this into an orphan so
+> +			 * eviction (or crash-recovery) cleans up the inode.
+> +			 */
+> +			clear_nlink(inode);
+> +			ret = btrfs_orphan_add(trans, BTRFS_I(inode));
+> +			if (unlikely(ret))
+> +				btrfs_abort_transaction(trans, ret);
+> +			ret = -ENOMEM;
+> +			goto discard;
+
+[Severity: High]
+When we clear the in-memory nlink and add an orphan item, do we also need
+to call btrfs_update_inode() to persist the nlink=0 state to the b-tree
+before the transaction ends?
+
+If a crash occurs before the eviction finishes, could the transaction commit
+with the b-tree containing an inode item with nlink=1 alongside the new
+orphan item?
+
+During the next mount, wouldn't btrfs_orphan_cleanup() assume an on-disk
+inode with nlink > 0 is a legacy truncate orphan, delete the orphan item,
+and leave the actual inode untouched, resulting in a permanent metadata
+leak?
+
+> +		} else if (unlikely(ret)) {
+>  			btrfs_abort_transaction(trans, ret);
+>  			goto discard;
+>  		}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260717-btrfs-enomem-v1-0-cdc9c0e265d0@kernel.org?part=3
+

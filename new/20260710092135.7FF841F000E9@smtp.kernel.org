@@ -1,0 +1,189 @@
+From sashiko-bot@kernel.org Fri Jul 10 11:23:05 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v11 12/20] xfs: handle fsverity I/O in write/read path
+Date: Fri, 10 Jul 2026 09:21:35 +0000
+Message-Id: <20260710092135.7FF841F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] Flawed offset check in xfs_bmapi_convert_one_delalloc drops IOMAP_F_FSVERITY during extent merging, causing silent loss of fs-verity metadata.
+- [High] Extent size hints bypass setting IOMAP_F_FSVERITY, exposing fs-verity metadata to userspace.
+- [High] Missing IOMAP_F_FSVERITY flag on srcmap during out-of-place writes causes fs-verity metadata corruption during read-modify-write.
+- [High] Reads crossing from the data region into the fs-verity metadata region lack IOMAP_F_FSVERITY, causing cached Merkle tree blocks to be incorrectly zeroed.
+--
+
+--- Patch [12]: [PATCH v11 12/20] xfs: handle fsverity I/O in write/read path ---
+commit f5ba8491e45994ec8f36b2d6cf7dda1e373bdbd4
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: handle fsverity I/O in write/read path
+
+This commit introduces handling for fs-verity I/O in XFS by passing the
+IOMAP_F_FSVERITY flag during writeback and read paths. It ensures iomap
+knows when I/O happens past EOF for Merkle tree construction.
+
+> diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+> index d64defeda645e..cc48f6e20e800 100644
+> --- a/fs/xfs/libxfs/xfs_bmap.c
+> +++ b/fs/xfs/libxfs/xfs_bmap.c
+[ ... ]
+> @@ -4402,6 +4404,10 @@ xfs_bmapi_convert_one_delalloc(
+>  	 * the extent.  Just return the real extent at this offset.
+>  	 */
+>  	if (!isnullstartblock(bma.got.br_startblock)) {
+> +		if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION) &&
+> +		    XFS_FSB_TO_B(mp, bma.got.br_startoff) >=
+> +			    xfs_fsverity_metadata_offset(ip))
+> +			flags |= IOMAP_F_FSVERITY;
+>  		xfs_bmbt_to_iomap(ip, iomap, &bma.got, 0, flags,
+
+[Severity: High]
+Will this check fail if the newly allocated metadata extent is merged
+with a preceding data extent?
+
+Since XFS can aggressively merge contiguous extents, the merged br_startoff
+might become the start of the data extent, making it less than the metadata
+offset.
+
+If the check fails and IOMAP_F_FSVERITY is omitted, won't the generic iomap
+writeback code see a folio past EOF without the verity flag and discard it,
+causing silent loss of the Merkle tree?
+
+>  				xfs_iomap_inode_sequence(ip, flags));
+>  		if (seq)
+> @@ -4449,6 +4455,11 @@ xfs_bmapi_convert_one_delalloc(
+>  	XFS_STATS_ADD(mp, xs_xstrat_bytes, XFS_FSB_TO_B(mp, bma.length));
+>  	XFS_STATS_INC(mp, xs_xstrat_quick);
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION) &&
+> +	    XFS_FSB_TO_B(mp, bma.got.br_startoff) >=
+> +		    xfs_fsverity_metadata_offset(ip))
+> +		flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: High]
+Does this face the same extent merging issue as the check above?
+
+If the new metadata extent merges with adjacent data blocks, the offset
+check will fail and drop the flag.
+
+>  	ASSERT(!isnullstartblock(bma.got.br_startblock));
+>  	xfs_bmbt_to_iomap(ip, iomap, &bma.got, 0, flags,
+>  				xfs_iomap_inode_sequence(ip, flags));
+[ ... ]
+> diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+> index 225c3de88d03b..fba51902416b0 100644
+> --- a/fs/xfs/xfs_iomap.c
+> +++ b/fs/xfs/xfs_iomap.c
+> @@ -1589,7 +1591,8 @@ xfs_zoned_buffered_write_iomap_begin(
+>  	loff_t			count,
+>  	unsigned		flags,
+>  	struct iomap		*iomap,
+> -	struct iomap		*srcmap)
+> +	struct iomap		*srcmap,
+> +	u16			iomap_flags)
+>  {
+>  	struct iomap_iter	*iter =
+>  		container_of(iomap, struct iomap_iter, iomap);
+> @@ -1599,7 +1602,6 @@ xfs_zoned_buffered_write_iomap_begin(
+>  	struct xfs_mount	*mp = ip->i_mount;
+>  	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
+>  	xfs_fileoff_t		end_fsb = xfs_iomap_end_fsb(mp, offset, count);
+> -	u16			iomap_flags = IOMAP_F_SHARED;
+>  	unsigned int		lockmode = XFS_ILOCK_EXCL;
+>  	xfs_filblks_t		count_fsb;
+>  	xfs_extlen_t		indlen;
+> @@ -1607,6 +1609,8 @@ xfs_zoned_buffered_write_iomap_begin(
+>  	struct xfs_iext_cursor	icur;
+>  	int			error = 0;
+>  
+> +	iomap_flags = iomap_flags | IOMAP_F_SHARED;
+> +
+
+[Severity: High]
+Should the source mapping in xfs_zoned_buffered_write_iomap_begin() include
+the IOMAP_F_FSVERITY flag instead of hardcoding 0 for the iomap_flags
+argument?
+
+Looking at the unaligned write fallback later in this function:
+
+fs/xfs/xfs_iomap.c:xfs_zoned_buffered_write_iomap_begin() {
+    ...
+    if (!IS_ALIGNED(offset, mp->m_sb.sb_blocksize) || ... ) {
+        ...
+        error = xfs_bmbt_to_iomap(ip, srcmap, &smap, flags, 0,
+                xfs_iomap_inode_sequence(ip, 0));
+    ...
+}
+
+During an unaligned write, read-modify-write requires the source mapping.
+If the IOMAP_F_FSVERITY flag is missing on the srcmap, the iomap layer
+might assume blocks past EOF should be zeroed.
+
+Could this unintentionally zero out previously written Merkle tree blocks
+and corrupt the fs-verity metadata?
+
+[ ... ]
+> @@ -1803,9 +1807,12 @@ xfs_buffered_write_iomap_begin(
+>  	if (xfs_is_shutdown(mp))
+>  		return -EIO;
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+>  	if (xfs_is_zoned_inode(ip))
+>  		return xfs_zoned_buffered_write_iomap_begin(inode, offset,
+> -				count, flags, iomap, srcmap);
+> +				count, flags, iomap, srcmap, iomap_flags);
+>  
+>  	/* we can't use delayed allocations when using extent size hints */
+>  	if (xfs_get_extsz_hint(ip))
+>  		return xfs_direct_write_iomap_begin(inode, offset, count,
+>  				flags, iomap, srcmap);
+
+[Severity: High]
+Does this fallback to xfs_direct_write_iomap_begin() drop the newly
+assigned IOMAP_F_FSVERITY flag?
+
+If a file has an extent size hint configured, the delegation skips passing
+the iomap_flags variable entirely.
+
+Without this flag, could the generic iomap write code update i_size when
+appending the Merkle tree past EOF, unintentionally exposing the internal
+fs-verity metadata to userspace?
+
+[ ... ]
+> @@ -2191,12 +2198,17 @@ xfs_read_iomap_begin(
+>  	bool			shared = false;
+>  	unsigned int		lockmode = XFS_ILOCK_SHARED;
+>  	u64			seq;
+> +	unsigned int		iomap_flags = 0;
+>  
+>  	ASSERT(!(flags & (IOMAP_WRITE | IOMAP_ZERO)));
+>  
+>  	if (xfs_is_shutdown(mp))
+>  		return -EIO;
+>  
+> +	if (fsverity_active(inode) &&
+> +	    (offset >= xfs_fsverity_metadata_offset(ip)))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: High]
+What happens if a read operation (like a large readahead) starts in the
+data region but spans across the boundary into the fs-verity metadata
+region?
+
+If the starting offset is less than the metadata offset, IOMAP_F_FSVERITY
+won't be set. Because the returned iomap isn't truncated at the metadata
+boundary, it will cover the metadata region without the required flag.
+
+Will the generic iomap read code then incorrectly zero the folios past
+i_size in the page cache instead of reading the Merkle tree from disk?
+
+>  	error = xfs_ilock_for_iomap(ip, flags, &lockmode);
+>  	if (error)
+>  		return error;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260710085256.3464201-1-aalbersh@kernel.org?part=12
+

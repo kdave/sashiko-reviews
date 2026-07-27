@@ -1,0 +1,71 @@
+From sashiko-bot@kernel.org Tue Jul 14 08:31:50 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/3] btrfs: restore active device pointers after failed
+ sprout
+Date: Tue, 14 Jul 2026 06:31:48 +0000
+Message-Id: <20260714063148.D54DB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Missing RCU synchronization before freeing `device` on the error path leads to a Use-After-Free for concurrent RCU readers.
+--
+
+--- Patch [2]: [PATCH 2/3] btrfs: restore active device pointers after failed sprout ---
+commit ebdb664a2f18aad32adfe3a8d81d8157700e4cd0
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: restore active device pointers after failed sprout
+    
+This commit restores the active device pointers to the latest seed device
+before removing and releasing a failed sprout device. This prevents a
+crash when btrfs_show_devname() subsequently dereferences a freed
+latest_dev pointer.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 556d8a60a5ec9..a14f186f5b07f 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -3070,6 +3070,9 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  error_sysfs:
+>  	btrfs_sysfs_remove_device(device);
+>  	mutex_lock(&fs_info->fs_devices->device_list_mutex);
+> +	if (seeding_dev)
+> +		btrfs_assign_next_active_device(device,
+> +						seed_devices->latest_dev);
+>  	mutex_lock(&fs_info->chunk_mutex);
+>  	if (!list_empty(&device->post_commit_list))
+>  		list_del_init(&device->post_commit_list);
+
+[Severity: High]
+This is a pre-existing issue, but while this patch restores the active
+device pointer to prevent one crash, does it leave the device exposed to a
+use-after-free via RCU?
+
+Further down in this same error path, the device is removed from the RCU
+list and immediately freed:
+
+btrfs_init_new_device() {
+    ...
+error_sysfs:
+    ...
+    list_del_rcu(&device->dev_list);
+    ...
+error_free_device:
+    btrfs_free_device(device);
+    ...
+}
+
+Because btrfs_free_device() directly frees the memory via kfree() without
+waiting for an RCU grace period (e.g., using synchronize_rcu() or
+kfree_rcu()), concurrent RCU readers iterating fs_devices->devices could
+dereference the freed device.
+
+Additionally, any RCU reader that read the old latest_dev pointer before
+this restoration could still access the freed memory during the grace
+period. Should this error path ensure an RCU grace period elapses before
+freeing the device?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260714061037.1014-1-3497809730@qq.com?part=2
+

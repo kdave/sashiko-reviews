@@ -1,0 +1,53 @@
+From sashiko-bot@kernel.org Mon Jun  8 12:16:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: do not overwrite NODATASUM flag when removing
+ NODATACOW flag
+Date: Mon, 08 Jun 2026 10:16:13 +0000
+Message-Id: <20260608101614.217C31F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Explicitly disabling NOCOW (`chattr -C`) on a zero-sized file permanently and silently strips data checksumming, as `BTRFS_INODE_NODATASUM` is no longer cleared.
+--
+
+commit 802848ac879a8282b2e655b6bd6b391d774a071c
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: do not overwrite NODATASUM flag when removing NODATACOW flag
+    
+This commit fixes an issue where setting the SYNC flag clears the NODATASUM
+flag inherited from mount options. It does this by preventing the removal of
+the NODATASUM flag when the NOCOW flag is absent.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index a39460bf68a77..13af5be1c5fc7 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -335,8 +335,7 @@ int btrfs_fileattr_set(struct mnt_idmap *idmap,
+>  		 */
+>  		if (S_ISREG(inode->vfs_inode.i_mode)) {
+>  			if (inode->vfs_inode.i_size == 0)
+> -				inode_flags &= ~(BTRFS_INODE_NODATACOW |
+> -						 BTRFS_INODE_NODATASUM);
+> +				inode_flags &= ~BTRFS_INODE_NODATACOW;
+
+[Severity: High]
+When a user explicitly disables NOCOW via chattr -C on a zero-sized file,
+does this change permanently and silently strip data checksumming?
+
+Because BTRFS_INODE_NODATASUM is no longer cleared here, the file will appear
+as a normal COW file (since the C attribute is no longer visible in lsattr),
+but Btrfs might silently skip checksum generation for all future writes to
+this file.
+
+To fix the chattr +S bug without breaking chattr -C, would it be better to
+check if FS_NOCOW_FL actually changed between old_fsflags and fsflags, and
+only toggle NODATACOW and NODATASUM if a change to the NOCOW state was
+explicitly requested?
+
+>  		} else {
+>  			inode_flags &= ~BTRFS_INODE_NODATACOW;
+>  		}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/e0be9c192cf8896a7f02ae23880f8e4921102129.1780912039.git.wqu@suse.com?part=1
+
