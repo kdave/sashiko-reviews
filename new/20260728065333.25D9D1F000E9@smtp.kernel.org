@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Tue Jul 28 08:53:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: add validation for extent states
+Date: Tue, 28 Jul 2026 06:53:32 +0000
+Message-Id: <20260728065333.25D9D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Unaligned extent state in dedupe at EOF triggers ASSERT panic.
+--
+
+--- Patch [2]: [PATCH 2/2] btrfs: add validation for extent states ---
+commit 4f336aaf8ca167e85f10047f6a85a937d0773851
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: add validation for extent states
+    
+This commit introduces a basic alignment check for extent states during
+insert_state_fast(), insert_state(), and split_state() to ensure all extent
+maps inserted into the tree are aligned.
+
+> diff --git a/fs/btrfs/extent-io-tree.c b/fs/btrfs/extent-io-tree.c
+> index c18ea5ef2974a..4f1ef33f17ac0 100644
+> --- a/fs/btrfs/extent-io-tree.c
+> +++ b/fs/btrfs/extent-io-tree.c
+
+[ ... ]
+
+> @@ -403,6 +403,21 @@ static void set_state_bits(struct extent_io_tree *tree,
+>  	state->state |= bits_to_set;
+>  }
+>  
+> +static void validate_extent_state(const struct extent_io_tree *tree,
+> +				  struct extent_state *state)
+> +{
+> +	u32 blocksize;
+> +
+> +	if (tree->owner != IO_TREE_INODE_IO)
+> +		return;
+> +
+> +	blocksize = btrfs_extent_io_tree_to_fs_info(tree)->sectorsize;
+> +	ASSERT(IS_ALIGNED(state->start, blocksize) &&
+> +	       IS_ALIGNED(state->end + 1, blocksize),
+
+[Severity: High]
+Will this assertion trigger a kernel panic during unaligned dedupe requests?
+
+VFS dedupe permits an unaligned request length if the range extends exactly
+to EOF. When this happens, btrfs_extent_same_range() passes this unaligned
+length and explicitly requests an extent lock:
+
+fs/btrfs/reflink.c:btrfs_extent_same_range() {
+    ...
+    const u64 end = dst_loff + len - 1;
+    ...
+    btrfs_lock_extent(&dst->io_tree, dst_loff, end, &cached_state);
+    ...
+}
+
+Doesn't this create an extent state with an unaligned exclusive end, which
+will fail the IS_ALIGNED(state->end + 1, blocksize) check and trigger this
+ASSERT?
+
+> +	       "unaligned extent state, blocksize=%u start=%llu end=%llu state=0x%x",
+> +	       blocksize, state->start, state->end, state->state);
+> +}
+> +
+>  /*
+>   * Insert an extent_state struct into the tree.  'bits' are set on the
+>   * struct before it is inserted.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1785220613.git.wqu@suse.com?part=2
+

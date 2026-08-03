@@ -1,0 +1,83 @@
+From sashiko-bot@kernel.org Mon Aug  3 02:01:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: fix use-after-free in
+ btrfs_reset_unused_block_groups()
+Date: Mon, 03 Aug 2026 00:01:48 +0000
+Message-Id: <20260803000149.1EB4E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Concurrent block group deletion leads to data destruction via TOCTOU zone reset
+--
+
+--- Patch [1]: [PATCH] btrfs: zoned: fix use-after-free in btrfs_reset_unused_block_groups() ---
+commit 877b2e7b2f7c49beea0eef6d1a50b12c392abfef
+Author: Shuangpeng Bai <shuangpeng.kernel@gmail.com>
+
+btrfs: zoned: fix use-after-free in btrfs_reset_unused_block_groups()
+
+This patch resolves a use-after-free by retaining a reference to the
+block group while accessing its physical_map and performing zone resets.
+The reference is dropped only after operations complete or error out.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index a016cb471beb4..e30b6a61c7819 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -3182,6 +3181,7 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  
+>  			if (ret) {
+>  				up_read(&fs_info->dev_replace.rwsem);
+> +				btrfs_put_block_group(bg);
+>  				return ret;
+>  			}
+>  		}
+> @@ -3193,6 +3193,7 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		if (bg->ro) {
+>  			spin_unlock(&bg->lock);
+>  			spin_unlock(&space_info->lock);
+
+[Severity: Critical]
+This is a pre-existing issue, but does this zone reset sequence have a
+time-of-check to time-of-use race?
+
+Looking at btrfs_reset_unused_block_groups(), blkdev_zone_mgmt() is called
+with REQ_OP_ZONE_RESET earlier in this loop without holding locks that would
+prevent the chunk from being concurrently deleted.
+
+Could a concurrent operation that iterates the chunk tree (such as a balance
+racing with memory pressure flushing) discover the empty block group, set
+it to read-only, remove the logical chunk, and free the physical device
+extents?
+
+If those physical extents are immediately reallocated to a new chunk, could
+the delayed REQ_OP_ZONE_RESET wipe the newly allocated zone data when it
+reaches the disk?
+
+Since this bg->ro check happens after the physical zone has already been
+reset:
+
+fs/btrfs/zoned.c:btrfs_reset_unused_block_groups() {
+    ...
+    ret = blkdev_zone_mgmt(stripe->dev->bdev, REQ_OP_ZONE_RESET, ...);
+    ...
+    if (bg->ro) {
+        spin_unlock(&bg->lock);
+        ...
+}
+
+Does this check occur too late to prevent the destructive I/O?
+
+> +			btrfs_put_block_group(bg);
+>  			continue;
+>  		}
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260802232815.3180433-1-shuangpeng.kernel@gmail.com?part=1
+

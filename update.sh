@@ -25,5 +25,6 @@ for mbox in wip.*; do
 		echo "SKIP: $mbox $mid"
 		continue
 	fi
+	echo "NEW: $mbox $mid"
 	"$here/qpdecode.py" "$mbox" "$newdir/$mid"
 done

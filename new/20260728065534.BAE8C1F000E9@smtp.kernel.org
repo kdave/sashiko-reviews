@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Tue Jul 28 08:55:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: use proper inclusive end in extent_fiemap()
+Date: Tue, 28 Jul 2026 06:55:34 +0000
+Message-Id: <20260728065534.BAE8C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] If fiemap encounters an explicit hole or prealloc extent that spans beyond the requested range (start + len), and multiple delalloc extents exist within that extent, a cache flush will cause `len` to underflow. On restart, this passes an inverted range to `btrfs_lock_extent()`, corrupting the extent io tree.
+--
+
+--- Patch [1]: [PATCH 1/2] btrfs: use proper inclusive end in extent_fiemap() ---
+commit 0b1bab8c1ce6860f6eb4244dd316e857bc0bce56
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: use proper inclusive end in extent_fiemap()
+
+The @end parameter for all extent io tree helpers is inclusive, but
+the call site in extent_fiemap() is passing exclusive end.
+
+Fix it to follow the common pattern.
+
+> diff --git a/fs/btrfs/fiemap.c b/fs/btrfs/fiemap.c
+> index 6263e837093e4..63ebb803ca931 100644
+> --- a/fs/btrfs/fiemap.c
+> +++ b/fs/btrfs/fiemap.c
+> @@ -657,7 +657,7 @@ static int extent_fiemap(struct btrfs_inode *inode,
+>  
+>  restart:
+>  	range_start = round_down(start, sectorsize);
+> -	range_end = round_up(start + len, sectorsize);
+> +	range_end = round_up(start + len, sectorsize) - 1;
+>  	prev_extent_end = range_start;
+>  
+>  	btrfs_lock_extent(&inode->io_tree, range_start, range_end, &cached_state);
+
+[Severity: Critical]
+This is a pre-existing issue, but can this lead to an inverted range being
+passed to btrfs_lock_extent() and corrupting the extent io tree?
+
+If FIEMAP encounters an explicit hole or prealloc extent that spans beyond the
+requested range (start + len), and multiple delalloc extents exist within that
+extent, a cache flush could cause len to underflow.
+
+Unlike the implicit hole case, explicit holes and prealloc extents pass
+extent_end - 1 without bounding it to range_end:
+
+fs/btrfs/fiemap.c:extent_fiemap() {
+...
+		} else if (disk_bytenr == 0) {
+			/* We have an explicit hole. */
+			ret = fiemap_process_hole(inode, fieinfo, &cache,
+						  &delalloc_cached_state,
+						  backref_ctx, 0, 0, 0,
+						  key.offset, extent_end - 1);
+...
+}
+
+This allows the scan to exceed the requested range. When the fiemap cache
+fills, emit_fiemap_extent() returns BTRFS_FIEMAP_FLUSH_CACHE with
+next_search_offset greater than the originally requested start + len.
+
+When the flush handler runs, it updates len and start:
+
+fs/btrfs/fiemap.c:extent_fiemap() {
+...
+out_unlock:
+	btrfs_unlock_extent(&inode->io_tree, range_start, range_end, &cached_state);
+
+	if (ret == BTRFS_FIEMAP_FLUSH_CACHE) {
+		btrfs_release_path(path);
+		ret = flush_fiemap_cache(fieinfo, &cache);
+		if (ret)
+			goto out;
+		len -= cache.next_search_offset - start;
+		start = cache.next_search_offset;
+		goto restart;
+...
+}
+
+This would underflow len. On the next iteration at restart, range_start
+becomes the new next_search_offset but range_end would be calculated based
+on the underflowed len (which evaluates to the original end). This
+results in range_start > range_end.
+
+Would this corrupted range then be passed down to set_extent_bit() via
+btrfs_lock_extent(), potentially causing tree operations to hit WARN_ON_ONCE
+and panic or deadlock?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1785220613.git.wqu@suse.com?part=1
+

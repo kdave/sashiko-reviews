@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Thu Jul 30 03:54:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] iomap: follow the alignment requirement for
+ iomap_dio_hole_iter()
+Date: Thu, 30 Jul 2026 01:48:59 +0000
+Message-Id: <20260730014859.7728F1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] iomap_dio_alignment() dereferences iter->iomap.bdev which can be NULL for IOMAP_HOLE, causing a kernel panic.
+--
+
+--- Patch [1]: [PATCH] iomap: follow the alignment requirement for iomap_dio_hole_iter() ---
+commit d22fa5f9ca1c2df6f2f80b321eeb9d10cbfd002a
+Author: Qu Wenruo <wqu@suse.com>
+
+iomap: follow the alignment requirement for iomap_dio_hole_iter()
+
+This commit introduces more strict alignment handling in iomap_dio_hole_iter()
+to resolve a btrfs assertion failure with 8K block sizes on 4K page systems.
+It extracts a new iomap_dio_alignment() helper to consistently compute
+alignment for both IOMAP_HOLE and bio iterations.
+
+> --- a/fs/iomap/direct-io.c
+> +++ b/fs/iomap/direct-io.c
+[ ... ]
+> +/*
+> + * File systems that write out of place and always allocate new blocks
+> + * need each bio to be block aligned as that's the unit of allocation.
+> + */
+> +static unsigned int iomap_dio_alignment(const struct iomap_iter *iter,
+> +					const struct iomap_dio *dio)
+> +{
+> +	if (dio->flags & IOMAP_DIO_FSBLOCK_ALIGNED)
+> +		return i_blocksize(iter->inode);
+> +	return bdev_logical_block_size(iter->iomap.bdev);
+
+[Severity: Critical]
+Can iter->iomap.bdev be NULL when this is called for an unmapped extent?
+
+If a filesystem (such as EROFS) returns IOMAP_HOLE from its iomap_begin()
+callback, it may leave iomap->bdev uninitialized (NULL). If that filesystem
+also doesn't set IOMAP_DIO_FSBLOCK_ALIGNED, bdev_logical_block_size() will
+dereference the NULL pointer.
+
+[ ... ]
+> @@ -588,12 +591,15 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+>  
+>  static int iomap_dio_hole_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+>  {
+> -	loff_t length = iov_iter_zero(iomap_length(iter), dio->submit.iter);
+> +	loff_t copied = iov_iter_zero(iomap_length(iter), dio->submit.iter);
+> +	const unsigned int alignment = iomap_dio_alignment(iter, dio);
+
+[Severity: Critical]
+Does calling iomap_dio_alignment() here make the IOMAP_HOLE path vulnerable
+to a NULL pointer dereference?
+
+Previously, the IOMAP_HOLE handling path ignored iomap->bdev. With this
+change, an unprivileged user performing an O_DIRECT read on a file
+containing a hole could trigger a kernel panic if the underlying filesystem
+does not initialize iomap->bdev for holes.
+
+> +	const loff_t aligned_copied = round_down(copied, alignment);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/e69cc8a4a9c3f641b97872b50f04c397880077cd.1785374485.git.wqu@suse.com?part=1
+

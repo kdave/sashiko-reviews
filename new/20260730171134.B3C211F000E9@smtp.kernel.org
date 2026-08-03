@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Thu Jul 30 19:11:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: skip hole detection during full fsync for files
+ without holes
+Date: Thu, 30 Jul 2026 17:11:34 +0000
+Message-Id: <20260730171134.B3C211F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] The `i_size == inode_get_bytes()` optimization in `btrfs_log_holes()` is vulnerable to a race condition with a concurrent shrinking truncate, leading to skipped hole logging and resurrection of deleted data after a crash.
+--
+
+--- Patch [1]: [PATCH] btrfs: skip hole detection during full fsync for files without holes ---
+commit eb76e3c69d947472e8b431fa2116a87c21b207a4
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: skip hole detection during full fsync for files without holes
+
+This patch adds an optimization to skip searching for holes during a full
+fsync if the file has no prealloc extents and its uncompressed disk space
+used matches its i_size.
+
+> diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+> index 875e4ddc68eae..a7eed033f09b0 100644
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+> @@ -5622,6 +5622,14 @@ static int btrfs_log_holes(struct btrfs_trans_handle *trans,
+>  	if (!btrfs_fs_incompat(fs_info, NO_HOLES) || i_size == 0)
+>  		return 0;
+>  
+> +	/*
+> +	 * If there are no prealloc extents (which can be located past i_size),
+> +	 * and disk space used matches the i_size, then there are no holes.
+> +	 */
+> +	if (!(inode->flags & BTRFS_INODE_PREALLOC) &&
+> +	    i_size == inode_get_bytes(&inode->vfs_inode))
+> +		return 0;
+> +
+
+[Severity: Critical]
+Is this optimization vulnerable to a race condition with a concurrent
+shrinking truncate?
+
+During a shrinking truncate, truncate_setsize() updates i_size before
+btrfs_truncate() decrements the bytes used via inode_get_bytes().
+
+Concurrently, if a directory fsync() is triggered on the parent directory, it
+can call log_new_dir_dentries(), which recursively logs the child file via
+btrfs_log_inode() without holding the child's VFS inode_lock.
+
+Under these conditions, could i_size == inode_get_bytes() temporarily
+evaluate to true in btrfs_log_holes(), causing the hole logging to be
+completely bypassed?
+
+For example, if a user punches a hole from 0-4K, writes from 4K-8K, and then
+truncates the file to 4K, the new i_size (4K) could temporarily match the
+current inode_get_bytes() (4K) during this window.
+
+If hole logging is skipped, would this result in failing to apply the hole
+during log replay, leaving stale data accessible after a crash?
+
+>  	key.objectid = ino;
+>  	key.type = BTRFS_EXTENT_DATA_KEY;
+>  	key.offset = 0;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/2673cd12fadb5269b39417694d82e02b90a482f7.1785429154.git.fdmanana@suse.com?part=1
+

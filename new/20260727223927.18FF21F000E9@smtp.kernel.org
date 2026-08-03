@@ -1,0 +1,126 @@
+From sashiko-bot@kernel.org Tue Jul 28 00:39:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: trigger cow fixup via dirty_folio()
+Date: Mon, 27 Jul 2026 22:39:26 +0000
+Message-Id: <20260727223927.18FF21F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Critical] Asynchronous fixup workers cause data loss and busy inodes during unmount.
+- [Critical] `fsync()` prematurely returns success without writing data to disk for folios requiring a writepage fixup, leading to data loss upon power failure.
+- [High] A time-of-check to time-of-use (TOCTOU) race condition in `btrfs_data_dirty_folio` allows a NULL pointer dereference when accessing `folio->private`.
+--
+
+--- Patch [1]: [PATCH v3] btrfs: trigger cow fixup via dirty_folio() ---
+commit a531f849fed31552ede150706fbcf75b797f106d
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: trigger cow fixup via dirty_folio()
+
+This commit reintroduces a writepage fixup mechanism for btrfs to handle
+folios that are dirtied without a prior space reservation. It adds a
+new dirty_folio callback that queues asynchronous space reservation
+workers during writeback.
+
+Link: https://lore.kernel.org/linux-btrfs/20260721191152.101118-1-borntraeger@linux.ibm.com/
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index de5785117a47f..f032f0858f40f 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+
+[ ... ]
+
+> @@ -1440,6 +1440,115 @@ static bool find_next_delalloc_bitmap(struct folio *folio,
+> +static noinline_for_stack int writepage_fixup(struct btrfs_inode *inode,
+> +					      struct folio *folio,
+> +					      struct btrfs_bio_ctrl *bio_ctrl)
+> +{
+
+[ ... ]
+
+> +	if (likely(found_fixup)) {
+> +		btrfs_queue_writepage_fixup(inode, folio);
+> +		folio_redirty_for_writepage(bio_ctrl->wbc, folio);
+> +		if (bitmap_empty(bio_ctrl->submit_bitmap, blocks_per_folio)) {
+> +			folio_unlock(folio);
+> +			return 1;
+> +		}
+
+[Severity: Critical]
+Does this bypass fsync waiting and risk data loss upon power failure?
+
+When fsync initiates a WB_SYNC_ALL writeback pass, returning 1 here
+skips I/O submission without setting the writeback flag on the folio.
+
+Because the writeback flag is not set, filemap_fdatawait_range will return
+immediately and fsync will report success to userspace while the data
+remains only dirty in memory.
+
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index b446c3014b240..3fcc377d2b1bf 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+
+[ ... ]
+
+> @@ -2812,6 +2812,163 @@ int btrfs_set_extent_delalloc(struct btrfs_inode *inode, u64 start, u64 end,
+> +static void btrfs_writepage_fixup_worker(struct work_struct *work)
+> +{
+
+[ ... ]
+
+> +		ret = btrfs_set_extent_delalloc(inode, start,
+> +						start + sectorsize - 1, 0,
+> +						&cached_state);
+
+[Severity: Critical]
+Will this lead to silent data loss and busy inodes during unmount?
+
+During unmount, sync_filesystem flushes dirty data, but writepage_fixup
+defers folios to this asynchronous worker. sync_filesystem completes
+without waiting for these workers. The worker only reserves space here
+and does not initiate a new writeback pass. 
+
+Because VFS writeback has already ended, evict_inodes fails to tear down
+the inode due to the worker's reference, and the dirty folio is
+ultimately discarded when unmount completes.
+
+
+> diff --git a/fs/btrfs/subpage.c b/fs/btrfs/subpage.c
+> index 2a9397be8116c..27dd677ca687d 100644
+> --- a/fs/btrfs/subpage.c
+> +++ b/fs/btrfs/subpage.c
+
+[ ... ]
+
+> @@ -496,6 +496,172 @@ void btrfs_subpage_clear_writeback(const struct btrfs_fs_info *fs_info,
+> +static void btrfs_subpage_set_fixup_dirty(const struct btrfs_fs_info *fs_info,
+> +					  struct folio *folio, u64 start, u32 len)
+> +{
+> +	struct btrfs_folio_state *bfs = folio_get_private(folio);
+> +	unsigned int dirty_bit = subpage_calc_start_bit(fs_info, folio,
+> +							dirty, start, len);
+> +	unsigned int fixup_bit = subpage_calc_start_bit(fs_info, folio,
+> +							fixup, start, len);
+> +	const unsigned int nbits = len >> fs_info->sectorsize_bits;
+> +	unsigned long flags;
+> +	bool marked = false;
+> +
+> +	spin_lock_irqsave(&bfs->lock, flags);
+
+[Severity: High]
+Can this result in a NULL pointer dereference on the folio private data?
+
+If memory reclaim attempts to evict a pinned folio, release_folio is called
+which detaches and clears the private pointer. If a GUP caller then dirties
+the folio, btrfs_data_dirty_folio calls btrfs_folio_set_fixup_dirty, which
+reaches this point.
+
+Since the private data is now NULL, folio_get_private returns NULL and the
+spin_lock_irqsave dereferences it. Consider calling set_folio_extent_mapped
+in btrfs_data_dirty_folio to re-validate private state after cache lookups.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/69d0043e0f6a3d17048dfde857127ab0bf331154.1785190866.git.boris@bur.io?part=1
+

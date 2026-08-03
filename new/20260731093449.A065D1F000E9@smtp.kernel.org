@@ -1,0 +1,88 @@
+From sashiko-bot@kernel.org Fri Jul 31 11:34:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] iomap: follow the alignment requirement for
+ iomap_dio_hole_iter()
+Date: Fri, 31 Jul 2026 09:34:49 +0000
+Message-Id: <20260731093449.A065D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] Calling iomap_dio_alignment() with a NULL bdev causes a kernel panic in bdev_logical_block_size().
+- [Critical] Unconditional rounding down of `copied` in `iomap_dio_hole_iter()` breaks direct I/O reads at EOF and causes infinite loops.
+--
+
+--- Patch [1]: [PATCH v2] iomap: follow the alignment requirement for iomap_dio_hole_iter() ---
+commit e6841065183c6414d467e3c6e31bfb8e180e887f
+Author: Qu Wenruo <wqu@suse.com>
+
+iomap: follow the alignment requirement for iomap_dio_hole_iter()
+
+This commit modifies iomap_dio_hole_iter() to round down the copied length
+to the filesystem block size and revert the unaligned portion. This is
+intended to fix a btrfs assertion failure when iov_iter_zero() fails at a
+page boundary not aligned to the filesystem block size.
+
+> diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c
+> index 64c6b7286c208..f170976d9de0a 100644
+> --- a/fs/iomap/direct-io.c
+> +++ b/fs/iomap/direct-io.c
+> @@ -594,12 +594,20 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+>  
+>  static int iomap_dio_hole_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+>  {
+> -	loff_t length = iov_iter_zero(iomap_length(iter), dio->submit.iter);
+> +	loff_t copied = iov_iter_zero(iomap_length(iter), dio->submit.iter);
+> +	unsigned int bs = iomap_dio_alignment(iter->inode, iter->iomap.bdev,
+> +					      dio->flags);
+                                              ^^^^^^^^^^
+
+[Severity: Critical]
+Will this cause a NULL pointer dereference for filesystems that leave
+iter->iomap.bdev as NULL for IOMAP_HOLE mappings?
+
+For filesystems like f2fs, erofs, and nilfs2, there is no underlying physical
+block allocated for a hole, so they don't populate iter->iomap.bdev. Since
+they also don't set IOMAP_DIO_FSBLOCK_ALIGNED, calling iomap_dio_alignment()
+will fall back to bdev_logical_block_size(bdev) and dereference the NULL
+pointer:
+
+fs/iomap/direct-io.c:iomap_dio_alignment() {
+	if (dio_flags & IOMAP_DIO_FSBLOCK_ALIGNED)
+		return i_blocksize(inode);
+	return bdev_logical_block_size(bdev);
+}
+
+> +	loff_t aligned_copied = round_down(copied, bs);
+>  
+> -	dio->size += length;
+> -	if (!length)
+> +	/*
+> +	 * If fs block size is larger than page size, page fault failure
+> +	 * can cause @copied to be page aligned but not fs block aligned.
+> +	 */
+> +	iov_iter_revert(dio->submit.iter, copied - aligned_copied);
+> +	dio->size += aligned_copied;
+> +	if (!aligned_copied)
+>  		return -EFAULT;
+                ^^^^^^^^^^^^^^^
+
+[Severity: Critical]
+Could unconditionally rounding down the copied length break direct I/O reads
+at EOF and cause an infinite loop?
+
+If a userspace program performs a direct I/O read that hits a hole at the
+end of a file where the file size is not aligned to the block size,
+__iomap_dio_rw() clamps the length to EOF.
+
+The copied value will be unaligned, and rounding it down will result in 
+aligned_copied == 0. This causes the code to return -EFAULT. In btrfs,
+btrfs_direct_read() intercepts -EFAULT, attempts to fault in the pages,
+and jumps to retry the direct I/O, resulting in an infinite loop that
+locks up the CPU.
+
+> -	return iomap_iter_advance(iter, length);
+> +	return iomap_iter_advance(iter, aligned_copied);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/9209e7204fc6b7b60c28f196750084be8a2faba8.1785489008.git.wqu@suse.com?part=1
+
