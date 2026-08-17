@@ -1,0 +1,103 @@
+From sashiko-bot@kernel.org Mon Aug 17 03:42:43 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix transaction use-after-free in raid stripe
+ insertion
+Date: Mon, 17 Aug 2026 01:42:32 +0000
+Message-Id: <20260817014233.5D9041F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Missing btrfs_mark_buffer_dirty after modifying a b-tree leaf in update_raid_extent_item.
+- [High] Incorrect error code logic in update_raid_extent_item() returns a positive error code or squashes actual errors.
+- [High] Missing size check in update_raid_extent_item() allows overwriting adjacent b-tree items if the existing item is smaller.
+--
+
+--- Patch [1]: [PATCH] btrfs: fix transaction use-after-free in raid stripe insertion ---
+commit 1b40ef991ea438380b7963bb14b2efc93f1405ea
+Author: Shuangpeng Bai <shuangpeng.kernel@gmail.com>
+
+btrfs: fix transaction use-after-free in raid stripe insertion
+
+If allocation of a RAID stripe extent fails,
+btrfs_insert_one_raid_extent() aborts and ends the transaction before
+returning -ENOMEM.
+
+btrfs_finish_one_ordered(), the production caller through
+btrfs_insert_raid_extent(), still owns the transaction handle. It handles
+the error by aborting the transaction and then reaches the common exit
+path, which ends the transaction again.
+[ ... ]
+Cc: stable@vger.kernel.org
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index b210371ce91e3..89e259a47d8de 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+> @@ -337,7 +337,6 @@ int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,
+>  	stripe_extent = kzalloc(item_size, GFP_NOFS);
+>  	if (unlikely(!stripe_extent)) {
+>  		btrfs_abort_transaction(trans, -ENOMEM);
+> -		btrfs_end_transaction(trans);
+>  		return -ENOMEM;
+>  	}
+
+[Severity: High]
+This isn't a bug introduced by this patch, but looking at
+update_raid_extent_item(), which is called further down in
+btrfs_insert_one_raid_extent() when btrfs_insert_item() returns -EEXIST:
+
+fs/btrfs/raid-stripe-tree.c:update_raid_extent_item() {
+	...
+	ret = btrfs_search_slot(trans, trans->fs_info->stripe_root, key, path,
+				0, 1);
+	if (ret)
+		return (ret == 1 ? ret : -EINVAL);
+
+Are we returning a positive error code or squashing actual errors here?
+
+If btrfs_search_slot() returns 1, this propagates up to
+btrfs_insert_one_raid_extent(), which calls btrfs_abort_transaction(trans, 1)
+and violates the API requirement for negative error codes. If it returns a
+genuine negative error, does it get incorrectly squashed into -EINVAL?
+
+[Severity: High]
+This is a pre-existing issue, but further down in update_raid_extent_item():
+
+fs/btrfs/raid-stripe-tree.c:update_raid_extent_item() {
+	...
+	leaf = path->nodes[0];
+	slot = path->slots[0];
+
+	write_extent_buffer(leaf, stripe_extent, btrfs_item_ptr_offset(leaf, slot),
+			    item_size);
+	...
+
+Can this result in a metadata buffer overflow?
+
+We don't check if item_size is less than or equal to
+btrfs_item_size(leaf, slot) before calling write_extent_buffer(). If the
+existing item is smaller, it seems this would write past the item boundaries
+and overwrite adjacent b-tree items.
+
+[Severity: High]
+This is a pre-existing issue, but in the same code block above:
+
+fs/btrfs/raid-stripe-tree.c:update_raid_extent_item() {
+	...
+	write_extent_buffer(leaf, stripe_extent, btrfs_item_ptr_offset(leaf, slot),
+			    item_size);
+
+	return ret;
+}
+
+Are we missing a call to btrfs_mark_buffer_dirty(trans, leaf) here?
+
+The leaf buffer is modified in-place, but without re-dirtying it, the new
+changes might not be flushed to disk when the transaction commits if the
+buffer's dirty bit was cleared due to memory pressure, potentially causing
+silent metadata corruption.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260817012733.2962781-1-shuangpeng.kernel@gmail.com?part=1
+

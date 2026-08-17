@@ -1,0 +1,78 @@
+From sashiko-bot@kernel.org Sat Aug  8 04:45:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/4] btrfs: also validate compression levels in
+ btrfs_compress_is_valid_type()
+Date: Sat, 08 Aug 2026 02:45:47 +0000
+Message-Id: <20260808024548.50ED51F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The commit breaks the build due to a function signature mismatch. The signature of `btrfs_compress_is_valid_type` was changed, but its caller was not updated.
+- [High] The modified validation logic introduces an out-of-bounds read by assuming the raw xattr buffer is NUL-terminated and using string functions like `strlen()` on it.
+--
+
+--- Patch [2]: [PATCH 2/4] btrfs: also validate compression levels in btrfs_compress_is_valid_type() ---
+commit b863ffeaacd8c5acde53e50f2190c679797a93f4
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: also validate compression levels in btrfs_compress_is_valid_type()
+
+This commit changes btrfs_compress_is_valid_type() to use 
+btrfs_match_compress_type() and btrfs_compress_str2level() for more robust
+validation of compression strings. It also drops the len parameter, relying
+on NUL-terminated strings instead.
+
+> diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+> index 58138f300b580..833c5f45afec5 100644
+> --- a/fs/btrfs/compression.c
+> +++ b/fs/btrfs/compression.c
+
+[ ... ]
+
+> -bool btrfs_compress_is_valid_type(const char *str, size_t len)
+> +bool btrfs_compress_is_valid_type(const char *str)
+>  {
+> +	size_t len = strlen(str);
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+[Severity: High]
+Is it safe to assume this string is NUL-terminated?
+
+The value buffer passed from the xattr subsystem into 
+prop_compression_validate() is a raw buffer without guaranteed 
+NUL-termination.
+
+If strlen() is called on this buffer here, and it is subsequently processed
+by btrfs_match_compress_type() or btrfs_compress_str2level() via 
+kstrtoint(), could this result in out-of-bounds memory reads?
+
+[ ... ]
+
+> diff --git a/fs/btrfs/compression.h b/fs/btrfs/compression.h
+> index e67ba47b4cdc5..c63bed9f4152e 100644
+> --- a/fs/btrfs/compression.h
+> +++ b/fs/btrfs/compression.h
+
+[ ... ]
+
+>  const char* btrfs_compress_type2str(enum btrfs_compression_type type);
+> -bool btrfs_compress_is_valid_type(const char *str, size_t len);
+> +bool btrfs_compress_is_valid_type(const char *str);
+                                     ^^^^^^^^^^^^^^^^
+
+[Severity: High]
+Does this signature change break the build?
+
+The commit message mentions that dropping the len parameter is fine because
+it is only used once in props.c. However, looking at fs/btrfs/props.c, the 
+caller prop_compression_validate() does not appear to be updated by this
+patch and still attempts to pass two arguments:
+
+fs/btrfs/props.c:prop_compression_validate() {
+    ...
+    if (btrfs_compress_is_valid_type(value, len))
+        ...
+}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260808023459.1494928-1-koray.fra@gmail.com?part=2
+

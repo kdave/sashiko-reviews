@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Fri Aug 14 07:31:32 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: preserve the compression property when other
+ inode flags change
+Date: Fri, 14 Aug 2026 05:31:22 +0000
+Message-Id: <20260814053122.7F8261F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Concurrent modification of `inode->flags` between `btrfs_fileattr_set()` and asynchronous writeback (`compress_file_range()`) causes dropped attribute updates.
+--
+
+--- Patch [1]: [PATCH] btrfs: preserve the compression property when other inode flags change ---
+commit 1abf06f6e366f2cdbbd6f22dea0381474f49c617
+Author: Sam Ho <samho@synology.com>
+
+btrfs: preserve the compression property when other inode flags change
+
+This commit fixes an issue where setting unrelated file flags via
+FS_IOC_SETFLAGS overwrites the user-selected compression algorithm with
+the mount default. It ensures that the algorithm recorded in the
+compression property is kept unless compression is explicitly enabled.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index baa645e988126..2e54694f06f7f 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -384,9 +384,25 @@ int btrfs_fileattr_set(struct mnt_idmap *idmap,
+>  		inode_flags |= BTRFS_INODE_COMPRESS;
+>  		inode_flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  
+> -		comp = btrfs_compress_type2str(fs_info->compress_type);
+> -		if (!comp || comp[0] == 0)
+> -			comp = btrfs_compress_type2str(BTRFS_COMPRESS_ZLIB);
+> +		/*
+> +		 * If compression was already enabled, keep the algorithm that
+> +		 * is recorded in the compression property. Otherwise changing
+> +		 * an unrelated attribute would reset it to the mount default,
+> +		 * since FS_IOC_SETFLAGS callers pass back the whole flag set
+> +		 * they got from FS_IOC_GETFLAGS.
+> +		 *
+> +		 * Fall back to the default when compression is being enabled
+> +		 * by this call, or when the inode has the compress flag set
+> +		 * but no property, which is possible on filesystems touched by
+> +		 * kernels that did not keep the two in sync.
+> +		 */
+> +		if (old_fsflags & FS_COMPR_FL)
+> +			comp = btrfs_compress_type2str(inode->prop_compress);
+> +		if (!comp || comp[0] == 0) {
+> +			comp = btrfs_compress_type2str(fs_info->compress_type);
+> +			if (!comp || comp[0] == 0)
+> +				comp = btrfs_compress_type2str(BTRFS_COMPRESS_ZLIB);
+> +		}
+
+[Severity: High]
+This is a pre-existing issue, but can this function race with asynchronous
+writeback and silently lose file attributes?
+
+In btrfs_fileattr_set(), we cache the inode flags locally earlier in the
+function, perform operations that could block (like btrfs_start_transaction),
+and then write the cached value back:
+
+fs/btrfs/ioctl.c:btrfs_fileattr_set() {
+        ...
+        inode_flags = inode->flags;
+        ...
+update_flags:
+        inode->flags = inode_flags;
+        ...
+}
+
+Concurrently, if the file is undergoing asynchronous writeback, the worker
+thread can locklessly modify the flags using a non-atomic operation:
+
+fs/btrfs/inode.c:compress_file_range() {
+        ...
+        inode->flags |= BTRFS_INODE_NOCOMPRESS;
+        ...
+}
+
+If the writeback thread performs its read-modify-write while
+btrfs_fileattr_set() is executing, wouldn't the attributes set by chattr
+(such as FS_IMMUTABLE_FL or FS_SYNC_FL) be unconditionally overwritten in
+memory and lost when the cached inode_flags is written back?
+
+>  	} else {
+>  		inode_flags &= ~(BTRFS_INODE_COMPRESS | BTRFS_INODE_NOCOMPRESS);
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260814051406.1244006-1-samho@synology.com?part=1
+

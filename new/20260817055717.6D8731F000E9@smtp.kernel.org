@@ -1,0 +1,84 @@
+From sashiko-bot@kernel.org Mon Aug 17 07:57:28 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5] btrfs: retry verity reads for not-uptodate Merkle
+ folios
+Date: Mon, 17 Aug 2026 05:57:16 +0000
+Message-Id: <20260817055717.6D8731F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Passing `folio_address(folio)` as `dest` to `read_key_bytes` on highmem systems results in a NULL pointer, causing an infinite loop, uninitialized page data, and information leaks.
+--
+
+--- Patch [1]: [PATCH v5] btrfs: retry verity reads for not-uptodate Merkle folios ---
+commit 2d53f2e0a321485d1dfdd6c5c2737a686b3566f0
+Author: Yichong Chen <chenyichong@uniontech.com>
+
+btrfs: retry verity reads for not-uptodate Merkle folios
+
+This commit modifies btrfs_read_merkle_tree_page() to retry reading
+Merkle items when a not-uptodate folio is found in the mapping. It
+also unlocks the folio on read failure so later callers can lock it
+and retry the read.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index 983365a735416..1133a56c0568b 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+
+[ ... ]
+
+> @@ -744,6 +748,7 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  		return ERR_PTR(ret);
+>  	}
+>  
+> +read_folio:
+>  	/*
+>  	 * Merkle item keys are indexed from byte 0 in the merkle tree.
+>  	 * They have the form:
+> @@ -753,6 +758,7 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  	ret = read_key_bytes(BTRFS_I(inode), BTRFS_VERITY_MERKLE_ITEM_KEY, off,
+>  			     folio_address(folio), PAGE_SIZE, folio);
+
+[Severity: High]
+This is a pre-existing issue, but does using folio_address(folio) here
+fail on 32-bit systems with HIGHMEM enabled?
+
+For highmem folios, folio_address() returns NULL. When the dest argument
+is NULL, read_key_bytes() treats it as a signal to only sum lengths,
+skipping the actual data copy and bounds checking:
+
+fs/btrfs/verity.c:read_key_bytes() {
+    ...
+        /* desc = NULL to just sum all the item lengths */
+        if (!dest)
+                copy_end = item_end;
+        else
+                copy_end = min(offset + len, item_end);
+
+        /* Number of bytes in this item we want to copy */
+        copy_bytes = copy_end - offset;
+    ...
+        len -= copy_bytes;
+    ...
+}
+
+Because copy_end is not bounded by len when dest is NULL, copy_bytes
+can exceed len if the Btrfs item is larger than PAGE_SIZE. This causes the
+u64 len variable to underflow, resulting in an infinite while (len > 0)
+loop.
+
+If the loop does terminate, the function succeeds without copying data,
+and btrfs_read_merkle_tree_page() could mark the entirely uninitialized
+highmem folio as uptodate, potentially exposing uninitialized kernel memory.
+
+>  	if (ret < 0) {
+> +		folio_unlock(folio);
+>  		folio_put(folio);
+>  		return ERR_PTR(ret);
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260817054837.1740374-1-chenyichong@uniontech.com?part=1
+

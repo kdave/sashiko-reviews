@@ -1,0 +1,66 @@
+From sashiko-bot@kernel.org Wed Aug  5 00:16:22 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4] iomap: follow the alignment requirement for
+ iomap_dio_hole_iter()
+Date: Tue, 04 Aug 2026 22:16:10 +0000
+Message-Id: <20260804221612.CC8F11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Unconditional filesystem block size alignment in `iomap_dio_hole_iter()` breaks valid sub-block direct I/O reads from holes on filesystems like XFS and ext4.
+--
+
+--- Patch [1]: [PATCH v4] iomap: follow the alignment requirement for iomap_dio_hole_iter() ---
+commit 9bd0077a09f9fdebde6901677e8fb0c64f92f8e0
+Author: Qu Wenruo <wqu@suse.com>
+
+iomap: follow the alignment requirement for iomap_dio_hole_iter()
+
+This commit aligns the copied length down to the filesystem block size in
+iomap_dio_hole_iter() and reverts any excess, to prevent unaligned extent state
+assertions in Btrfs when a page fault interrupts zeroing.
+
+> diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c
+> index 2aa71be36c996..ac2a081e97b62 100644
+> --- a/fs/iomap/direct-io.c
+> +++ b/fs/iomap/direct-io.c
+> @@ -595,12 +595,19 @@ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+>  
+>  static int iomap_dio_hole_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+>  {
+> -	loff_t length = iov_iter_zero(iomap_length(iter), dio->submit.iter);
+> +	loff_t copied = iov_iter_zero(iomap_length(iter), dio->submit.iter);
+> +	unsigned int bs = i_blocksize(iter->inode);
+> +	loff_t aligned_copied = round_down(copied, bs);
+>  
+> -	dio->size += length;
+> -	if (!length)
+> +	/*
+> +	 * If fs block size is larger than page size, page fault failure
+> +	 * can cause @copied to be page aligned but not fs block aligned.
+> +	 */
+> +	iov_iter_revert(dio->submit.iter, copied - aligned_copied);
+> +	dio->size += aligned_copied;
+> +	if (!aligned_copied)
+>  		return -EFAULT;
+
+[Severity: High]
+Does this unconditional filesystem block size alignment break valid sub-block
+direct I/O reads from holes on filesystems like XFS and ext4?
+
+If an application performs a sub-blocksize (e.g., 512 bytes) sector-aligned
+O_DIRECT read from a file hole on XFS or ext4 (which typically have a
+4096-byte block size), iov_iter_zero() successfully zeroes 512 bytes.
+
+However, aligned_copied = round_down(512, 4096) evaluates to 0. This reverts
+the iterator and returns -EFAULT directly to user space.
+
+Should this logic be explicitly guarded by the IOMAP_DIO_FSBLOCK_ALIGNED
+flag, which is only used by Btrfs?
+
+> -	return iomap_iter_advance(iter, length);
+> +	return iomap_iter_advance(iter, aligned_copied);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/73bd4d9b39e821453028ca8e567eaad2ebe0fc18.1785880740.git.wqu@suse.com?part=1
+

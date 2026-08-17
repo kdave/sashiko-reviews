@@ -1,0 +1,42 @@
+From sashiko-bot@kernel.org Fri Aug 14 01:03:29 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 05/28] xor: move to lib/raid/
+Date: Thu, 13 Aug 2026 23:03:13 +0000
+Message-Id: <20260813230318.A87491F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] The MAINTAINERS file was not updated to reflect the new location of the RAID XOR core code.
+--
+
+--- Patch [5]: [PATCH 05/28] xor: move to lib/raid/ ---
+commit 521ed07e83a1bf1233d2291dd851539fa8fc5883
+Author: Christoph Hellwig <hch@lst.de>
+
+xor: move to lib/raid/
+
+Move the RAID XOR code to lib/raid/ as it has nothing to do with the
+crypto API.
+
+[ ... ]
+
+> diff --git a/crypto/xor.c b/lib/raid/xor/xor-core.c
+> similarity index 100%
+> rename from crypto/xor.c
+> rename to lib/raid/xor/xor-core.c
+
+[Severity: Low]
+Should the MAINTAINERS file be updated to include the new directory?
+
+Looking at the SOFTWARE RAID (Multiple Disks) SUPPORT section in MAINTAINERS,
+it currently includes:
+
+F:	include/uapi/linux/raid/
+F:	lib/raid6/
+
+The new lib/raid/xor/ directory is not covered by any maintainer entry. This
+omission will cause scripts/get_maintainer.pl to fail to route future patches
+touching these files to the appropriate subsystem maintainers.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260327061704.3707577-1-hch@lst.de?part=5
+

@@ -1,0 +1,96 @@
+From sashiko-bot@kernel.org Mon Aug 17 07:46:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix missing folio_unlock in
+ read_merkle_tree_page error path
+Date: Mon, 17 Aug 2026 05:46:07 +0000
+Message-Id: <20260817054607.C0DFF1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] On 32-bit HIGHMEM systems, `read_key_bytes()` silently skips copying data into the folio, exposing uninitialized memory and causing fs-verity validation to fail.
+- [High] Transient read errors during Merkle tree page population are permanently cached as `-EIO`, causing persistent local Denial of Service.
+--
+
+--- Patch [1]: [PATCH] btrfs: fix missing folio_unlock in read_merkle_tree_page error path ---
+commit 7c915441f5f4c63df27e821486f0f44d1e97559f
+Author: Hongling Zeng <zenghongling@kylinos.cn>
+btrfs: fix missing folio_unlock in read_merkle_tree_page error path
+
+This commit fixes a missing folio_unlock() in the error path of
+btrfs_read_merkle_tree_page(), preventing a permanent hang when subsequent
+attempts try to lock the same folio after a read failure.
+
+Cc: stable@vger.kernel.org
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index 983365a735416..4431656140f8b 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+> @@ -753,6 +753,7 @@ static struct page *btrfs_read_merkle_tree_page(struct inode *inode,
+>  	ret = read_key_bytes(BTRFS_I(inode), BTRFS_VERITY_MERKLE_ITEM_KEY, off,
+>  			     folio_address(folio), PAGE_SIZE, folio);
+
+[Severity: High]
+This is a pre-existing issue, but does this code silently fail to copy data
+on 32-bit highmem systems?
+
+If the allocated page cache folio comes from the highmem zone,
+folio_address(folio) returns NULL. However, read_key_bytes() interprets a
+NULL dest argument as a signal to only count sizes and skip copying data:
+
+fs/btrfs/verity.c:read_key_bytes() {
+    ...
+        /* desc = NULL to just sum all the item lengths */
+        if (!dest)
+            copy_end = item_end;
+    ...
+        if (dest) {
+            if (dest_folio)
+                kaddr = kmap_local_folio(dest_folio, 0);
+    ...
+}
+
+Since folio_address() evaluates to NULL for unmapped highmem pages,
+read_key_bytes() will entirely skip copying the data, leaving the folio
+uninitialized but incorrectly marked uptodate later in this function.
+
+>  	if (ret < 0) {
+> +		folio_unlock(folio);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does leaving the folio in
+the page cache here convert transient read errors into permanent ones?
+
+While this patch correctly unlocks the folio and prevents a hang, the error
+path fails to evict the folio from the page cache, leaving it present but
+not uptodate.
+
+A subsequent lookup will find this left-behind folio and assume a permanent
+read error instead of retrying the read_key_bytes() operation:
+
+fs/btrfs/verity.c:btrfs_read_merkle_tree_page() {
+    ...
+    folio = __filemap_get_folio(inode->i_mapping, index, FGP_ACCESSED, 0);
+    if (!IS_ERR(folio)) {
+        ...
+        folio_lock(folio);
+        /* If it's not uptodate after we have the lock, we got a read error. */
+        if (!folio_test_uptodate(folio)) {
+            folio_unlock(folio);
+            folio_put(folio);
+            return ERR_PTR(-EIO);
+        }
+    ...
+}
+
+Could a transient error (like -ENOMEM during btrfs_alloc_path) permanently
+break verity file access until the page cache is dropped?
+
+>  		folio_put(folio);
+>  		return ERR_PTR(ret);
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260817053607.46939-1-zenghongling@kylinos.cn?part=1
+

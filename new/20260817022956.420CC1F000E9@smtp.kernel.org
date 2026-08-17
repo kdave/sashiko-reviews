@@ -1,0 +1,64 @@
+From sashiko-bot@kernel.org Mon Aug 17 04:30:06 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: handle highmem folios in read_key_bytes
+Date: Mon, 17 Aug 2026 02:29:55 +0000
+Message-Id: <20260817022956.420CC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The folio remains locked in the page cache if read_key_bytes() fails, causing a deadlock.
+--
+
+--- Patch [1]: [PATCH] btrfs: handle highmem folios in read_key_bytes ---
+commit 964f2f016127bd9e2e2b7056c485d333b074f5a8
+Author: Hongling Zeng <zenghongling@kylinos.cn>
+
+btrfs: handle highmem folios in read_key_bytes
+
+This patch fixes an issue on 32-bit systems with highmem where folio_address()
+can return NULL for unmapped folios. By updating the conditions in
+read_key_bytes(), it ensures the data is correctly mapped and copied when
+dest_folio is provided.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index 983365a735416..80bc945c7dcb3 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+
+[ ... ]
+
+> @@ -362,7 +362,7 @@ static int read_key_bytes(struct btrfs_inode *inode, u8 key_type, u64 offset,
+>  		/* Offset from the start of item for copying */
+>  		copy_offset = offset - key.offset;
+>  
+> -		if (dest) {
+> +		if (dest || dest_folio) {
+>  			if (dest_folio)
+>  				kaddr = kmap_local_folio(dest_folio, 0);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but looking at how read_key_bytes()
+is used in btrfs_read_merkle_tree_page() in fs/btrfs/verity.c, the error
+handling appears to miss an unlock:
+
+btrfs_read_merkle_tree_page() {
+    ...
+	ret = read_key_bytes(BTRFS_I(inode), BTRFS_VERITY_MERKLE_ITEM_KEY, off,
+			     folio_address(folio), PAGE_SIZE, folio);
+	if (ret < 0) {
+		folio_put(folio);
+		return ERR_PTR(ret);
+	}
+    ...
+}
+
+Does this error path leave the folio permanently locked in the page cache?
+
+Since filemap_add_folio() adds the folio to the page cache and leaves it
+locked, dropping the reference with folio_put() without first calling
+folio_unlock() would cause subsequent attempts to lock this folio to hang.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260817022012.19658-1-zenghongling@kylinos.cn?part=1
+

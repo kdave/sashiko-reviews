@@ -1,0 +1,87 @@
+From sashiko-bot@kernel.org Mon Aug 17 07:27:16 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: fix the possible bioc_list memory leak
+ during error
+Date: Mon, 17 Aug 2026 05:27:03 +0000
+Message-Id: <20260817052704.475851F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The error path in `btrfs_insert_one_raid_extent()` prematurely ends the transaction, causing a use-after-free and double-free in the caller `btrfs_finish_one_ordered()`.
+--
+
+--- Patch [1]: [PATCH 1/2] btrfs: fix the possible bioc_list memory leak during error ---
+commit 4cf54d87a86addacb63e1293edcc4643ab44ae92
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: fix the possible bioc_list memory leak during error
+
+This commit addresses memory leaks in the bioc_list of a btrfs_ordered_extent
+by introducing btrfs_cleanup_ordered_bioc_list(). It ensures that all bioc
+entries are properly removed and released, both during RAID extent insertion
+and before the final release of the ordered extent.
+
+Link: https://sashiko.dev/#/patchset/20260817021512.3010812-1-shuangpeng.kernel%40gmail.com
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index b210371ce91e3..832f6acddbba0 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+[ ... ]
+> @@ -382,17 +382,23 @@ int btrfs_insert_raid_extent(struct btrfs_trans_handle *trans,
+>  	list_for_each_entry(bioc, &ordered_extent->bioc_list, rst_ordered_entry) {
+>  		ret = btrfs_insert_one_raid_extent(trans, bioc);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but is it possible for an error in
+btrfs_insert_one_raid_extent() to cause a use-after-free and double-free of
+the transaction handle?
+
+If kzalloc() fails in btrfs_insert_one_raid_extent(), it prematurely ends
+the transaction:
+
+fs/btrfs/raid-stripe-tree.c:btrfs_insert_one_raid_extent() {
+    ...
+	stripe_extent = kzalloc(item_size, GFP_NOFS);
+	if (unlikely(!stripe_extent)) {
+		btrfs_abort_transaction(trans, -ENOMEM);
+		btrfs_end_transaction(trans);
+		return -ENOMEM;
+	}
+    ...
+}
+
+The error then propagates up to btrfs_finish_one_ordered(), which will
+dereference the already-freed handle in btrfs_abort_transaction() and then
+attempt to free it a second time at the out label:
+
+fs/btrfs/inode.c:btrfs_finish_one_ordered() {
+    ...
+	ret = btrfs_insert_raid_extent(trans, ordered_extent);
+	if (unlikely(ret)) {
+		btrfs_abort_transaction(trans, ret);
+		goto out;
+	}
+    ...
+out:
+    ...
+	if (trans)
+		btrfs_end_transaction(trans);
+    ...
+}
+
+Should the btrfs_end_transaction() and btrfs_abort_transaction() calls in
+btrfs_insert_one_raid_extent() be removed since the caller handles aborting
+and ending the transaction?
+
+>  		if (ret)
+> -			return ret;
+> +			break;
+>  	}
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1786943382.git.wqu@suse.com?part=1
+

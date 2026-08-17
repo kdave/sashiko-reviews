@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Sun Aug  9 21:07:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 5/5] btrfs: support inheritance for per-inode
+ compression levels
+Date: Sun, 09 Aug 2026 19:07:36 +0000
+Message-Id: <20260809190737.5C64D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Lockless double-fetch of `inode->prop_compress` and `inode->prop_compress_level` can lead to generating an invalid or mixed-state property string, breaking property inheritance.
+--
+
+--- Patch [5]: [PATCH v3 5/5] btrfs: support inheritance for per-inode compression levels ---
+commit 47acdb4f0b690af3a073c8494ad691d56a08aac6
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: support inheritance for per-inode compression levels
+
+This commit modifies prop_compression_extract() to take an output buffer and
+length, allowing it to dynamically append the compression level to the string.
+This enables correctly inheriting both the compression algorithm and its level
+for newly created files and directories.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index f79a61a2759f6..5ca728375d351 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+
+[ ... ]
+
+> @@ -395,12 +404,19 @@ static bool prop_compression_ignore(const struct btrfs_inode *inode)
+>  	return false;
+>  }
+>  
+> -static const char *prop_compression_extract(const struct btrfs_inode *inode)
+> +static const char *prop_compression_extract(const struct btrfs_inode *inode,
+> +					    char *buf, size_t len)
+>  {
+>  	switch (inode->prop_compress) {
+>  	case BTRFS_COMPRESS_ZLIB:
+>  	case BTRFS_COMPRESS_LZO:
+>  	case BTRFS_COMPRESS_ZSTD:
+> +		if (inode->prop_compress_level) {
+> +			snprintf(buf, len, "%s:%d",
+> +				 btrfs_compress_type2str(inode->prop_compress),
+> +				 inode->prop_compress_level);
+
+[Severity: Medium]
+Since btrfs_inode_inherit_props() reads from the parent inode locklessly,
+could a concurrent setxattr cause a race here?
+
+Evaluating inode->prop_compress in the switch statement and then fetching both
+inode->prop_compress and inode->prop_compress_level again inside the snprintf
+call might observe inconsistent states if modified concurrently.
+
+This double-fetch could lead to generating a malformed property string or 
+mixing a new algorithm with an old level, causing the inheritance to fail or 
+apply an unintended state.
+
+> +			return buf;
+> +		}
+>  		return btrfs_compress_type2str(inode->prop_compress);
+>  	default:
+>  		break;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260809185303.600071-1-koray.fra@gmail.com?part=5
+

@@ -1,0 +1,152 @@
+From sashiko-bot@kernel.org Sun Aug  9 04:04:52 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/4] btrfs: add per-inode compression levels in
+ xattrs
+Date: Sun, 09 Aug 2026 02:04:40 +0000
+Message-Id: <20260809020441.329351F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] Memory allocation with GFP_KERNEL while holding B-tree locks creates a deadlock vector.
+- [High] Validation logic inconsistently rejects historically valid compression property strings containing a trailing newline, breaking ABI.
+- [Medium] Compression level is silently dropped when child inodes inherit the compression property from their parent directory.
+- [Low] Multi-variable data race on `prop_compress` and `prop_compress_level` causing torn reads during writeback.
+--
+
+--- Patch [3]: [PATCH v2 3/4] btrfs: add per-inode compression levels in xattrs ---
+commit 665309b585a640a893110c80b8cb91ddd54d5cb4
+Author: koraynilay <koray.fra@gmail.com>
+Subject: btrfs: add per-inode compression levels in xattrs
+
+Add support for specifying algo:level using btrfs property set
+/path/to/file compression "algo:level". Add a signed 8 bit 
+prop_compress_level property to btrfs_inode, which can support 
+from level -128 to 127.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 2534cd9284d54..cff4b3e97559d 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -938,6 +938,7 @@ static void compress_file_range(struct btrfs_work *work)
+>  		compress_level = inode->defrag_compress_level;
+>  	} else if (inode->prop_compress) {
+>  		compress_type = inode->prop_compress;
+> +		compress_level = inode->prop_compress_level;
+>  	}
+
+[Severity: Low]
+Does this introduce a torn read?
+
+The writeback path here and in run_delalloc_inline() reads these fields
+locklessly, while prop_compression_apply() updates them sequentially. Because
+the state is split into two separate variables, could we observe a torn state
+(e.g., reading a new compression algorithm but the old compression level)?
+
+While btrfs_compress_set_level() might ultimately clamp any mismatched level,
+this still seems to result in a temporarily inconsistent configuration being
+passed to the compression backend.
+
+[ ... ]
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index bb77d46376d4b..f79a61a2759f6 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+> @@ -295,20 +295,28 @@ int btrfs_load_inode_props(struct btrfs_inode *inode, struct btrfs_path *path)
+>  static int prop_compression_validate(const struct btrfs_inode *inode,
+>  				     const char *value, size_t len)
+>  {
+> +	int ret = -EINVAL;
+> +	const char *value_str;
+> +
+>  	if (!btrfs_inode_can_compress(inode))
+>  		return -EINVAL;
+>  
+>  	if (!value)
+>  		return 0;
+>  
+> -	if (btrfs_compress_is_valid_type(value, len))
+> -		return 0;
+> -
+>  	if ((len == 2 && strncmp("no", value, 2) == 0) ||
+>  	    (len == 4 && strncmp("none", value, 4) == 0))
+>  		return 0;
+>  
+> -	return -EINVAL;
+> +	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+
+[Severity: High]
+Can this cause a deadlock?
+
+This function is invoked during inode property initialization:
+
+btrfs_load_inode_props() -> iterate_object_props() -> inode_prop_iterator()
+
+Since iterate_object_props() executes with a read lock held on a B-tree leaf,
+using GFP_KERNEL here might allow the allocator to initiate memory reclaim.
+This could trigger filesystem writeback that attempts to acquire the exact
+same B-tree locks.
+
+> +	if (!value_str)
+> +		return -ENOMEM;
+> +
+> +	if (btrfs_compress_is_valid_type(value_str))
+> +		ret = 0;
+
+[Severity: High]
+Will this reject historically valid compression strings?
+
+Before this patch, prop_compression_validate() used strncmp() which
+intentionally allowed and ignored trailing characters like newlines. The new
+implementation uses btrfs_match_compress_type() which strictly checks that
+the string terminates immediately or has a colon exactly at the end of the
+algorithm name.
+
+Consequently, a previously valid input like "zstd\n" (which tools like
+setfattr or shell echoes often append) now fails validation with -EINVAL.
+Inconsistently, "zstd:3\n" remains valid because the downstream kstrtoint()
+parser deliberately ignores a single trailing newline. Does this introduce a
+userspace ABI regression?
+
+> +
+> +	kfree(value_str);
+> +	return ret;
+>  }
+>  
+>  static int prop_compression_apply(struct btrfs_inode *inode, const char *value,
+> @@ -335,23 +346,37 @@ static int prop_compression_apply(struct btrfs_inode *inode, const char *value,
+>  		return 0;
+>  	}
+>  
+> -	if (!strncmp("lzo", value, 3)) {
+> +	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+
+[Severity: High]
+Could this allocation also deadlock for the same B-tree lock reasons as in
+prop_compression_validate() above?
+
+[ ... ]
+>  	inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  	inode->flags |= BTRFS_INODE_COMPRESS;
+>  	inode->prop_compress = type;
+> +	inode->prop_compress_level = level;
+>  
+> -	return 0;
+> +out:
+> +	kfree(value_str);
+> +	return ret;
+>  }
+
+[Severity: Medium]
+Is the compression level correctly inherited by child inodes?
+
+When a new file or directory is created inside a directory with the
+compression property, btrfs_inode_inherit_props() inherits it by calling the
+parent's extract() callback.
+
+Since prop_compression_extract() was not updated in this patch and continues
+to return only the base compression type (e.g. "zstd"), won't the compression
+level specified on the parent directory be lost during inheritance, causing
+the child inode to silently fall back to the default compression level?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260809015054.779137-1-koray.fra@gmail.com?part=3
+

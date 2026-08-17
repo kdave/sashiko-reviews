@@ -1,0 +1,81 @@
+From sashiko-bot@kernel.org Sat Aug  8 08:36:40 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: free unlinked replace target on
+ initialization failure
+Date: Sat, 08 Aug 2026 06:36:29 +0000
+Message-Id: <20260808063629.CFB7D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The target device is leaked and left as a zombie in the filesystem device list if `mark_block_group_to_copy()` fails.
+- [High] Use of non-RCU `list_add` on an RCU-protected list.
+--
+
+--- Patch [1]: [PATCH v2] btrfs: free unlinked replace target on initialization failure ---
+commit 2e0f8229a61a194f36ac89e41c15a00f8ee551fd
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: free unlinked replace target on initialization failure
+
+btrfs_init_dev_replace_tgtdev() allocates the replacement target before
+looking up its block device and initializing its zoned device information.
+This patch frees the allocated device on the error path if those lookups fail
+so the device does not leak.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 318ddb7904292..3762429b54821 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+
+[ ... ]
+
+> @@ -327,6 +329,8 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+>  	return 0;
+>  
+>  error:
+> +	if (device)
+> +		btrfs_free_device(device);
+>  	bdev_fput(bdev_file);
+>  	return ret;
+>  }
+
+[Severity: High]
+This is a pre-existing issue, but is it safe to use a non-RCU list_add() when 
+adding this device to the list slightly earlier in this function?
+
+btrfs_init_dev_replace_tgtdev() {
+    ...
+    mutex_lock(&fs_devices->device_list_mutex);
+    list_add(&device->dev_list, &fs_devices->devices);
+    fs_devices->num_devices++;
+    ...
+}
+
+Since the device replace operation can run concurrently with ioctls that 
+iterate the devices list using RCU (like btrfs_ioctl_fs_info or 
+btrfs_ioctl_fitrim), could a concurrent RCU reader observe an uninitialized 
+pointer because list_add() lacks the memory barriers of list_add_rcu()?
+
+[Severity: High]
+This is also a pre-existing issue, but does the error path in 
+btrfs_dev_replace_start() leak the target device?
+
+When mark_block_group_to_copy() fails, the function returns directly:
+
+btrfs_dev_replace_start() {
+    ...
+    ret = mark_block_group_to_copy(fs_info, src_device);
+    if (ret)
+        return ret;
+    ...
+}
+
+Could this early return leave the target device as a zombie in the active 
+filesystem device list? It appears to skip the cleanup path that would normally 
+handle the newly added target device, which might corrupt the filesystem 
+state and cause subsequent replace attempts to fail.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/tencent_7C7BBA87F8B9F1419CC7B05319F15C28FA0A@qq.com?part=1
+

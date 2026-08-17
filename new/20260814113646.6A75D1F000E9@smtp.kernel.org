@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Fri Aug 14 13:36:56 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: free qgroup configuration when quota enable
+ fails
+Date: Fri, 14 Aug 2026 11:36:45 +0000
+Message-Id: <20260814113646.6A75D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Code fix: Add `btrfs_abort_transaction(trans, ret);` before `goto out_free_path;`. This problem wasn't introduced by this patch, but missing transaction abort allows partial quota tree commit. Initial logic and parameters are validated. Standard processing applied. In `btrfs_quota_enable` (fs/btrfs/qgroup.c), if `kzalloc_obj` for `prealloc` fails with -ENOMEM, skipping the abort commits a partial transaction, resulting in silent quota accounting corruption.
+--
+
+--- Patch [1]: [PATCH] btrfs: free qgroup configuration when quota enable fails ---
+commit 95a2846d31140475a7081eb590eb54ae86aa459e
+Author: Guanjie Chen <jk.chen1095@gmail.com>
+
+btrfs: free qgroup configuration when quota enable fails
+
+This commit updates the error path in btrfs_quota_enable() to use
+btrfs_free_qgroup_config(). This ensures that in-memory qgroups and their
+relations are properly cleaned up alongside sysfs entries if enabling quotas
+fails.
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index 502fb4a55cb22..8f59a0e3b4f50 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -1292,7 +1292,7 @@ int btrfs_quota_enable(struct btrfs_fs_info *fs_info,
+>  		btrfs_put_root(quota_root);
+>  out:
+>  	if (ret)
+> -		btrfs_sysfs_del_qgroups(fs_info);
+> +		btrfs_free_qgroup_config(fs_info);
+
+[Severity: High]
+This is a pre-existing issue, but while looking at the error handling in
+btrfs_quota_enable(), I noticed a potential problem in the preallocation
+failure path.
+
+If kzalloc_obj() for prealloc fails with -ENOMEM:
+
+	prealloc = kzalloc_obj(*prealloc, GFP_NOFS);
+	if (!prealloc) {
+		ret = -ENOMEM;
+		goto out_free_path;
+	}
+
+Could jumping to out_free_path without calling btrfs_abort_transaction()
+first commit a partial transaction, resulting in silent quota accounting
+corruption?
+
+Should we add a call to btrfs_abort_transaction(trans, ret) before the
+goto?
+
+>  	mutex_unlock(&fs_info->qgroup_ioctl_lock);
+>  	if (ret && trans)
+>  		btrfs_end_transaction(trans);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260814112240.93514-1-jk.chen1095@gmail.com?part=1
+

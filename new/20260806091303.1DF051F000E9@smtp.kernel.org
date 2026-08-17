@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Thu Aug  6 11:13:13 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/7] btrfs: always return -EIOCBQUEUED after
+ btrfs_uring_read_extent_endio
+Date: Thu, 06 Aug 2026 09:13:02 +0000
+Message-Id: <20260806091303.1DF051F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Missing lock release and memory leak when `pages` allocation fails in `btrfs_uring_read_extent()`.
+--
+
+--- Patch [1]: [PATCH v2 1/7] btrfs: always return -EIOCBQUEUED after btrfs_uring_read_extent_endio ---
+commit ab85c68a53dcfb91f99c5009bcd58fb8190767fe
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: always return -EIOCBQUEUED after btrfs_uring_read_extent_endio
+    
+This commit fixes an issue where btrfs_encoded_read_regular_fill_pages()
+can return a negative errno instead of -EIOCBQUEUED when bios finish early.
+Returning the negative errno caused a double-free because both the caller
+and the deferred completion path attempted to clean up.
+
+Link: https://lore.kernel.org/linux-btrfs/20260630091609.3414-1-samsun1006219@gmail.com/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index b446c3014b240..8e3cee3845e6f 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -9458,10 +9457,10 @@ int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+>  
+>  	if (uring_ctx) {
+>  		if (refcount_dec_and_test(&priv->pending_refs)) {
+> -			ret = blk_status_to_errno(READ_ONCE(priv->status));
+> -			btrfs_uring_read_extent_endio(uring_ctx, ret);
+> +			int err = blk_status_to_errno(READ_ONCE(priv->status));
+> +
+> +			btrfs_uring_read_extent_endio(uring_ctx, err);
+>  			kfree(priv);
+> -			return ret;
+>  		}
+>  
+>  		return -EIOCBQUEUED;
+
+[ ... ]
+
+While reviewing this io_uring read path, I noticed a pre-existing issue in
+the caller btrfs_uring_read_extent() located in fs/btrfs/ioctl.c:
+
+fs/btrfs/ioctl.c:btrfs_uring_read_extent() {
+    ...
+	nr_pages = DIV_ROUND_UP(disk_io_size, PAGE_SIZE);
+	pages = kzalloc_objs(struct page *, nr_pages, GFP_NOFS);
+	if (!pages)
+		return -ENOMEM;
+    ...
+}
+
+[Severity: High]
+This is a pre-existing issue, but does this direct return skip the lock
+release and cause a memory leak?
+
+If the kzalloc_objs() call for pages fails, the function returns -ENOMEM
+directly. This bypasses the out_fail cleanup label where btrfs_unlock_extent()
+and btrfs_inode_unlock() are called. 
+
+Because the caller btrfs_uring_encoded_read() propagates this -ENOMEM
+error without releasing the locks, it seems any subsequent operation that
+tries to acquire these locks on the file (such as read, write, or
+truncate) will hang forever in uninterruptible sleep. This also appears
+to leak data->iov in the caller.
+
+Could this be fixed to ensure the extent and inode locks are properly
+released on this allocation failure path?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260806085041.1410576-1-yangxiuwei@kylinos.cn?part=1
+

@@ -1,0 +1,110 @@
+From sashiko-bot@kernel.org Wed Aug  5 04:26:03 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/3] btrfs: always return -EIOCBQUEUED after
+ btrfs_uring_read_extent_endio
+Date: Wed, 05 Aug 2026 02:25:52 +0000
+Message-Id: <20260805022553.28D4B1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The iovec array allocated by import_iovec is leaked on the error path of btrfs_uring_read_extent.
+- [High] The encoded io_uring data struct and its iov array are leaked if the io_uring command is cancelled while pending retry.
+--
+
+--- Patch [2]: [PATCH 2/3] btrfs: always return -EIOCBQUEUED after btrfs_uring_read_extent_endio ---
+commit dbfa29f467f50ec1010ad4d1cea41081c5cbeccb
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: always return -EIOCBQUEUED after btrfs_uring_read_extent_endio
+
+This commit fixes a double free in the io_uring encoded read path by always
+returning -EIOCBQUEUED instead of the I/O status when bios finish early.
+This ensures only the deferred path cleans up the resources.
+
+Link: https://lore.kernel.org/linux-btrfs/20260630091609.3414-1-samsun1006219@gmail.com/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index b446c3014b240..8e3cee3845e6f 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+
+[ ... ]
+
+> @@ -9458,10 +9457,10 @@ int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+>  
+>  	if (uring_ctx) {
+>  		if (refcount_dec_and_test(&priv->pending_refs)) {
+> -			ret = blk_status_to_errno(READ_ONCE(priv->status));
+> -			btrfs_uring_read_extent_endio(uring_ctx, ret);
+> +			int err = blk_status_to_errno(READ_ONCE(priv->status));
+> +
+> +			btrfs_uring_read_extent_endio(uring_ctx, err);
+>  			kfree(priv);
+> -			return ret;
+>  		}
+>  
+>  		return -EIOCBQUEUED;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but I have a question about how the
+caller handles errors when propagating negative error codes.
+
+In fs/btrfs/ioctl.c:btrfs_uring_encoded_read(), if import_iovec() allocates
+a new array for data->iov, and a subsequent call to btrfs_uring_read_extent()
+returns a negative errno (like -ENOMEM), the code jumps to out_acct:
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_read() {
+    ...
+    ret = btrfs_uring_read_extent(kiocb, iter, &args, iov_iter_count(iter), data);
+    if (ret < 0)
+        goto out_acct;
+    ...
+out_acct:
+    ...
+    return ret;
+out_free:
+    kfree(data->iov);
+    kfree(data);
+    ...
+}
+
+Does this bypass the out_free label and leak the dynamically allocated
+data->iov array when an error is returned?
+
+[Severity: High]
+This is also a pre-existing issue, but I'm curious about the cancellation path
+for these requests when returning -EAGAIN from this call chain.
+
+In the same caller, when returning -EAGAIN, the data structure is intentionally
+kept so it can be reused on retry:
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_read() {
+    ...
+    if (ret != -EIOCBQUEUED && ret != -EAGAIN) {
+        kfree(data->iov);
+        kfree(data);
+    }
+    ...
+}
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_write() {
+    ...
+    if (ret != -EAGAIN) {
+        kfree(data->iov);
+        kfree(data);
+    }
+    ...
+}
+
+If a user submits an IORING_OP_URING_CMD for encoded reads or writes and it
+returns -EAGAIN, the request is queued to io-wq. If the user then cancels the
+request or exits the process, io-wq completes the request with -ECANCELED.
+
+Since the command doesn't appear to use io_uring_cmd_mark_cancelable(), btrfs
+is not notified when the operation is cancelled. Could this leak the data
+struct and its data->iov array upon cancellation?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260805021135.1896609-1-yangxiuwei@kylinos.cn?part=2
+

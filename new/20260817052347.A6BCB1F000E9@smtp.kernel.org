@@ -1,0 +1,63 @@
+From sashiko-bot@kernel.org Mon Aug 17 07:23:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: return proper negative error code for
+ update_raid_extent_item()
+Date: Mon, 17 Aug 2026 05:23:47 +0000
+Message-Id: <20260817052347.A6BCB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] `update_raid_extent_item` blindly writes `item_size` bytes into an existing btree item without verifying that the existing item is large enough to hold the new data.
+--
+
+--- Patch [2]: [PATCH 2/2] btrfs: return proper negative error code for update_raid_extent_item() ---
+commit e2e790e95eabf64f7f04dc2aed8472adfe21d9a4
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: return proper negative error code for update_raid_extent_item()
+
+This commit fixes the error handling in update_raid_extent_item() to ensure
+it returns proper negative error codes like -ENOENT when a key isn't found.
+It also prevents real errors like -EIO from being incorrectly masked as
+-EINVAL.
+
+Link: https://sashiko.dev/#/patchset/20260817021512.3010812-1-shuangpeng.kernel%40gmail.com
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index 832f6acddbba0..550c2aeeaa0f5 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+> @@ -310,8 +310,10 @@ static int update_raid_extent_item(struct btrfs_trans_handle *trans,
+>  
+>  	ret = btrfs_search_slot(trans, trans->fs_info->stripe_root, key, path,
+>  				0, 1);
+> -	if (ret)
+> -		return (ret == 1 ? ret : -EINVAL);
+> +	if (ret > 0)
+> +		ret = -ENOENT;
+> +	if (ret < 0)
+> +		return ret;
+>  
+>  	leaf = path->nodes[0];
+>  	slot = path->slots[0];
+
+[Severity: High]
+This is a pre-existing issue, but does update_raid_extent_item() write 
+item_size bytes into the existing btree item without verifying that the
+existing item is large enough to hold the new data?
+
+If a crafted filesystem contains a BTRFS_RAID_STRIPE_KEY item with a 
+maliciously small size (e.g., 0 bytes), and btrfs_insert_item() returns 
+-EEXIST, update_raid_extent_item() will locate the key and call:
+
+    write_extent_buffer(leaf, stripe_extent, 
+                        btrfs_item_ptr_offset(leaf, slot), item_size);
+
+Since btrfs_item_size(leaf, slot) isn't checked against item_size, could
+this blindly overwrite adjacent items' payload data in the B-tree leaf,
+causing memory and metadata corruption?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1786943382.git.wqu@suse.com?part=2
+

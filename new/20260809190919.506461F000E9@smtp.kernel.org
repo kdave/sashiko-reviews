@@ -1,0 +1,109 @@
+From sashiko-bot@kernel.org Sun Aug  9 21:09:29 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 3/5] btrfs: also validate compression levels in
+ btrfs_compress_is_valid_type()
+Date: Sun, 09 Aug 2026 19:09:18 +0000
+Message-Id: <20260809190919.506461F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Deadlock during memory reclaim due to GFP_KERNEL allocation inside an active transaction.
+
+Pre-existing issues:
+- [High] This problem wasn't introduced by this patch, but an out-of-bounds heap read occurs when applying a maliciously crafted `btrfs.compression` xattr from a crafted disk image.
+--
+
+--- Patch [3]: [PATCH v3 3/5] btrfs: also validate compression levels in btrfs_compress_is_valid_type() ---
+commit 789dc52054223d53140397a40eb58d0dc8c69077
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: also validate compression levels in btrfs_compress_is_valid_type()
+
+This commit changes btrfs_compress_is_valid_type() to validate compression
+levels exactly like the mount option parser. It removes the length parameter
+and instead uses kmemdup_nul() to create a null-terminated string for
+validation.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index bb77d46376d4b..a269124c3b929 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+[ ... ]
+> @@ -295,20 +295,28 @@ int btrfs_load_inode_props(struct btrfs_inode *inode, struct btrfs_path *path)
+>  static int prop_compression_validate(const struct btrfs_inode *inode,
+>  				     const char *value, size_t len)
+>  {
+[ ... ]
+> -	if (btrfs_compress_is_valid_type(value, len))
+> -		return 0;
+> -
+>  	if ((len == 2 && strncmp("no", value, 2) == 0) ||
+>  	    (len == 4 && strncmp("none", value, 4) == 0))
+>  		return 0;
+>  
+> -	return -EINVAL;
+> +	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+
+[Severity: High]
+Can this cause a deadlock during memory reclaim?
+
+When a user sets the btrfs.compression property, btrfs_ioctl_setflags()
+starts a Btrfs transaction before calling btrfs_set_prop(), which then calls
+this validation handler:
+
+fs/btrfs/ioctl.c:btrfs_ioctl_setflags()
+    trans = btrfs_start_transaction(root, 1);
+    ...
+    ret = btrfs_set_prop(trans, inode, "btrfs.compression", ...);
+
+fs/btrfs/props.c:btrfs_set_prop()
+    ret = handler->validate(inode, value, value_len);
+
+Using GFP_KERNEL here allows direct memory reclaim, which can recurse into
+Btrfs to free memory. If the reclaim process attempts to acquire transaction
+locks already held by the current thread, it will deadlock.
+
+> +	if (!value_str)
+> +		return -ENOMEM;
+> +
+> +	if (btrfs_compress_is_valid_type(value_str))
+> +		ret = 0;
+> +
+> +	kfree(value_str);
+> +	return ret;
+>  }
+>  
+>  static int prop_compression_apply(struct btrfs_inode *inode, const char *value,
+
+[Severity: High]
+This is a pre-existing issue, but can this result in an out-of-bounds heap
+read when processing a maliciously crafted disk image?
+
+When loading an inode from disk, btrfs_load_inode_props() delegates to
+iterate_object_props(), which dynamically allocates value_buf based exactly
+on the data length read from the disk:
+
+fs/btrfs/props.c:iterate_object_props() {
+    ...
+    value_buf = kmalloc(data_len, GFP_NOFS);
+    ...
+    read_extent_buffer(leaf, value_buf, data_ptr, data_len);
+    iterator(ctx, handler, value_buf, data_len);
+}
+
+The iterator eventually calls prop_compression_apply():
+
+fs/btrfs/props.c:prop_compression_apply() {
+    ...
+    if (!strncmp("lzo", value, 3)) {
+        type = BTRFS_COMPRESS_LZO;
+}
+
+If data_len is artificially small (e.g., 1 byte) and contains a partial
+match (like 'l'), strncmp() will read past the 1-byte heap allocation since
+the value buffer is not null-terminated.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260809185303.600071-1-koray.fra@gmail.com?part=3
+

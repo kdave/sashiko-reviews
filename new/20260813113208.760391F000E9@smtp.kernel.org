@@ -1,0 +1,131 @@
+From sashiko-bot@kernel.org Thu Aug 13 13:32:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC v2] btrfs: keep mixed block group writable for
+ relocation setup commit
+Date: Thu, 13 Aug 2026 11:32:08 +0000
+Message-Id: <20260813113208.760391F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] Missing chunk allocation fallback for fenced setup block groups, causing relocation to fail with -ENOSPC.
+- [Medium] The balance thread can hang in an uninterruptible sleep during an aborted transaction.
+- [Medium] btrfs_reclaim_block_group lacks a check for BLOCK_GROUP_FLAG_RELOC_SETUP, leading to concurrent relocation attempts and spurious errors.
+--
+
+--- Patch [1]: [PATCH RFC v2] btrfs: keep mixed block group writable for relocation setup commit ---
+commit 6fea85cd1ae800f6192e3a0c04bd3df683ebd365
+Author: Bartosz Chronowski <immersa.bartosz.chronowski@gmail.com>
+Subject: btrfs: keep mixed block group writable for relocation setup commit
+
+This commit modifies mixed block group relocation to keep the target
+writable until the setup transaction finishes. It introduces a fenced setup
+boundary to gate non-metadata operations while allowing setup metadata COW.
+The read-only transition and relocation control publish are deferred to the
+transaction tail.
+
+Link: https://lore.kernel.org/r/9d9d207e-ad2a-4af6-9d0b-9a2bfc61d442@suse.com
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 8def7abb728f7..332fc2721e01d 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+[ ... ]
+> @@ -1504,6 +1513,54 @@ static int inc_block_group_ro(struct btrfs_block_group *cache, bool force)
+>  	return ret;
+>  }
+>  
+> +static int inc_block_group_ro(struct btrfs_block_group *cache, bool force)
+> +{
+> +	return __inc_block_group_ro(cache, force, false);
+> +}
+> +
+> +int btrfs_bg_reloc_setup_start(struct btrfs_block_group *cache, bool drop_ro)
+> +{
+[ ... ]
+> +int btrfs_bg_reloc_setup_finish(struct btrfs_block_group *cache)
+> +{
+> +	ASSERT(test_bit(BLOCK_GROUP_FLAG_RELOC_SETUP, &cache->runtime_flags));
+> +	return __inc_block_group_ro(cache, false, true);
+> +}
+
+[Severity: High]
+Could this lead to -ENOSPC failures when the filesystem is nearly full?
+
+The fenced setup in btrfs_relocate_block_group() bypasses the normal
+btrfs_inc_block_group_ro() call, which handles fallback chunk allocations.
+When the transaction tail later calls btrfs_bg_reloc_setup_finish(), it
+invokes __inc_block_group_ro() with force=false.
+
+Without the buffering from a prior chunk allocation, could this return
+-ENOSPC and unexpectedly abort the balance operation?
+
+[ ... ]
+> @@ -1945,6 +2002,7 @@ static int btrfs_reclaim_block_group(struct btrfs_block_group *bg, int *reclaime
+>  	u64 reserved;
+>  	u64 old_total;
+>  	int ret = 0;
+> +	bool marked_ro = false;
+>  
+>  	/* Don't race with allocators so take the groups_sem */
+>  	down_write(&space_info->groups_sem);
+>
+>  	spin_lock(&space_info->lock);
+>  	spin_lock(&bg->lock);
+>  	if (bg->reserved || bg->pinned || bg->ro) {
+>  		/*
+>  		 * We want to bail if we made new allocations
+
+[Severity: Medium]
+Will the background block group reclaimer collide with an active fenced
+relocation here?
+
+Since bg->ro is 0 during the fenced setup, but BLOCK_GROUP_FLAG_RELOC_SETUP
+isn't checked in this condition, the cleaner thread might proceed to call
+btrfs_relocate_chunk() concurrently.
+
+Calling btrfs_relocate_chunk() returns -EINPROGRESS because
+BTRFS_FS_RELOC_RUNNING is already set. Does this result in spurious
+kernel error logs and inflate the reclaim_errors counter?
+
+[ ... ]
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index fc5c14b5adad7..92059ebc83457 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+[ ... ]
+> +static int reconcile_relocation_setup(struct btrfs_transaction *trans,
+> +				      struct reloc_control *rc,
+> +				      int commit_ret)
+> +{
+> +	struct btrfs_fs_info *fs_info = trans->fs_info;
+> +	bool cancel = false;
+> +	bool wait = false;
+> +	int setup_ret;
+> +
+> +	spin_lock(&fs_info->trans_lock);
+> +	if (trans->reloc_setup == rc &&
+> +	    trans->state < TRANS_STATE_COMMIT_PREP) {
+> +		trans->reloc_setup = NULL;
+> +		cancel = true;
+> +	} else if (READ_ONCE(rc->setup_result) == -EINPROGRESS) {
+> +		wait = true;
+> +	}
+> +	spin_unlock(&fs_info->trans_lock);
+> +
+> +	if (cancel)
+> +		complete_relocation_setup(rc, commit_ret ?: -EIO);
+> +	else if (wait)
+> +		wait_event(trans->commit_wait,
+> +			   READ_ONCE(trans->state) >= TRANS_STATE_COMPLETED);
+
+[Severity: Medium]
+Can the balance thread hang here if a transaction aborts during relocation
+setup?
+
+If btrfs_commit_transaction() aborts, it might return an error without ever
+reaching TRANS_STATE_COMPLETED. Without checking TRANS_ABORTED(trans) in this
+wait condition, the thread could be left in an uninterruptible sleep until
+the transaction kthread cleans it up.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/vu6cjfyamplqqiy4hbu5eobbp65cy4fzv2jci4n5lfalanvmlp@pf5bfsi33gl7?part=1
+

@@ -1,0 +1,107 @@
+From sashiko-bot@kernel.org Tue Aug  4 18:00:58 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 5/5] btrfs: pre-allocate delayed dir index for
+ non-overwrite rename
+Date: Tue, 04 Aug 2026 15:59:37 +0000
+Message-Id: <20260804155938.752BB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Memory leak of preallocated delayed dir index on path allocation failure
+
+Pre-existing issues:
+- [High] Dangling directory index created when dir item insertion fails with -EEXIST
+--
+
+--- Patch [5]: [PATCH v2 5/5] btrfs: pre-allocate delayed dir index for non-overwrite rename ---
+commit 4fa97d3a1211ede15eb51ee5fbf8eb07981436a7
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: pre-allocate delayed dir index for non-overwrite rename
+
+For rename() without an overwrite target, pre-allocate the delayed
+dir index before any btree modifications so that ENOMEM can be returned
+before the source is unlinked from the old directory.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 99e990c592f67..9f6a631d83a35 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+
+[ ... ]
+
+> @@ -6930,11 +6931,14 @@ int btrfs_add_link(struct btrfs_trans_handle *trans,
+>  	}
+>  
+>  	/* Nothing to clean up yet */
+> -	if (ret)
+> +	if (ret) {
+> +		if (prealloc)
+> +			btrfs_free_delayed_dir_index_prealloc(trans, prealloc);
+>  		return ret;
+> +	}
+>  
+>  	ret = btrfs_insert_dir_item(trans, name, parent_inode, &key,
+> -				    btrfs_inode_type(inode), index, NULL);
+> +				    btrfs_inode_type(inode), index, prealloc);
+>  	if (ret == -EEXIST || ret == -EOVERFLOW || ret == -ENOMEM)
+>  		goto fail_dir_item;
+
+[Severity: High]
+This is a pre-existing issue, but does returning -EEXIST here leave a
+dangling directory index?
+
+Inside btrfs_insert_dir_item(), if insert_with_overflow() returns -EEXIST
+due to a name collision, the code jumps to the second_insert label:
+
+fs/btrfs/dir-item.c:btrfs_insert_dir_item() {
+    ...
+	dir_item = insert_with_overflow(trans, root, path, &key, data_size,
+					name->name, name->len);
+	if (IS_ERR(dir_item)) {
+		ret = PTR_ERR(dir_item);
+		if (ret == -EEXIST)
+			goto second_insert;
+    ...
+second_insert:
+	if (!need_delayed_index) {
+    ...
+	ret2 = btrfs_insert_delayed_dir_index_prealloc(trans, dir, prealloc,
+						       &disk_key, type, index);
+    ...
+}
+
+This queues the delayed index insertion even though the primary directory
+item insertion failed. When btrfs_add_link() aborts the operation and returns
+the error without aborting the transaction, will this orphaned index commit
+to disk and corrupt the directory metadata?
+
+[ ... ]
+
+> @@ -8800,7 +8823,9 @@ static int btrfs_rename(struct mnt_idmap *idmap,
+>  	}
+>  
+>  	ret = btrfs_add_link(trans, BTRFS_I(new_dir), BTRFS_I(old_inode),
+> -			     &new_fname.disk_name, false, index);
+> +			     &new_fname.disk_name, false, index,
+> +			     prealloc.item ? &prealloc : NULL);
+> +	prealloc.item = NULL;
+>  	if (unlikely(ret)) {
+>  		btrfs_abort_transaction(trans, ret);
+>  		goto out_fail;
+
+[Severity: High]
+Does this leak the preallocated delayed dir index if btrfs_insert_dir_item()
+fails during path allocation?
+
+If btrfs_alloc_path() fails inside btrfs_insert_dir_item() and returns
+-ENOMEM, the prealloc parameter is not freed by btrfs_insert_dir_item().
+btrfs_add_link() propagates this -ENOMEM back here to btrfs_rename(). Since
+prealloc.item is unconditionally set to NULL, the out_fail label will
+skip the cleanup, leaking the btrfs_delayed_item allocation and reserved
+metadata space.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260804-btrfs-enomem-v2-0-4d923170e8c1@kernel.org?part=5
+

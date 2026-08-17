@@ -1,0 +1,113 @@
+From sashiko-bot@kernel.org Wed Aug  5 04:25:56 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/3] btrfs: free iov when btrfs_uring_read_extent fails
+Date: Wed, 05 Aug 2026 02:25:46 +0000
+Message-Id: <20260805022546.F32CD1F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Memory leak of btrfs_uring_encoded_data on io_uring request cancellation.
+- [High] Unrecoverable self-deadlock due to calling copy_to_user() while holding btrfs inode and extent locks.
+- [High] Misinterpretation of compat_iovec arrays in io-wq threads leads to out-of-bounds reads/writes.
+--
+
+--- Patch [3]: [PATCH 3/3] btrfs: free iov when btrfs_uring_read_extent fails ---
+commit 77f12a11528606897f46154c8e20f586cc7426cc
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: free iov when btrfs_uring_read_extent fails
+
+After btrfs_uring_read_extent(), the caller always jumped to out_acct, which
+skips kfree(data->iov) on failure. This patch updates the failure path to fall
+through to out_free instead, ensuring the memory is properly released.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index e2604b306522a..3dc15143bc376 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -4820,8 +4820,8 @@ static int btrfs_uring_encoded_read(struct io_uring_cmd *cmd, unsigned int issue
+>  					      cached_state, disk_bytenr, disk_io_size,
+>  					      count, data->args.compression,
+>  					      data->iov, cmd);
+> -
+> -		goto out_acct;
+> +		if (ret == -EIOCBQUEUED)
+> +			goto out_acct;
+>  	}
+>  
+>  out_free:
+
+[Severity: High]
+This is a pre-existing issue, but does this leak memory if the io_uring
+request is cancelled?
+
+When btrfs_uring_encoded_read() or btrfs_uring_encoded_write() returns
+-EAGAIN, the dynamically allocated data struct is intentionally left unfreed
+in cmd->pdu for reissue:
+
+	if (ret == -EAGAIN)
+		goto out_acct;
+
+And at the end of the function:
+
+out_acct:
+	if (ret > 0)
+		add_rchar(current, ret);
+	inc_syscr(current);
+
+	if (ret != -EIOCBQUEUED && ret != -EAGAIN)
+		kfree(data);
+
+If the request is subsequently cancelled (e.g., via process exit) before it
+is reissued by the io-wq worker, does io_uring's generic cancellation path
+know how to free the file system's pdu data?
+
+Since the command is not marked cancelable via io_uring_cmd_mark_cancelable(),
+it seems data and data->iov could be permanently leaked.
+
+[Severity: High]
+This is also a pre-existing issue, but is there a potential self-deadlock
+when calling copy_to_user() in btrfs_uring_encoded_read()?
+
+When btrfs_encoded_read() returns -EIOCBQUEUED, it intentionally leaves the
+inode's i_rwsem and the extent lock held to synchronize with the asynchronous
+read. The code then immediately calls copy_to_user():
+
+	if (copy_to_user(sqe_addr + copy_end,
+			 (const char *)&data->args + copy_end_kernel,
+			 sizeof(data->args) - copy_end_kernel)) {
+
+If a user supplies an sqe_addr pointing to a memory-mapped region of the
+exact same file and extent, copy_to_user() will trigger a page fault.
+
+Will the page fault handler (btrfs_filemap_fault) then attempt to acquire
+the exact same extent lock that the current thread already holds, resulting
+in a self-deadlock?
+
+[Severity: High]
+This is another pre-existing issue, but does using import_iovec() in
+btrfs_uring_encoded_read() and btrfs_uring_encoded_write() cause incorrect
+parsing in io-wq threads?
+
+The code parses the user-provided iovec array using import_iovec():
+
+		ret = import_iovec(ITER_DEST, data->args.iov, data->args.iovcnt,
+				   ARRAY_SIZE(data->iovstack), &data->iov,
+				   &data->iter);
+
+import_iovec() relies on in_compat_syscall() to determine whether to parse
+the array as a 32-bit compat_iovec or a 64-bit iovec.
+
+When an io_uring request is punted to an asynchronous io-wq worker thread,
+it executes in a kernel thread context where in_compat_syscall() is always
+false.
+
+If a 32-bit process submits a compat request that gets punted, will
+import_iovec() incorrectly parse the 32-bit compat_iovec array as a 64-bit
+iovec array? Could this read garbled addresses and lengths, potentially
+causing out-of-bounds access?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260805021135.1896609-1-yangxiuwei@kylinos.cn?part=3
+

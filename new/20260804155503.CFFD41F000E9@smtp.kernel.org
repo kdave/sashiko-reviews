@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Tue Aug  4 17:55:14 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/5] btrfs: split btrfs_insert_delayed_dir_index()
+ into prealloc and commit phases
+Date: Tue, 04 Aug 2026 15:55:03 +0000
+Message-Id: <20260804155503.CFFD41F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] `btrfs_prealloc_delayed_dir_index` accepts a `name` parameter but silently ignores it, forcing callers to manually copy the name into the preallocated item.
+--
+
+--- Patch [2]: [PATCH v2 2/5] btrfs: split btrfs_insert_delayed_dir_index() into prealloc and commit phases ---
+commit b3074ff09bceee8266a8db15a678d13a7b34156f
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: split btrfs_insert_delayed_dir_index() into prealloc and commit phases
+
+This commit splits btrfs_insert_delayed_dir_index() into three functions 
+using a new btrfs_dir_index_prealloc struct. This allows callers to perform
+fallible memory allocations before the point of no return.
+
+> diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+> index db2ffab0941a6..95d2dca804446 100644
+> --- a/fs/btrfs/delayed-inode.c
+> +++ b/fs/btrfs/delayed-inode.c
+
+[ ... ]
+
+> +int btrfs_prealloc_delayed_dir_index(struct btrfs_inode *dir,
+> +				     const char *name, int name_len,
+> +				     struct btrfs_dir_index_prealloc *prealloc)
+> +{
+> +	struct btrfs_delayed_node *node;
+> +	struct btrfs_delayed_item *item;
+> +
+> +	node = btrfs_get_or_create_delayed_node(dir, &prealloc->tracker);
+> +	if (IS_ERR(node))
+> +		return PTR_ERR(node);
+> +
+> +	item = btrfs_alloc_delayed_item(sizeof(struct btrfs_dir_item) + name_len,
+> +					node, BTRFS_DELAYED_INSERTION_ITEM);
+> +	if (!item) {
+> +		btrfs_release_delayed_node(node, &prealloc->tracker);
+> +		return -ENOMEM;
+> +	}
+> +
+> +	prealloc->node = node;
+> +	prealloc->item = item;
+> +	return 0;
+> +}
+
+[Severity: Medium]
+The name parameter is passed into this function, but is it ever actually
+used here? While name_len is used for the allocation size, the name string
+itself appears to be completely ignored during the preallocation step.
+
+[ ... ]
+
+> +int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+> +				   const char *name, int name_len,
+> +				   struct btrfs_inode *dir,
+> +				   const struct btrfs_disk_key *disk_key, u8 flags,
+> +				   u64 index)
+> +{
+> +	struct btrfs_dir_index_prealloc prealloc;
+> +	int ret;
+> +
+> +	ret = btrfs_prealloc_delayed_dir_index(dir, name, name_len, &prealloc);
+> +	if (ret)
+> +		return ret;
+> +
+> +	memcpy(prealloc.item->data + sizeof(struct btrfs_dir_item), name,
+> +	       name_len);
+
+[Severity: Medium]
+Since btrfs_prealloc_delayed_dir_index() accepts the name parameter but
+doesn't copy it, does this force callers to manually handle the copy and
+work around the API?
+
+This requires the caller to know the internal struct layout to compute the
+offset for memcpy. Could the name copying be moved directly into
+btrfs_prealloc_delayed_dir_index() to avoid exposing the item layout to
+callers and prevent potential uninitialized memory bugs if future callers
+assume the prealloc function already handled the copy?
+
+> +
+> +	return btrfs_insert_delayed_dir_index_prealloc(trans, dir, &prealloc,
+> +						       disk_key, flags, index);
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260804-btrfs-enomem-v2-0-4d923170e8c1@kernel.org?part=2
+

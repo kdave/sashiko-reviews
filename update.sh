@@ -28,3 +28,6 @@ for mbox in wip.*; do
 	echo "NEW: $mbox $mid"
 	"$here/qpdecode.py" "$mbox" "$newdir/$mid"
 done
+
+git add new/*
+git commit -m"Update "$(date  +%Y-%m-%d)

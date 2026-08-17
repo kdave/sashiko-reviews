@@ -1,0 +1,120 @@
+From sashiko-bot@kernel.org Sat Aug  8 07:00:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: free unlinked replace target on initialization
+ failure
+Date: Sat, 08 Aug 2026 05:00:33 +0000
+Message-Id: <20260808050034.50C7A1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Use of non-RCU-safe list_add() on an RCU-protected list.
+- [High] Resource leak and state corruption when mark_block_group_to_copy() fails.
+- [High] Lockless traversal of fs_devices->devices without rcu_read_lock().
+--
+
+--- Patch [1]: [PATCH] btrfs: free unlinked replace target on initialization failure ---
+commit 21c0658fd800dee3a78d988f1843d9810a887285
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: free unlinked replace target on initialization failure
+
+btrfs_init_dev_replace_tgtdev() allocates the replacement target before
+looking up its dev_t and initializing its zoned device information. If
+either lookup_bdev() or btrfs_get_dev_zone_info() fails, the device has
+not been linked into fs_devices->devices yet, but the error path only
+drops the block device file reference.
+
+Free the allocated device on this error path to release its name,
+allocation state, zone info, and the device itself.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 318ddb7904292..3c17481c93f02 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -240,6 +240,7 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+>  	struct block_device *bdev;
+>  	u64 devid = BTRFS_DEV_REPLACE_DEVID;
+>  	int ret = 0;
+> +	bool device_allocated = false;
+>  
+>  	*device_out = NULL;
+>  	if (srcdev->fs_devices->seeding) {
+
+[Severity: High]
+This isn't a bug introduced by this patch, but further down in
+btrfs_init_dev_replace_tgtdev(), is it safe to iterate over fs_devices->devices
+without holding device_list_mutex or using rcu_read_lock()?
+
+fs/btrfs/dev-replace.c:btrfs_init_dev_replace_tgtdev() {
+    ...
+	sync_blockdev(bdev);
+
+	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+		if (device->bdev == bdev) {
+    ...
+}
+
+While device replacement holds BTRFS_EXCLOP_DEV_REPLACE, could a concurrent
+device scan via btrfs_scan_one_device() append to this list using
+device_list_add() and cause a data race?
+
+> @@ -287,6 +288,7 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+>  		ret = PTR_ERR(device);
+>  		goto error;
+>  	}
+> +	device_allocated = true;
+>  
+>  	ret = lookup_bdev(device_path, &device->devt);
+>  	if (ret)
+
+[Severity: High]
+This is a pre-existing issue, but further down in this function, could
+using list_add() instead of list_add_rcu() cause issues for concurrent
+RCU readers?
+
+fs/btrfs/dev-replace.c:btrfs_init_dev_replace_tgtdev() {
+    ...
+	mutex_lock(&fs_devices->device_list_mutex);
+	list_add(&device->dev_list, &fs_devices->devices);
+	fs_devices->num_devices++;
+    ...
+}
+
+If a concurrent reader such as btrfs_show_devname() traverses the list using
+list_for_each_entry_rcu(), could they observe a corrupted or partially
+initialized list element due to the missing smp_store_release() semantics?
+
+> @@ -327,6 +329,8 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+>  	return 0;
+>  
+>  error:
+> +	if (device_allocated)
+> +		btrfs_free_device(device);
+>  	bdev_fput(bdev_file);
+>  	return ret;
+>  }
+
+[ ... ]
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does btrfs_dev_replace_start()
+leak the newly initialized target device if mark_block_group_to_copy() fails?
+
+fs/btrfs/dev-replace.c:btrfs_dev_replace_start() {
+    ...
+	ret = mark_block_group_to_copy(fs_info, src_device);
+	if (ret)
+		return ret;
+    ...
+}
+
+Since the device was successfully added to fs_devices->devices in
+btrfs_init_dev_replace_tgtdev(), returning directly without jumping to the
+leave label skips btrfs_destroy_dev_replace_tgtdev(). Could this leave the
+initialized device permanently linked and block future device replace
+operations?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/tencent_CB14173C19427EDC26219662D6A984787209@qq.com?part=1
+

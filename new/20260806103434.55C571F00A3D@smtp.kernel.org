@@ -1,0 +1,94 @@
+From sashiko-bot@kernel.org Thu Aug  6 12:34:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 7/7] btrfs: drop unused uring encoded IO REISSUE
+ stash helpers
+Date: Thu, 06 Aug 2026 10:34:33 +0000
+Message-Id: <20260806103434.55C571F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Unconditional `kfree(data->iov)` causes SLUB corruption when passing an interior pointer.
+--
+
+--- Patch [7]: [PATCH v2 7/7] btrfs: drop unused uring encoded IO REISSUE stash helpers ---
+commit 57d38aa23715a749631dd1c5f7af06104167851a
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+Subject: btrfs: drop unused uring encoded IO REISSUE stash helpers
+
+This commit removes unused REISSUE state tracking in the btrfs io_uring
+encoded I/O paths. It drops the bc->data stash and simplifies the error
+handling for -EAGAIN.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 995a84ca86b7f..1065416bcb1dd 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+
+[ ... ]
+
+> @@ -4789,8 +4786,6 @@ static int btrfs_uring_encoded_read(struct io_uring_cmd *cmd, unsigned int issue
+>  
+>  	ret = btrfs_encoded_read(&kiocb, &data->iter, &data->args, &cached_state,
+>  				 &disk_bytenr, &disk_io_size);
+> -	if (ret == -EAGAIN)
+> -		goto out_free;
+>  	if (ret < 0 && ret != -EIOCBQUEUED)
+>  		goto out_free;
+>  
+
+[Severity: Critical]
+This is a pre-existing issue, but does taking the out_free error path cause
+SLUB corruption if the iovcnt fits in UIO_FASTIOV?
+
+Looking at btrfs_uring_encoded_read(), __import_iovec() is called and may
+leave data->iov pointing to the embedded data->iovstack:
+
+    data->iov = data->iovstack;
+    ret = __import_iovec(..., ARRAY_SIZE(data->iovstack), &data->iov, ...);
+
+Later in the out_free path:
+
+    out_free:
+        kfree(data->iov);
+    
+    out_acct:
+        ...
+        kfree(data);
+
+If data->iov was not reallocated by __import_iovec(), it still points to
+data->iovstack. Since data is a dynamically allocated kmalloc object,
+data->iovstack is an interior pointer. 
+
+Calling kfree(data->iov) on this interior pointer will corrupt the SLUB
+freelist.
+
+[ ... ]
+
+> @@ -4964,7 +4953,6 @@ static int btrfs_uring_encoded_write(struct io_uring_cmd *cmd, unsigned int issu
+>  	inc_syscw(current);
+>  
+>  	kfree(data);
+> -	bc->data = NULL;
+>  	return ret;
+>  }
+
+[Severity: Critical]
+This is a pre-existing issue, but does btrfs_uring_encoded_write() have the
+same interior pointer freeing problem?
+
+Looking at the error path just above this in btrfs_uring_encoded_write():
+
+    out_iov:
+        kfree(data->iov);
+    out_acct:
+        ...
+        kfree(data);
+
+If __import_iovec() kept data->iov pointing at data->iovstack, this
+will also pass an interior pointer to kfree(). Does this need to check
+if data->iov != data->iovstack before freeing it?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260806085041.1410576-1-yangxiuwei@kylinos.cn?part=7
+

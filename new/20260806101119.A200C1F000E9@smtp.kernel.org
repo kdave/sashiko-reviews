@@ -1,0 +1,78 @@
+From sashiko-bot@kernel.org Thu Aug  6 12:11:29 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 5/7] btrfs: unlock inode and extent in caller when
+ uring read extent fails
+Date: Thu, 06 Aug 2026 10:11:19 +0000
+Message-Id: <20260806101119.A200C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Deadlock risk. Holding the extent lock and inode lock during user-space memory access (`copy_to_user` and `copy_page_to_iter`) can cause a deadlock if the user buffer is mmap'ed to the same file extent.
+--
+
+--- Patch [5]: [PATCH v2 5/7] btrfs: unlock inode and extent in caller when uring read extent fails ---
+commit a1ba6bc6f91fb686dfb80ca3b3e09e0ef191c85d
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: unlock inode and extent in caller when uring read extent fails
+
+This commit shifts the responsibility of unlocking the inode and extent
+from btrfs_uring_read_extent() back to its caller on failure. Memory
+allocation failures now join the out_fail path without leaking locks.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 939c4a9d47b60..b576887469bb9 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -4552,7 +4552,7 @@ static void btrfs_uring_read_finished(struct io_tw_req tw_req, io_tw_token_t tw)
+>  	size_t page_offset;
+>  	ssize_t ret;
+>  
+> -	/* The inode lock has already been acquired in btrfs_uring_read_extent.  */
+> +	/* The inode lock has already been acquired in btrfs_encoded_read(). */
+>  	btrfs_lockdep_inode_acquire(inode, i_rwsem);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but can this cause a deadlock if
+the user buffer is mmap'ed to the same file extent?
+
+Later in btrfs_uring_read_finished(), the code calls copy_page_to_iter():
+
+	if (copy_page_to_iter(priv->pages[index], page_offset, bytes,
+			      &priv->iter) != bytes) {
+
+If a page fault occurs during copy_page_to_iter() while the extent lock and
+i_rwsem are actively held, the fault handler (such as btrfs_filemap_fault or
+btrfs_page_mkwrite) might attempt to re-acquire the same locks for the
+faulted range, potentially causing a self-deadlock. The synchronous path
+seems to avoid this by explicitly dropping the locks before copying.
+
+[ ... ]
+
+> @@ -4819,6 +4820,8 @@ static int btrfs_uring_encoded_read(struct io_uring_cmd *cmd, unsigned int issue
+>  					      data->iov, cmd);
+>  		if (ret == -EIOCBQUEUED)
+>  			goto out_acct;
+> +		btrfs_unlock_extent(io_tree, start, lockend, &cached_state);
+> +		btrfs_inode_unlock(inode, BTRFS_ILOCK_SHARED);
+>  	}
+>  
+>  out_free:
+
+[Severity: High]
+This is a pre-existing issue, but does a similar deadlock risk exist here?
+
+Earlier in btrfs_uring_encoded_read(), there is a call to copy_to_user():
+
+	if (copy_to_user(sqe_addr + copy_end,
+			 (const char *)&data->args + copy_end_kernel,
+			 sizeof(data->args) - copy_end_kernel)) {
+
+Because copy_to_user() happens while the extent lock and i_rwsem are actively
+held (if ret == -EIOCBQUEUED), a page fault on the user buffer could trigger
+a fault handler that tries to re-acquire the same locks.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260806085041.1410576-1-yangxiuwei@kylinos.cn?part=5
+

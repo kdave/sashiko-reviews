@@ -1,0 +1,126 @@
+From sashiko-bot@kernel.org Sat Aug  8 08:58:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: clean up target device if block group marking
+ fails
+Date: Sat, 08 Aug 2026 06:58:35 +0000
+Message-Id: <20260808065835.C20B61F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] btrfs_init_dev_replace_tgtdev() uses non-RCU list_add() instead of list_add_rcu() when adding the target device to the RCU-protected fs_devices->devices list.
+- [High] btrfs_dev_replace_start() leaves a stale or incorrect task_struct pointer in dev_replace->replace_task on error paths.
+- [High] Lockless iteration of dev_root->commit_root without holding commit_root_sem causes TOCTOU race and potential use-after-free.
+--
+
+--- Patch [1]: [PATCH] btrfs: clean up target device if block group marking fails ---
+commit bb86c8b5ebeba54accb3b7f7e3d79bbf2c54ebc7
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: clean up target device if block group marking fails
+
+btrfs_dev_replace_start() adds the replacement target to the device
+list before marking block groups to copy. If marking fails, returning
+directly leaves the target linked and keeps the device accounting
+incremented. Jump to the existing cleanup path so the target device
+is removed and released on failure.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -622,11 +622,11 @@ static int btrfs_dev_replace_start(struct btrfs_fs_info *fs_info,
+
+[ ... ]
+
+>  	ret = btrfs_init_dev_replace_tgtdev(fs_info, tgtdev_name,
+>  					    src_device, &tgt_device);
+>  	if (ret)
+>  		return ret;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but doesn't
+btrfs_init_dev_replace_tgtdev() have an issue with lockless RCU readers?
+
+When adding the target device to the RCU-protected fs_devices->devices list,
+it uses a non-RCU list_add():
+
+fs/btrfs/dev-replace.c:btrfs_init_dev_replace_tgtdev() {
+    ...
+    mutex_lock(&fs_devices->device_list_mutex);
+    list_add(&device->dev_list, &fs_devices->devices);
+    ...
+}
+
+Since there is no memory barrier, could concurrent RCU readers traversing
+this list observe the newly added device before its initialization is complete,
+leading to invalid field dereferences?
+
+>  
+>  	ret = mark_block_group_to_copy(fs_info, src_device);
+
+[Severity: High]
+This is a pre-existing issue, but is it safe for mark_block_group_to_copy()
+to iterate the commit root without holding commit_root_sem?
+
+It performs a lockless iteration of dev_root->commit_root:
+
+fs/btrfs/dev-replace.c:mark_block_group_to_copy() {
+    ...
+    path->reada = READA_FORWARD;
+    path->search_commit_root = true;
+    path->skip_locking = true;
+    ...
+    btrfs_for_each_slot(root, &key, &found_key, path, iter_ret) {
+    ...
+}
+
+If a concurrent transaction commit swaps the commit_root and frees the old
+extent buffers during this search, could this result in a use-after-free
+when accessing the freed buffers?
+
+>  	if (ret)
+> -		return ret;
+> +		goto leave;
+>  
+>  	down_write(&dev_replace->rwsem);
+>  	dev_replace->replace_task = current;
+
+[Severity: High]
+This is a pre-existing issue, but does this error path leave a stale task
+pointer in dev_replace->replace_task?
+
+The function unconditionally sets replace_task to current before validating
+the replace state:
+
+fs/btrfs/dev-replace.c:btrfs_dev_replace_start() {
+    ...
+    dev_replace->replace_task = current;
+    switch (dev_replace->replace_state) {
+    ...
+    case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+        ...
+        ret = BTRFS_IOCTL_DEV_REPLACE_RESULT_ALREADY_STARTED;
+        up_write(&dev_replace->rwsem);
+        goto leave;
+    }
+
+If we take this error path (or fail later during btrfs_start_transaction()),
+replace_task is never restored or cleared. If this user task subsequently
+performs I/O, btrfs_map_block() will mistakenly evaluate
+replace_task == current and skip taking dev_replace->rwsem.
+
+Could this lead to lockless data races with active replace operations?
+
+>  	switch (dev_replace->replace_state) {
+>  	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+>  	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+>  	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
+>  		break;
+>  	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+>  	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/tencent_853134544C3CE88A219EEB21346E2510D308@qq.com?part=1
+

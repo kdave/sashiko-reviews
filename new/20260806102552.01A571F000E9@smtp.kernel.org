@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Thu Aug  6 12:26:02 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 6/7] btrfs: don't stash uring encoded data across
+ -EAGAIN
+Date: Thu, 06 Aug 2026 10:25:51 +0000
+Message-Id: <20260806102552.01A571F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] The patch defers `copy_from_user()` of request arguments to the async io-wq worker thread, causing asynchronous user memory access that leads to memory corruption or -EFAULT.
+--
+
+--- Patch [6]: [PATCH v2 6/7] btrfs: don't stash uring encoded data across -EAGAIN ---
+commit e5c0d3d6bf9827cd8eb1a93b3a49e9f20d7de0bf
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: don't stash uring encoded data across -EAGAIN
+
+This commit attempts to fix a memory leak of driver PDU allocations when
+io_uring requests are cancelled or the ring exits before reissue. It modifies
+the read and write paths to free the data on -EAGAIN, or return -EAGAIN early.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index b576887469bb9..995a84ca86b7f 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+
+[ ... ]
+
+> @@ -4832,8 +4832,10 @@ static int btrfs_uring_encoded_read(struct io_uring_cmd *cmd, unsigned int issue
+>  		add_rchar(current, ret);
+>  	inc_syscr(current);
+>  
+> -	if (ret != -EIOCBQUEUED && ret != -EAGAIN)
+> +	if (ret != -EIOCBQUEUED) {
+>  		kfree(data);
+> +		bc->data = NULL;
+> +	}
+>  
+>  	return ret;
+>  }
+
+[Severity: Critical]
+By freeing the data on -EAGAIN in btrfs_uring_encoded_read(), does this
+force the async worker to re-allocate and re-execute copy_from_user() on
+the request arguments when the request is reissued?
+
+If userspace submitted the command with the ioctl arguments allocated on the
+stack and subsequently returned from the submission function, wouldn't the
+async worker's copy_from_user() read from potentially overwritten stack memory?
+This could lead to memory corruption by importing a garbage iov array.
+
+If the goal is to prevent memory leaks on cancellation, could this keep the
+synchronous allocation and use io_uring_cmd_mark_cancelable() instead?
+
+> @@ -4862,6 +4864,11 @@ static int btrfs_uring_encoded_write(struct io_uring_cmd *cmd, unsigned int issu
+>  		goto out_acct;
+>  	}
+>  
+> +	if (issue_flags & IO_URING_F_NONBLOCK) {
+> +		ret = -EAGAIN;
+> +		goto out_acct;
+> +	}
+> +
+>  	if (!data) {
+>  		data = kzalloc_obj(*data, GFP_NOFS);
+>  		if (!data) {
+
+[Severity: Critical]
+By returning -EAGAIN before the data allocation in btrfs_uring_encoded_write(),
+does this also defer the synchronous copy_from_user() to the async io-wq
+worker thread?
+
+Similar to the read path, if the arguments were on the user's stack, could
+this result in the async worker reading garbage data when evaluating the
+iovec array?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260806085041.1410576-1-yangxiuwei@kylinos.cn?part=6
+

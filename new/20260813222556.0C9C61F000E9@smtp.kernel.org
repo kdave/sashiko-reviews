@@ -1,0 +1,17 @@
+From sashiko-bot@kernel.org Fri Aug 14 00:26:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 05/26] xor: small cleanups
+Date: Thu, 13 Aug 2026 22:25:55 +0000
+Message-Id: <20260813222556.0C9C61F000E9@smtp.kernel.org>
+
+> Update the to of file comment to be correct and non-redundant, and drop
+> the unused BH_TRACE define.
+> 
+> Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260324062211.3216301-1-hch@lst.de?part=5
+
+

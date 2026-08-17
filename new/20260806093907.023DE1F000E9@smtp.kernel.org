@@ -1,0 +1,96 @@
+From sashiko-bot@kernel.org Thu Aug  6 11:39:19 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/7] btrfs: free iov when btrfs_uring_read_extent
+ fails
+Date: Thu, 06 Aug 2026 09:39:06 +0000
+Message-Id: <20260806093907.023DE1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Memory leak of the dynamically allocated `data` structure when the async request is punted to io-wq and subsequently cancelled.
+- [High] Deadlock via `copy_to_user` page fault while holding the filesystem extent lock and inode rwsem.
+--
+
+--- Patch [2]: [PATCH v2 2/7] btrfs: free iov when btrfs_uring_read_extent fails ---
+commit dfd8d54910a36d25332bd0820c7432ca94d933c3
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: free iov when btrfs_uring_read_extent fails
+
+This commit updates btrfs_uring_encoded_read() to correctly free data->iov
+on failure. Previously, it always jumped to out_acct, which skipped the
+necessary kfree() for non-queued requests.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index baa645e988126..39bd9788e8954 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -4816,8 +4816,8 @@ static int btrfs_uring_encoded_read(struct io_uring_cmd *cmd, unsigned int issue
+>  					      cached_state, disk_bytenr, disk_io_size,
+>  					      count, data->args.compression,
+>  					      data->iov, cmd);
+> -
+> -		goto out_acct;
+> +		if (ret == -EIOCBQUEUED)
+> +			goto out_acct;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does this custom data
+allocation leak if the async request is cancelled?
+
+If the async request is punted to io-wq and later cancelled (for example,
+due to task exit or ring destruction), io-wq will fail it with -ECANCELED.
+
+Because this code allocates data and stores it in bc->data instead of using
+io_uring's native async data lifecycle via req->async_data, io_uring's
+generic cleanup in io_clean_op() won't free it:
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_read() {
+    ...
+    data = kzalloc_obj(*data, GFP_NOFS);
+    ...
+    bc->data = data;
+    ...
+}
+
+Could this leave the data structure permanently leaked? This pattern also
+appears to affect btrfs_uring_encoded_write().
+
+[Severity: High]
+This is a pre-existing issue, but is there a risk of self-deadlock
+during copy_to_user() slightly earlier in this function?
+
+If btrfs_encoded_read() queues the read to execute asynchronously, it
+returns -EIOCBQUEUED while leaving both the VFS i_rwsem and the Btrfs
+extent lock held. Immediately following this, copy_to_user() is called:
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_read() {
+    ...
+    ret = btrfs_encoded_read(...);
+    // ret is -EIOCBQUEUED, locks remain held
+
+    if (copy_to_user(sqe_addr + copy_end, ...)) {
+        if (ret == -EIOCBQUEUED) {
+            btrfs_unlock_extent(...);
+            btrfs_inode_unlock(...);
+        }
+    ...
+}
+
+If a user space application passes a pointer that targets a memory-mapped
+region of the exact same file, the copy_to_user() call will trigger a page
+fault. The VFS fault handler invokes btrfs_page_mkwrite(), which attempts
+to acquire the inode's i_rwsem.
+
+Since rw_semaphores and extent locks are not reentrant, won't this cause
+the fault handler to block indefinitely waiting for the lock that the
+faulting thread already holds?
+
+>  	}
+>  
+>  out_free:
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260806085041.1410576-1-yangxiuwei@kylinos.cn?part=2
+

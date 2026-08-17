@@ -1,0 +1,132 @@
+From sashiko-bot@kernel.org Sun Aug  9 21:09:35 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 4/5] btrfs: add per-inode compression levels in
+ xattrs
+Date: Sun, 09 Aug 2026 19:09:24 +0000
+Message-Id: <20260809190925.1FEF81F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] prop_compression_apply() introduces an unexpected -ENOMEM failure path, violating the caller's contract and triggering an ASSERT.
+- [High] GFP_KERNEL memory allocations are performed while holding a Btrfs transaction handle, risking deadlock.
+- [Medium] Per-inode compression level fails to propagate when inherited by child files and directories.
+- [Low] Data race between independently reading and writing the prop_compress and prop_compress_level variables.
+--
+
+--- Patch [4]: [PATCH v3 4/5] btrfs: add per-inode compression levels in xattrs ---
+commit 69eade157718495663ef46db650b4c413803286c
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: add per-inode compression levels in xattrs
+    
+Add support for specifying algo:level using
+btrfs property set /path/to/file compression "algo:level".
+    
+Add a signed 8 bit prop_compress_level property to btrfs_inode, which
+can support from level -128 to 127, plenty for the currently supported
+algo:level(s).
+    
+Change prop_compression_apply() to use the already present
+btrfs_match_compress_type() and btrfs_compress_str2level() to parse the
+xattr, using kmemdup_nul() to convert the user-supplied xattr value to a
+NUL-terminated string to be used by btrfs_compress_str2level().
+    
+Assisted-by: Gemini:3.1-pro antigravity-cli-1.1.5
+Signed-off-by: koraynilay <koray.fra@gmail.com>
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 6d7f2aa2555c8..cff4b3e97559d 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -938,7 +938,7 @@ static void compress_file_range(struct btrfs_work *work)
+>  		compress_level = inode->defrag_compress_level;
+>  	} else if (inode->prop_compress) {
+>  		compress_type = inode->prop_compress;
+> -		compress_level = 0;
+> +		compress_level = inode->prop_compress_level;
+>  	}
+
+[Severity: Low]
+Could reading these two fields independently allow a data race?
+
+If a concurrent setxattr modifies the properties while a background writeback
+thread evaluates compress_file_range(), could we observe a new compression
+type but a stale compression level (or vice versa)?
+
+[ ... ]
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index a269124c3b929..f79a61a2759f6 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+> @@ -343,23 +346,37 @@ static int prop_compression_apply(struct btrfs_inode *inode, const char *value,
+>  		return 0;
+>  	}
+>  
+> -	if (!strncmp("lzo", value, 3)) {
+> +	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+> +	if (!value_str)
+> +		return -ENOMEM;
+
+[Severity: High]
+Does returning -ENOMEM here violate the caller's contract?
+
+Looking at btrfs_set_prop(), it enforces that apply callbacks cannot fail
+once validate succeeds:
+
+btrfs_set_prop()
+    ret = handler->apply(inode, value, value_len);
+    /* We validated before, so it should not fail here. */
+    ASSERT(ret == 0);
+
+Could this allocation trigger the ASSERT on debug builds?
+
+[Severity: High]
+Is it safe to use GFP_KERNEL here?
+
+Since prop_compression_apply() is called from btrfs_set_prop() while holding
+an active Btrfs transaction handle (e.g., via btrfs_ioctl_setflags()), could
+GFP_KERNEL allocations trigger direct memory reclaim and block on locks
+already held by the current transaction, causing a deadlock?
+
+> +
+> +	if (btrfs_match_compress_type(value_str, "lzo", true)) {
+>  		type = BTRFS_COMPRESS_LZO;
+>  		btrfs_set_fs_incompat(fs_info, COMPRESS_LZO);
+> -	} else if (!strncmp("zlib", value, 4)) {
+> +	} else if (btrfs_match_compress_type(value_str, "zlib", true)) {
+[ ... ]
+>  		btrfs_set_fs_incompat(fs_info, COMPRESS_ZSTD);
+>  	} else {
+> -		return -EINVAL;
+> +		ret = -EINVAL;
+> +		goto out;
+>  	}
+>  
+>  	inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  	inode->flags |= BTRFS_INODE_COMPRESS;
+>  	inode->prop_compress = type;
+> +	inode->prop_compress_level = level;
+
+[Severity: Medium]
+Will the new prop_compress_level be inherited correctly by child files and
+directories?
+
+Looking at prop_compression_extract() in fs/btrfs/props.c, it only
+serializes the compression type:
+
+prop_compression_extract()
+    return btrfs_compress_type2str(inode->prop_compress);
+
+Should prop_compression_extract() also be updated to append the
+prop_compress_level so that the inheritance feature retains the specified
+level?
+
+>  
+> -	return 0;
+> +out:
+> +	kfree(value_str);
+> +	return ret;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260809185303.600071-1-koray.fra@gmail.com?part=4
+

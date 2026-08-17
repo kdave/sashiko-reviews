@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Sat Aug  8 04:48:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/4] btrfs: support inheritance for per-inode
+ compression levels
+Date: Sat, 08 Aug 2026 02:48:25 +0000
+Message-Id: <20260808024826.554FF1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Memory allocation with GFP_KERNEL while holding a Btrfs transaction handle.
+--
+
+--- Patch [4]: [PATCH 4/4] btrfs: support inheritance for per-inode compression levels ---
+commit 2c8fa913c5b116a9cddd5811b2d6d603d6bc9c1f
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: support inheritance for per-inode compression levels
+
+This commit modifies the prop_handler's extract() signature to accept a
+buffer and its length. This allows the compression level string to be
+dynamically generated. The caller is now responsible for providing the
+buffer space.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index f79a61a2759f6..9c97792800fba 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+[ ... ]
+> @@ -437,6 +444,7 @@ int btrfs_inode_inherit_props(struct btrfs_trans_handle *trans,
+>  		const struct prop_handler *h = &prop_handlers[i];
+>  		const char *value;
+>  		u64 num_bytes = 0;
+> +		char buf[16];
+>  
+>  		if (!h->inheritable)
+>  			continue;
+> @@ -444,7 +452,7 @@ int btrfs_inode_inherit_props(struct btrfs_trans_handle *trans,
+>  		if (h->ignore(inode))
+>  			continue;
+>  
+> -		value = h->extract(parent);
+> +		value = h->extract(parent, buf, sizeof(buf));
+>  		if (!value)
+>  			continue;
+
+[Severity: High]
+Does this code risk an ABBA deadlock?
+
+btrfs_inode_inherit_props() holds an active transaction handle (trans) and
+subsequently calls h->validate() and h->apply() with the extracted value.
+
+For compression properties, prop_compression_validate() and
+prop_compression_apply() allocate memory using kmemdup_nul() with GFP_KERNEL:
+
+fs/btrfs/props.c:prop_compression_validate() {
+    ...
+	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+    ...
+}
+
+This allows the memory allocator to enter direct reclaim, which may attempt to
+write back dirty filesystem pages or block on the very transaction currently
+held.
+
+This can be triggered here during inode creation, or when setting a btrfs
+compression property via xattr (btrfs_xattr_handler_set_prop ->
+btrfs_set_prop).
+
+Since this is reachable by any local user with permissions to set xattrs or
+create files in directories with inherited compression, it could render the
+filesystem partially or fully unresponsive.
+
+Should these allocations use GFP_NOFS or be wrapped in a
+memalloc_nofs_save()/memalloc_nofs_restore() scope?
+
+Note that this bug was introduced by a previous patch in this series and has
+not been fixed by the end of the series.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260808023459.1494928-1-koray.fra@gmail.com?part=4
+

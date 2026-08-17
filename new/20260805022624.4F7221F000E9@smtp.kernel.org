@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Wed Aug  5 04:26:34 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/3] btrfs: unlock inode and extent on pages alloc
+ failure in uring read
+Date: Wed, 05 Aug 2026 02:26:23 +0000
+Message-Id: <20260805022624.4F7221F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Use-after-free, double-free, and double-unlock on synchronous BIO failure in btrfs_encoded_read_regular_fill_pages
+--
+
+--- Patch [1]: [PATCH 1/3] btrfs: unlock inode and extent on pages alloc failure in uring read ---
+commit ff287114e19067d9a333def2717989b65bb21aba
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+Subject: btrfs: unlock inode and extent on pages alloc failure in uring read
+
+This patch ensures the extent and inode are unlocked if the pages array
+allocation fails in btrfs_uring_read_extent(). It modifies the allocation
+error paths to jump to out_fail instead of returning directly.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index baa645e988126..e2604b306522a 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+[ ... ]
+> @@ -4677,9 +4679,11 @@ static int btrfs_uring_read_extent(struct kiocb *iocb, struct iov_iter *iter,
+>  	btrfs_unlock_extent(io_tree, start, lockend, &cached_state);
+>  	btrfs_inode_unlock(inode, BTRFS_ILOCK_SHARED);
+>  	kfree(priv);
+
+[Severity: High]
+This is a pre-existing issue, but does this out_fail path cause a double-free
+and double-unlock if btrfs_encoded_read_regular_fill_pages() fails
+synchronously?
+
+When btrfs_encoded_read_regular_fill_pages() experiences a synchronous error
+(like an immediate BIO mapping failure), it queues task work and returns the
+raw error (e.g., -EIO) instead of -EIOCBQUEUED:
+
+fs/btrfs/inode.c:btrfs_encoded_read_regular_fill_pages() {
+    ...
+		if (refcount_dec_and_test(&priv->pending_refs)) {
+			ret = blk_status_to_errno(READ_ONCE(priv->status));
+			btrfs_uring_read_extent_endio(uring_ctx, ret);
+			kfree(priv);
+			return ret;
+		}
+    ...
+}
+
+In btrfs_uring_read_extent(), the caller sees a non-zero error that is not
+-EIOCBQUEUED, assumes a synchronous failure, and jumps here to out_fail. This
+prematurely frees priv (which was already freed above) and pages, and
+double-unlocks the extent and inode.
+
+Later, when the queued task work executes, it accesses the freed priv pointer
+and double-frees pages.
+
+> -	for (int i = 0; i < nr_pages; i++) {
+> -		if (pages[i])
+> -			__free_page(pages[i]);
+> +	if (pages) {
+> +		for (int i = 0; i < nr_pages; i++) {
+> +			if (pages[i])
+> +				__free_page(pages[i]);
+> +		}
+>  	}
+>  	kfree(pages);
+>  	return ret;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260805021135.1896609-1-yangxiuwei@kylinos.cn?part=1
+

@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Tue Aug  4 18:01:13 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 4/5] btrfs: handle ENOMEM from
+ btrfs_insert_dir_item() without aborting
+Date: Tue, 04 Aug 2026 16:00:13 +0000
+Message-Id: <20260804160014.42E0E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Graceful handling of ENOMEM in btrfs_create_new_inode() creates a window where an aborted inode creation is committed to disk in an inconsistent state, leading to a permanent inode leak on system crash.
+--
+
+--- Patch [4]: [PATCH v2 4/5] btrfs: handle ENOMEM from btrfs_insert_dir_item() without aborting ---
+commit ec149fbac8131d2de9b2bc930d1959147684e1a8
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: handle ENOMEM from btrfs_insert_dir_item() without aborting
+
+This commit modifies btrfs_add_link and btrfs_create_new_inode to handle
+-ENOMEM gracefully instead of aborting the transaction. It clears nlink and
+orphans the newly-created inode under memory pressure.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 3a2dca093c7db..99e990c592f67 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -6863,7 +6863,17 @@ int btrfs_create_new_inode(struct btrfs_trans_handle *trans,
+>  	} else {
+>  		ret = btrfs_add_link(trans, BTRFS_I(dir), BTRFS_I(inode), name,
+>  				     false, BTRFS_I(inode)->dir_index);
+> -		if (unlikely(ret)) {
+> +		if (ret == -ENOMEM) {
+> +			clear_nlink(inode);
+> +			/*
+> +			 * btrfs_orphan_add() aborts the transaction itself if it
+> +			 * fails, so only override ret to -ENOMEM on success.
+> +			 */
+> +			ret = btrfs_orphan_add(trans, BTRFS_I(inode));
+> +			if (!ret)
+> +				ret = -ENOMEM;
+> +			goto discard;
+
+[Severity: High]
+Does skipping the on-disk inode update here cause a permanent metadata leak
+on system crash?
+
+When clear_nlink(inode) is called, it only updates the in-memory state.
+Because the code jumps to discard without calling btrfs_update_inode(), the
+on-disk inode still has an nlink count of 1.
+
+If the system crashes after this transaction commits, btrfs_orphan_cleanup()
+will run on the next mount. Because it sees nlink > 0, it assumes the file
+is valid and only pending a truncate. It will delete the orphan item and
+leave the inode intact:
+
+fs/btrfs/inode.c:btrfs_orphan_cleanup() {
+        if (!inode || inode->vfs_inode.i_nlink) {
+                if (inode) {
+                        ...
+                }
+                trans = btrfs_start_transaction(root, 1);
+                ...
+                ret = btrfs_del_orphan_item(trans, root, found_key.objectid);
+                btrfs_end_transaction(trans);
+                continue;
+        }
+}
+
+Should btrfs_update_inode() be called before jumping to discard so the
+on-disk nlink matches the in-memory state?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260804-btrfs-enomem-v2-0-4d923170e8c1@kernel.org?part=4
+

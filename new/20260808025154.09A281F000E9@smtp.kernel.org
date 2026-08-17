@@ -1,0 +1,127 @@
+From sashiko-bot@kernel.org Sat Aug  8 04:52:04 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/4] btrfs: add per-inode compression levels in xattrs
+Date: Sat, 08 Aug 2026 02:51:53 +0000
+Message-Id: <20260808025154.09A281F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Critical] Fallible memory allocation in prop_compression_apply() violates API contract, leading to kernel panic and filesystem reclaim deadlock.
+- [High] Setting compression type without a level overrides the filesystem-wide default level with the algorithm's default level.
+- [High] Explicitly configured compression levels are lost during property inheritance.
+--
+
+--- Patch [3]: [PATCH 3/4] btrfs: add per-inode compression levels in xattrs ---
+commit 6cb127b4ed9b39e745bd0df4551edd884c4fa0f9
+Author: koraynilay <koray.fra@gmail.com>
+Subject: btrfs: add per-inode compression levels in xattrs
+
+This patch adds support for specifying compression algorithms and levels
+per inode via the btrfs property set command. It introduces a new
+prop_compress_level field to btrfs_inode and updates the property
+application logic to parse and store the requested level.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 2534cd9284d54..b63b5006fd780 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -938,6 +938,13 @@ static void compress_file_range(struct btrfs_work *work)
+>  		compress_level = inode->defrag_compress_level;
+>  	} else if (inode->prop_compress) {
+>  		compress_type = inode->prop_compress;
+> +		/*
+> +		 * If level not specified (i.e. is 0), use the fs default. If
+> +		 * compress_type is different, keep the level anyway and let
+> +		 * the rest of the code clamp it.
+> +		 */
+> +		if (inode->prop_compress_level)
+> +			compress_level = inode->prop_compress_level;
+
+[Severity: High]
+Does this unintentionally override the filesystem-wide compression mount
+options when a user sets a compression property without a level?
+
+If a user specifies a property without a level, the parsing in
+btrfs_compress_str2level() will return the algorithm's default level
+(for example, 3 for zstd) rather than 0.
+
+This means prop_compress_level becomes 3 instead of 0, which triggers this
+branch and overwrites the fs_info->compress_level, breaking the fallback
+behavior described in the comment.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index bb77d46376d4b..f79a61a2759f6 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+[ ... ]
+> @@ -335,23 +346,37 @@ static int prop_compression_apply(struct btrfs_inode *inode, const char *value,
+>  		return 0;
+>  	}
+>  
+> -	if (!strncmp("lzo", value, 3)) {
+> +	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+> +	if (!value_str)
+> +		return -ENOMEM;
+
+[Severity: Critical]
+Can this allocation cause a kernel panic or a filesystem reclaim deadlock?
+
+The btrfs property system guarantees that the apply callback will not fail
+if validation succeeds. This is enforced by an assertion in btrfs_set_prop()
+when applying the property:
+
+btrfs_set_prop() {
+        ...
+        ret = handler->apply(inode, value, value_len);
+        /* We validated before, so it should not fail here. */
+        ASSERT(ret == 0);
+}
+
+If this GFP_KERNEL allocation fails under memory pressure, apply() will
+return -ENOMEM and immediately trigger the assertion, crashing the system.
+
+Additionally, since this runs while holding a transaction handle or b-tree
+lock, a GFP_KERNEL allocation could recurse into the filesystem memory
+reclaim path and deadlock.
+
+> +	if (btrfs_match_compress_type(value_str, "lzo", true)) {
+>  		type = BTRFS_COMPRESS_LZO;
+>  		btrfs_set_fs_incompat(fs_info, COMPRESS_LZO);
+[ ... ]
+> -	} else if (!strncmp("zstd", value, 4)) {
+>  		type = BTRFS_COMPRESS_ZSTD;
+> +		ret = btrfs_compress_str2level(type, value_str + 4, &level);
+> +		if (ret < 0)
+> +			goto out;
+>  		btrfs_set_fs_incompat(fs_info, COMPRESS_ZSTD);
+>  	} else {
+> -		return -EINVAL;
+> +		ret = -EINVAL;
+> +		goto out;
+>  	}
+>  
+>  	inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  	inode->flags |= BTRFS_INODE_COMPRESS;
+>  	inode->prop_compress = type;
+> +	inode->prop_compress_level = level;
+
+[Severity: High]
+Are the explicitly configured compression levels lost during property
+inheritance for new files and directories?
+
+When new files inherit properties, btrfs_inode_inherit_props() extracts
+the parent's properties using the extract() callback. Since this patch does
+not update prop_compression_extract() to include the new level, it continues
+to only return the base algorithm string via btrfs_compress_type2str().
+
+As a result, it seems that newly created children will only inherit the
+algorithm type and silently lose the specific level configuration.
+
+> -	return 0;
+> +out:
+> +	kfree(value_str);
+> +	return ret;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260808023459.1494928-1-koray.fra@gmail.com?part=3
+

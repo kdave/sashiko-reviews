@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Sun Aug  9 04:02:54 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/4] btrfs: also validate compression levels in
+ btrfs_compress_is_valid_type()
+Date: Sun, 09 Aug 2026 02:02:43 +0000
+Message-Id: <20260809020244.5A88F1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The patch modifies the signature of `btrfs_compress_is_valid_type()` to take a single argument but fails to update its sole caller in `fs/btrfs/props.c`, resulting in a compilation error.
+- [High] Removing the `len` parameter and relying on NUL-terminated strings introduces an out-of-bounds read vulnerability because xattr values provided by userspace are not guaranteed to be NUL-terminated.
+--
+
+--- Patch [2]: [PATCH v2 2/4] btrfs: also validate compression levels in btrfs_compress_is_valid_type() ---
+commit 3f0674cb104a19f4132c1e4d16a6618c77e6e6d0
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: also validate compression levels in btrfs_compress_is_valid_type()
+
+This patch changes btrfs_compress_is_valid_type() to use
+btrfs_match_compress_type() and btrfs_compress_str2level() for validation.
+It also removes the length parameter under the assumption that the input
+string is NUL-terminated.
+
+> Furthermore, remove the len parameter, since now it requires a
+> NUL-terminated string because of btrfs_compress_str2level(); this change
+> is fine because btrfs_compress_is_valid_type() is used only once in
+> props.c
+
+[Severity: High]
+Are xattr payloads provided by userspace guaranteed to be NUL-terminated?
+
+When userspace calls setxattr with a property payload that lacks a trailing
+NUL byte (e.g., exactly 4 bytes for 'zstd'), the VFS layer passes this raw
+buffer down to the filesystem. Internal property inheritance via
+iterate_object_props() also reads raw bytes without appending a NUL byte.
+
+> diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+> index 58138f300b580..833c5f45afec5 100644
+> --- a/fs/btrfs/compression.c
+> +++ b/fs/btrfs/compression.c
+[ ... ]
+> -bool btrfs_compress_is_valid_type(const char *str, size_t len)
+> +bool btrfs_compress_is_valid_type(const char *str)
+>  {
+
+[Severity: High]
+Does this signature change cause a compilation failure?
+
+The patch doesn't appear to update the caller in fs/btrfs/props.c. Calling
+this function with two arguments as in prop_compression_validate():
+
+fs/btrfs/props.c:prop_compression_validate() {
+    ...
+    if (btrfs_compress_is_valid_type(value, len))
+    ...
+}
+
+Will this cause a 'too many arguments' compiler error?
+
+> +	size_t len = strlen(str);
+
+[Severity: High]
+Does removing the length parameter and relying on NUL-termination cause
+out-of-bounds reads here and in downstream calls?
+
+If str is a raw buffer from a setxattr syscall without a NUL terminator,
+will strlen() read past the end of the buffer? Furthermore, will downstream
+calls like kstrtoint() (via btrfs_compress_str2level()) or the string index
+checks in btrfs_match_compress_type() similarly read out of bounds?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260809015054.779137-1-koray.fra@gmail.com?part=2
+

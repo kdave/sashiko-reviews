@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Tue Aug  4 17:57:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/5] btrfs: use an on-stack path in
+ btrfs_insert_orphan_item()
+Date: Tue, 04 Aug 2026 15:56:58 +0000
+Message-Id: <20260804155659.275351F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Incomplete fix: btrfs_del_orphan_item() also needs a stack-allocated btrfs_path to prevent transaction aborts.
+--
+
+--- Patch [1]: [PATCH v2 1/5] btrfs: use an on-stack path in btrfs_insert_orphan_item() ---
+commit 71154aaab52154094eb5f2c9651e04e6df16ad7f
+Author: Jeff Layton <jlayton@kernel.org>
+btrfs: use an on-stack path in btrfs_insert_orphan_item()
+
+This commit changes btrfs_insert_orphan_item() to use an on-stack
+btrfs_path rather than allocating one dynamically. This prevents a
+memory allocation failure from turning into a transaction abort.
+
+> diff --git a/fs/btrfs/orphan.c b/fs/btrfs/orphan.c
+> index 9f3ad124104f1..72e1adec39d80 100644
+> --- a/fs/btrfs/orphan.c
+> +++ b/fs/btrfs/orphan.c
+> @@ -9,18 +9,17 @@
+>  int btrfs_insert_orphan_item(struct btrfs_trans_handle *trans,
+>  			     struct btrfs_root *root, u64 offset)
+>  {
+> -	BTRFS_PATH_AUTO_FREE(path);
+> +	struct btrfs_path path = { 0 };
+
+[ ... ]
+
+> -	return btrfs_insert_empty_item(trans, root, path, &key, 0);
+> +	ret = btrfs_insert_empty_item(trans, root, &path, &key, 0);
+> +	btrfs_release_path(&path);
+> +	return ret;
+>  }
+>  
+>  int btrfs_del_orphan_item(struct btrfs_trans_handle *trans,
+
+[Severity: High]
+This isn't a bug introduced by this patch, but should btrfs_del_orphan_item()
+also be updated to use an on-stack path?
+
+Looking at btrfs_del_orphan_item() right below this function, it still
+does a dynamic allocation:
+
+int btrfs_del_orphan_item(...)
+{
+	...
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+If an unprivileged user creates an O_TMPFILE and links it using linkat()
+during memory pressure, this allocation can fail.
+
+The error propagates up through btrfs_orphan_del() into btrfs_link(),
+which then unconditionally aborts the transaction:
+
+fs/btrfs/inode.c:btrfs_link() {
+    ...
+		ret = btrfs_orphan_del(trans, BTRFS_I(inode));
+		if (unlikely(ret)) {
+			btrfs_abort_transaction(trans, ret);
+			goto fail;
+		}
+    ...
+}
+
+Could btrfs_del_orphan_item() be converted to use an on-stack path as well
+to close this identical transaction abort vector?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260804-btrfs-enomem-v2-0-4d923170e8c1@kernel.org?part=1
+

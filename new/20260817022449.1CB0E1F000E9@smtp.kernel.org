@@ -1,0 +1,109 @@
+From sashiko-bot@kernel.org Mon Aug 17 04:24:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix transaction use-after-free in raid stripe
+ insertion
+Date: Mon, 17 Aug 2026 02:24:48 +0000
+Message-Id: <20260817022449.1CB0E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] btrfs_io_context structures on ordered_extent->bioc_list are leaked when btrfs_insert_one_raid_extent() fails or an I/O error occurs.
+- [High] update_raid_extent_item incorrectly propagates a positive error code (1) and obfuscates real negative error codes, leading to an invalid transaction abort.
+--
+
+--- Patch [1]: [PATCH v2] btrfs: fix transaction use-after-free in raid stripe insertion ---
+commit 6e94025f6870328d222d6e4eeb24555ffc352218
+Author: Shuangpeng Bai <shuangpeng.kernel@gmail.com>
+
+btrfs: fix transaction use-after-free in raid stripe insertion
+
+This commit removes a premature btrfs_end_transaction() call in the error
+path of btrfs_insert_one_raid_extent(). Removing it prevents a transaction
+use-after-free, as the caller still owns the transaction handle and will
+clean it up.
+
+Link: https://lore.kernel.org/r/20260817012733.2962781-1-shuangpeng.kernel@gmail.com
+
+> diff --git a/fs/btrfs/raid-stripe-tree.c b/fs/btrfs/raid-stripe-tree.c
+> index b210371ce91e3..89e259a47d8de 100644
+> --- a/fs/btrfs/raid-stripe-tree.c
+> +++ b/fs/btrfs/raid-stripe-tree.c
+> @@ -337,7 +337,6 @@ int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,
+>  	stripe_extent = kzalloc(item_size, GFP_NOFS);
+>  	if (unlikely(!stripe_extent)) {
+>  		btrfs_abort_transaction(trans, -ENOMEM);
+> -		btrfs_end_transaction(trans);
+>  		return -ENOMEM;
+
+[Severity: High]
+This is a pre-existing issue, but does this error path lead to a memory
+leak of btrfs_io_context structures?
+
+If btrfs_insert_one_raid_extent() returns an error, the caller 
+btrfs_insert_raid_extent() returns immediately without freeing the 
+remaining items in bioc_list:
+
+fs/btrfs/raid-stripe-tree.c:btrfs_insert_raid_extent() {
+    ...
+    if (ret)
+        return ret;
+    ...
+}
+
+Additionally, if an ordered extent encounters an I/O error,
+btrfs_finish_one_ordered() bypasses the call to btrfs_insert_raid_extent()
+entirely:
+
+fs/btrfs/inode.c:btrfs_finish_one_ordered() {
+    if (unlikely(test_bit(BTRFS_ORDERED_IOERR, &ordered_extent->flags))) {
+        ret = -EIO;
+        goto out;
+    }
+    ...
+}
+
+Since btrfs_put_ordered_extent() frees the ordered_extent struct but 
+ignores bioc_list, are the attached btrfs_io_context structures 
+permanently leaked?
+
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does the error handling
+further down in this function pass an invalid positive error code to
+btrfs_abort_transaction()?
+
+If btrfs_insert_item() returns -EEXIST, the code calls
+update_raid_extent_item():
+
+fs/btrfs/raid-stripe-tree.c:btrfs_insert_one_raid_extent() {
+    ...
+    if (ret == -EEXIST) {
+        ret = update_raid_extent_item(trans, &stripe_key, stripe_extent,
+                                      item_size);
+        if (ret)
+            btrfs_abort_transaction(trans, ret);
+    ...
+}
+
+Looking at update_raid_extent_item(), it can return a positive 1 or 
+obfuscate genuine negative errors:
+
+fs/btrfs/raid-stripe-tree.c:update_raid_extent_item() {
+    ...
+    ret = btrfs_search_slot(trans, trans->fs_info->stripe_root, key, path,
+                            0, 1);
+    if (ret)
+        return (ret == 1 ? ret : -EINVAL);
+    ...
+}
+
+Since btrfs_abort_transaction() relies on negative error codes, does
+passing a positive 1 negate it to -1 (-EPERM), resulting in an incorrect
+transaction abort code?
+
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260817021512.3010812-1-shuangpeng.kernel@gmail.com?part=1
+

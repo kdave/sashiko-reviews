@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Sun Aug  9 04:08:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 4/4] btrfs: support inheritance for per-inode
+ compression levels
+Date: Sun, 09 Aug 2026 02:07:58 +0000
+Message-Id: <20260809020758.D5F3C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Allocating memory with GFP_KERNEL while holding a Btrfs transaction handle can cause deadlocks.
+--
+
+--- Patch [4]: [PATCH v2 4/4] btrfs: support inheritance for per-inode compression levels ---
+commit 6f167463a3226dbba10efed1a1f0a0787da9a062
+Author: koraynilay <koray.fra@gmail.com>
+
+    btrfs: support inheritance for per-inode compression levels
+    
+    Change prop_handler's extract() signature to take an output buffer and
+    its length. This allows for the algo:level string to be generated
+    dynamically, but now the caller is in charge of managing that buffer
+    memory. Before this patch prop_compression_extract() would return only
+    the address of statically compiled string without being able to add the
+    level, now it concatenates the level to that statically compiled string.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index f79a61a2759f6..9c97792800fba 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+
+[ ... ]
+
+> @@ -437,6 +444,7 @@ int btrfs_inode_inherit_props(struct btrfs_trans_handle *trans,
+>  		const struct prop_handler *h = &prop_handlers[i];
+>  		const char *value;
+>  		u64 num_bytes = 0;
+> +		char buf[16];
+>  
+>  		if (!h->inheritable)
+>  			continue;
+> @@ -444,7 +452,7 @@ int btrfs_inode_inherit_props(struct btrfs_trans_handle *trans,
+>  		if (h->ignore(inode))
+>  			continue;
+>  
+> -		value = h->extract(parent);
+> +		value = h->extract(parent, buf, sizeof(buf));
+>  		if (!value)
+>  			continue;
+
+[Severity: High]
+Can this cause a deadlock by calling handlers that allocate memory with
+GFP_KERNEL while holding the transaction handle?
+
+Since btrfs_inode_inherit_props() and btrfs_set_prop() are called with an
+active btrfs_trans_handle, they subsequently call h->validate() and h->apply()
+which map to prop_compression_validate() and prop_compression_apply().
+
+Both of these handlers allocate memory using kmemdup_nul(..., GFP_KERNEL):
+
+fs/btrfs/props.c:prop_compression_validate() {
+    ...
+    value_str = kmemdup_nul(value, len, GFP_KERNEL);
+    ...
+}
+
+GFP_KERNEL allows direct reclaim, which can attempt to flush dirty filesystem
+data, requiring locks already held by the active transaction (an A-A deadlock).
+
+Since this path is reachable by unprivileged users setting compression xattrs
+or creating subvolumes, could this be exploited for a local DoS?
+
+Should these allocations use GFP_NOFS instead?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260809015054.779137-1-koray.fra@gmail.com?part=4
+

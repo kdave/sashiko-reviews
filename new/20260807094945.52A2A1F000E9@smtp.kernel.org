@@ -1,0 +1,68 @@
+From sashiko-bot@kernel.org Fri Aug  7 11:49:55 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: remove NULL fs_info checks in subpage
+ helpers
+Date: Fri, 07 Aug 2026 09:49:44 +0000
+Message-Id: <20260807094945.52A2A1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Pre-existing NULL pointer dereference on error path when test inode or test root allocation fails.
+--
+
+--- Patch [1]: [PATCH 1/2] btrfs: remove NULL fs_info checks in subpage helpers ---
+commit c65e0f2fa91a67c096ee6a881dede7f9e1560843
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove NULL fs_info checks in subpage helpers
+
+This commit removes unlikely(!fs_info) checks in several subpage helpers.
+These were previously needed for extent-io-tests, but since the tests now
+properly allocate a dummy fs_info and root, the checks are redundant.
+
+> We have several "unlikely(!fs_info)" checks inside subpage helpers, this
+> behavior was to avoid NULL pointer dereference for extent-io-tests,
+> where we have a dummy inode for testing but without an fs_info/root for
+> that testing inode.
+> 
+> However commit b2136cc288fc ("btrfs: tests: allocate dummy fs_info and
+> root in test_find_delalloc()") changed the test to properly allocate an
+> fs_info and root, so even for that selftest, we will have a proper
+> fs_info for btrfs_folio_*() helpers.
+
+[Severity: High]
+This is a pre-existing issue, but looking at the test_find_delalloc()
+function mentioned here, is there a NULL pointer dereference on the error
+path?
+
+If btrfs_alloc_dummy_root() or btrfs_new_test_inode() fails, the code
+jumps to the "out" label while inode is still NULL:
+
+fs/btrfs/tests/extent-io-tests.c:test_find_delalloc() {
+        ...
+        out:
+        if (locked_page)
+                put_page(locked_page);
+        process_page_range(inode, 0, total_dirty - 1,
+                           PROCESS_UNLOCK | PROCESS_RELEASE);
+        ...
+}
+
+This calls process_page_range(), which unconditionally dereferences
+inode->i_mapping:
+
+fs/btrfs/tests/extent-io-tests.c:process_page_range() {
+        ...
+        while (index <= end_index) {
+                ret = filemap_get_folios_contig(inode->i_mapping, &index,
+                                end_index, &fbatch);
+        ...
+}
+
+Could this cause a crash if the dummy root or test inode allocation fails
+during the test?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1786095309.git.wqu@suse.com?part=1
+
