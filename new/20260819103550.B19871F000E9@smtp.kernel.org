@@ -1,0 +1,66 @@
+From sashiko-bot@kernel.org Wed Aug 19 12:36:00 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: finish active block group cleanup if
+ call_zone_finish() fails
+Date: Wed, 19 Aug 2026 10:35:50 +0000
+Message-Id: <20260819103550.B19871F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Breaking early from the multi-stripe zone finish loop permanently leaks active zones on remaining healthy devices.
+--
+
+--- Patch [1]: [PATCH] btrfs: zoned: finish active block group cleanup if call_zone_finish() fails ---
+commit 1960bedcc767cd17d9b2cff4eedc204553b8cb57
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: finish active block group cleanup if call_zone_finish() fails
+
+do_zone_finish() previously returned early on a call_zone_finish() failure,
+leaving the block group active and causing an infinite retry loop. This
+commit changes the code to break the loop on failure and proceed with the
+block group cleanup instead.
+
+Link: https://sashiko.dev/#/patchset/20260818100037.1366563-1-johannes.thumshirn%40wdc.com
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index a016cb471beb4..30231b6d9a7df 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2628,14 +2628,12 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+>  	for (i = 0; i < map->num_stripes; i++) {
+>  
+>  		ret = call_zone_finish(block_group, &map->stripes[i]);
+> -		if (ret) {
+> -			up_read(&dev_replace->rwsem);
+> -			return ret;
+> -		}
+> +		if (ret)
+> +			break;
+
+[Severity: High]
+This is a pre-existing issue, but does breaking out of this loop early
+permanently leak active zones on the remaining healthy devices?
+
+In a multi-stripe zoned profile (like DUP or RAID1), if call_zone_finish()
+fails for one stripe due to an IO error or device loss, the break statement
+aborts the loop in do_zone_finish() and skips finishing the remaining stripes.
+
+Previously, returning early caused an infinite retry loop. Since this patch
+now falls through to the cleanup phase and removes the block group from the
+active list, does this mean the remaining healthy stripes are never retried?
+
+If so, this would permanently leak their hardware active zones and Btrfs
+in-memory active zone accounting. Zoned devices typically have strict active
+zone limits which could quickly be exhausted if leaked, eventually preventing
+new allocations and failing the filesystem.
+
+>  	}
+>  	up_read(&dev_replace->rwsem);
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260819102636.1423347-1-johannes.thumshirn@wdc.com?part=1
+

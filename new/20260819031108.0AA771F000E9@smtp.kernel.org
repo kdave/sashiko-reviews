@@ -1,0 +1,142 @@
+From sashiko-bot@kernel.org Wed Aug 19 05:11:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 1/5] btrfs: always return -EIOCBQUEUED after
+ btrfs_uring_read_extent_endio
+Date: Wed, 19 Aug 2026 03:11:07 +0000
+Message-Id: <20260819031108.0AA771F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Inode and extent locks are leaked when page array allocation fails in btrfs_uring_read_extent.
+- [High] Memory allocated for `btrfs_uring_encoded_data` leaks when an io_uring request returning `-EAGAIN` is cancelled from io-wq.
+- [High] Deadlock via page fault when `btrfs_uring_encoded_read` performs `copy_to_user` while holding extent and inode locks.
+- [Medium] Dynamic memory allocated for io_uring encoded read requests is leaked when extent setup fails.
+--
+
+--- Patch [1]: [PATCH v3 1/5] btrfs: always return -EIOCBQUEUED after btrfs_uring_read_extent_endio ---
+commit 62db964e5f62607fd244d7a3ea05e8d709c65427
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: always return -EIOCBQUEUED after btrfs_uring_read_extent_endio
+
+This commit fixes an issue where btrfs_encoded_read_regular_fill_pages()
+returned an I/O status directly instead of -EIOCBQUEUED when all bios finished
+early. This previously caused a double-free because btrfs_uring_read_extent()
+and btrfs_uring_read_finished() would both unlock and free resources.
+
+Closes: https://lore.kernel.org/linux-btrfs/20260630091609.3414-1-samsun1006219@gmail.com/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 7e82dad952ec5..16f69630b1ce1 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -9592,7 +9592,6 @@ int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+>  	struct completion sync_reads;
+>  	unsigned long i = 0;
+>  	struct btrfs_bio *bbio;
+> -	int ret;
+>  
+>  	/*
+>  	 * Fast path for synchronous reads which completes in this call, io_uring
+> @@ -9639,10 +9638,10 @@ int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+>  
+>  	if (uring_ctx) {
+>  		if (refcount_dec_and_test(&priv->pending_refs)) {
+> -			ret = blk_status_to_errno(READ_ONCE(priv->status));
+> -			btrfs_uring_read_extent_endio(uring_ctx, ret);
+> +			int err = blk_status_to_errno(READ_ONCE(priv->status));
+> +
+> +			btrfs_uring_read_extent_endio(uring_ctx, err);
+>  			kfree(priv);
+> -			return ret;
+>  		}
+>  
+>  		return -EIOCBQUEUED;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but I noticed a lock leak in
+btrfs_uring_read_extent() in fs/btrfs/ioctl.c when page array allocation
+fails:
+
+fs/btrfs/ioctl.c:btrfs_uring_read_extent() {
+    ...
+    pages = kzalloc_objs(struct page *, nr_pages, GFP_NOFS);
+    if (!pages)
+        return -ENOMEM;
+    ...
+}
+
+Does returning -ENOMEM directly here bypass the btrfs_unlock_extent() and
+btrfs_inode_unlock() calls at the out_fail label? The caller already
+successfully locked the file extent and acquired the inode's i_rwsem, so it
+seems this early return would permanently leak both locks.
+
+[Severity: Medium]
+This is a pre-existing issue, but does btrfs_uring_encoded_read() in
+fs/btrfs/ioctl.c leak data->iov when btrfs_uring_read_extent() fails?
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_read() {
+    ...
+    if (ret == -EIOCBQUEUED) {
+        ...
+        ret = btrfs_uring_read_extent(...);
+        goto out_acct;
+    }
+
+out_free:
+    kfree(data->iov);
+    ...
+}
+
+If btrfs_uring_read_extent() fails (e.g., due to an -ENOMEM error like the one
+above), it returns the error code directly. Does jumping to out_acct then
+unconditionally skip the out_free label, leaking the dynamically allocated
+data->iov array?
+
+[Severity: High]
+This isn't a bug introduced by this patch, but I noticed a potential memory leak
+in fs/btrfs/ioctl.c when an io_uring request returning -EAGAIN is cancelled from
+io-wq:
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_read() {
+    ...
+    data = kzalloc_obj(*data, GFP_NOFS);
+    if (!data) {
+        ret = -ENOMEM;
+        goto out_acct;
+    }
+
+    bc->data = data;
+    ...
+}
+
+When btrfs_uring_encoded_read() returns -EAGAIN, the dynamically allocated
+data pointer is stashed in bc->data for reuse on reissue. If the io-wq task
+is cancelled before processing, io_clean_op() calls io_uring_cmd_cleanup().
+
+However, since the command isn't marked cancelable via
+io_uring_cmd_mark_cancelable(), its driver-specific cancellation callback
+won't be invoked. Does this leak both bc->data and data->iov?
+
+[Severity: High]
+This is a pre-existing issue, but can btrfs_uring_encoded_read() in
+fs/btrfs/ioctl.c deadlock via page fault when copying to user space?
+
+fs/btrfs/ioctl.c:btrfs_uring_encoded_read() {
+    ...
+    if (copy_to_user(sqe_addr + copy_end,
+                     (const char *)&data->args + copy_end_kernel,
+                     sizeof(data->args) - copy_end_kernel)) {
+    ...
+}
+
+When btrfs_encoded_read() returns -EIOCBQUEUED, the inode (i_rwsem shared) and
+file extent remain locked. If the user-provided sqe_addr points to a memory
+mapped region of the same file, could this copy_to_user() trigger a page
+fault (such as btrfs_read_folio or btrfs_page_mkwrite) that attempts to
+acquire the exact same non-recursive extent lock, causing a deadlock?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260819025436.1949152-1-yangxiuwei@kylinos.cn?part=1
+

@@ -1,0 +1,61 @@
+From sashiko-bot@kernel.org Wed Aug 19 03:16:51 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 RESEND 4/4] btrfs: remove on-stack paddrs[] array
+ usage
+Date: Wed, 19 Aug 2026 01:16:41 +0000
+Message-Id: <20260819011641.91ABF1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] The function `btrfs_check_block_csum()` was removed, but it is still called in `fs/btrfs/scrub.c`, breaking the build.
+--
+
+--- Patch [4]: [PATCH v3 RESEND 4/4] btrfs: remove on-stack paddrs[] array usage ---
+commit 1f2571084f0bc2a685876a21d5d78352d9ce9552
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove on-stack paddrs[] array usage
+
+This commit removes the fixed on-stack paddrs array memory usage by
+removing several duplicated checksum helpers. The remaining callers are
+converted to either use local array implementations or switch to
+bio-based interfaces.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 3850ecfe5ca79..b0da5593e5f35 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+
+[ ... ]
+
+> -/*
+> - * Verify the checksum for a single sector without any extra action that depend
+> - * on the type of I/O.
+> - *
+> - * @kaddr must be a properly kmapped address.
+> - */
+> -int btrfs_check_block_csum(struct btrfs_fs_info *fs_info, phys_addr_t paddr, u8 *csum,
+> -			   const u8 * const csum_expected)
+> -{
+> -	btrfs_calculate_block_csum_folio(fs_info, paddr, csum);
+> -	if (unlikely(memcmp(csum, csum_expected, fs_info->csum_size) != 0))
+> -		return -EIO;
+> -	return 0;
+> -}
+
+[Severity: Low]
+Does removing this function cause a build failure? Looking at
+fs/btrfs/scrub.c, it appears scrub_verify_one_sector() still calls
+btrfs_check_block_csum:
+
+fs/btrfs/scrub.c:scrub_verify_one_sector() {
+    ...
+    ret = btrfs_check_block_csum(fs_info, paddr, csum_buf, sector->csum);
+    ...
+}
+
+Was this call site missed when updating to the new bio-based helpers,
+or should there be a local variant implemented for scrub as well?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1787101260.git.wqu@suse.com?part=4
+

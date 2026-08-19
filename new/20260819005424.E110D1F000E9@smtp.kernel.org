@@ -1,0 +1,77 @@
+From sashiko-bot@kernel.org Wed Aug 19 02:54:35 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: abort transaction before releasing
+ tree_log_mutex on commit failure
+Date: Wed, 19 Aug 2026 00:54:24 +0000
+Message-Id: <20260819005424.E110D1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] The TOCTOU race fixed by this patch remains vulnerable if write_all_supers() fails from backup_super_roots().
+--
+
+--- Patch [1]: [PATCH] btrfs: abort transaction before releasing tree_log_mutex on commit failure ---
+commit a6719597325272cd360f452a46e793176c9730c2
+Author: Leo Martins <loemra.dev@gmail.com>
+
+btrfs: abort transaction before releasing tree_log_mutex on commit failure
+
+This commit fixes a TOCTOU race in btrfs_commit_transaction() where a commit
+failure would drop tree_log_mutex before aborting the transaction. This
+allowed a waiting log sync to write out a superblock pointing to uncommitted
+trees, so it explicitly aborts the transaction before releasing the mutex.
+
+> diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+> index c641099d66e24..ae4a3edc6779e 100644
+> --- a/fs/btrfs/transaction.c
+> +++ b/fs/btrfs/transaction.c
+> @@ -2585,6 +2585,12 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+>  	ret = btrfs_write_and_wait_transaction(trans);
+>  	if (unlikely(ret)) {
+>  		btrfs_err(fs_info, "error while writing out transaction: %pe", ERR_PTR(ret));
+> +		/*
+> +		 * Abort before releasing tree_log_mutex, so a log sync waiting
+> +		 * on it sees the fs error and skips writing super_for_commit
+> +		 * for this failed transaction. See btrfs_sync_log().
+> +		 */
+> +		btrfs_abort_transaction(trans, ret);
+>  		mutex_unlock(&fs_info->tree_log_mutex);
+>  		goto scrub_continue;
+>  	}
+> 
+>  	ret = write_all_supers(trans);
+>  	/*
+>  	 * the super is written, we can safely allow the tree-loggers
+>  	 * to go about their business
+>  	 */
+>  	mutex_unlock(&fs_info->tree_log_mutex);
+>  	if (unlikely(ret))
+>  		goto scrub_continue;
+
+[Severity: Critical]
+This is a pre-existing issue, but does the TOCTOU race fixed by this patch still
+exist if write_all_supers() fails from backup_super_roots()?
+
+Looking at write_all_supers(), if backup_super_roots() fails, it returns the
+error immediately without aborting the transaction:
+
+fs/btrfs/disk-io.c:write_all_supers() {
+    ...
+		ret = backup_super_roots(fs_info);
+		if (ret < 0)
+			return ret;
+    ...
+}
+
+If this happens, btrfs_commit_transaction() unlocks tree_log_mutex and jumps to
+the scrub_continue label, leaving BTRFS_FS_ERROR unset because
+btrfs_abort_transaction() hasn't been called yet.
+
+Could a concurrent btrfs_sync_log() then acquire tree_log_mutex, see no FS
+error, and incorrectly write out the super_for_commit for the failed
+transaction?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/698c480ec13cd6e74c2175924f614b7e324e6cc3.1787099421.git.loemra.dev@gmail.com?part=1
+

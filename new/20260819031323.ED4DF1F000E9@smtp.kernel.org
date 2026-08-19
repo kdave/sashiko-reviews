@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Wed Aug 19 05:13:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 2/5] btrfs: free iov when btrfs_uring_read_extent
+ fails
+Date: Wed, 19 Aug 2026 03:13:23 +0000
+Message-Id: <20260819031323.ED4DF1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Inconsistent lock cleanup on error path in `btrfs_uring_read_extent` causing extent and inode lock leak (deadlock).
+--
+
+--- Patch [2]: [PATCH v3 2/5] btrfs: free iov when btrfs_uring_read_extent fails ---
+commit 45342dbc1bed21ae2b1fb0f3019ffbc98d38576d
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: free iov when btrfs_uring_read_extent fails
+
+This commit updates btrfs_uring_encoded_read() to fall through to the
+out_free path when btrfs_uring_read_extent() fails. This ensures data->iov
+is properly freed instead of bypassing the kfree() call.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index c4e995661bcf3..0e6f65c97b397 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -4816,8 +4816,8 @@ static int btrfs_uring_encoded_read(struct io_uring_cmd *cmd, unsigned int issue
+>  					      cached_state, disk_bytenr, disk_io_size,
+>  					      count, data->args.compression,
+>  					      data->iov, cmd);
+
+[Severity: High]
+This is a pre-existing issue, but I have a question about the error handling
+when btrfs_uring_read_extent() fails.
+
+When kzalloc_objs() fails early in btrfs_uring_read_extent(), it returns
+-ENOMEM directly without jumping to out_fail:
+
+fs/btrfs/ioctl.c:btrfs_uring_read_extent() {
+    ...
+    nr_pages = DIV_ROUND_UP(disk_io_size, PAGE_SIZE);
+    pages = kzalloc_objs(struct page *, nr_pages, GFP_NOFS);
+    if (!pages)
+        return -ENOMEM;
+    ...
+}
+
+Does returning directly bypass the lock cleanup? If the caller does not
+handle the unlocking on this specific error path, could it permanently leak
+the extent lock and i_rwsem?
+
+> -		goto out_acct;
+> +		if (ret == -EIOCBQUEUED)
+> +			goto out_acct;
+>  	}
+>  
+>  out_free:
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260819025436.1949152-1-yangxiuwei@kylinos.cn?part=2
+

@@ -1,0 +1,99 @@
+From sashiko-bot@kernel.org Tue Aug 18 12:18:39 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: propagate do_zone_finish() error in
+ btrfs_zone_finish_endio()
+Date: Tue, 18 Aug 2026 10:18:28 +0000
+Message-Id: <20260818101828.BF4FC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] If `call_zone_finish()` fails inside `do_zone_finish()`, the function returns early without cleaning up, causing memory/reference leaks, a permanent read-only state, and severe infinite loops or deadlocks in zone activations.
+--
+
+--- Patch [1]: [PATCH] btrfs: zoned: propagate do_zone_finish() error in btrfs_zone_finish_endio() ---
+commit d35c4cb4b19d499e3cdf754f9ec2b8b01ca16dca
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: propagate do_zone_finish() error in btrfs_zone_finish_endio()
+
+This commit updates btrfs_zone_finish_endio() to propagate the return
+value of do_zone_finish() instead of silently dropping failed zone
+finishes. The caller btrfs_finish_ordered_io() already handles the
+returned error.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index a016cb471beb4..82c2394dd43c6 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -2732,11 +2733,11 @@ int btrfs_zone_finish_endio(struct btrfs_fs_info *fs_info, u64 logical, u64 leng
+>  	    block_group->start + block_group->zone_capacity)
+>  		goto out;
+>  
+> -	do_zone_finish(block_group, true);
+> +	ret = do_zone_finish(block_group, true);
+
+[Severity: High]
+This is a pre-existing issue, but propagating this error exposes a flaw where
+a failure in do_zone_finish() skips critical cleanup.
+
+Looking at do_zone_finish() in fs/btrfs/zoned.c, if call_zone_finish() fails,
+it returns early:
+
+fs/btrfs/zoned.c:do_zone_finish() {
+    ...
+    for (i = 0; i < map->num_stripes; i++) {
+        ret = call_zone_finish(block_group, &map->stripes[i]);
+        if (ret) {
+            up_read(&dev_replace->rwsem);
+            return ret;
+        }
+    }
+    ...
+}
+
+Could this early return cause deadlocks and memory leaks by bypassing the
+list removal and bit-clearing steps below?
+
+fs/btrfs/zoned.c:do_zone_finish() {
+    ...
+    spin_lock(&fs_info->zone_active_bgs_lock);
+    ASSERT(!list_empty(&block_group->active_bg_list));
+    list_del_init(&block_group->active_bg_list);
+    spin_unlock(&fs_info->zone_active_bgs_lock);
+
+    /* For active_bg_list */
+    btrfs_put_block_group(block_group);
+
+    clear_and_wake_up_bit(BTRFS_FS_NEED_ZONE_FINISH, &fs_info->flags);
+    ...
+}
+
+Without this cleanup, the block group leaks its reference and stays
+indefinitely on active_bg_list, which would leave other threads waiting
+permanently on BTRFS_FS_NEED_ZONE_FINISH.
+
+Furthermore, does this leftover state lead to an infinite loop in
+btrfs_zoned_activate_one_bg()?
+
+If the block group remains on zone_active_bgs but its ZONE_IS_ACTIVE bit
+is cleared (which happens before call_zone_finish), btrfs_zone_finish_one_bg()
+might continuously select it as the min_bg.
+
+Since do_zone_finish() immediately returns 0 when the active bit is unset,
+btrfs_zone_finish_one_bg() would return 1 (success/retry), causing the
+for (;;) loop in btrfs_zoned_activate_one_bg() to retry endlessly.
+
+>  
+>  out:
+>  	btrfs_put_block_group(block_group);
+> -	return 0;
+> +	return ret;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260818100037.1366563-1-johannes.thumshirn@wdc.com?part=1
+

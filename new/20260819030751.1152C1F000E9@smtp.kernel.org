@@ -1,0 +1,57 @@
+From sashiko-bot@kernel.org Wed Aug 19 05:08:01 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 3/5] btrfs: unlock inode and extent in caller when
+ uring read extent fails
+Date: Wed, 19 Aug 2026 03:07:50 +0000
+Message-Id: <20260819030751.1152C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Possible self-deadlock in btrfs_uring_encoded_read due to copy_to_user() triggering a page fault while holding the inode and extent locks.
+--
+
+--- Patch [3]: [PATCH v3 3/5] btrfs: unlock inode and extent in caller when uring read extent fails ---
+commit 3e61127c5431fb12c7ce3749bbab49a8a9481144
+Author: Yang Xiuwei <yangxiuwei@kylinos.cn>
+
+btrfs: unlock inode and extent in caller when uring read extent fails
+
+This commit moves the unlocking of the inode and extent on failure paths
+from btrfs_uring_read_extent() into its caller. This matches the error
+handling path for copy_to_user() and fixes an issue where a pages-array
+allocation failure returned -ENOMEM without unlocking at all.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 0e6f65c97b397..09554cb07ad00 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+
+[ ... ]
+
+> @@ -4818,6 +4815,8 @@ static int btrfs_uring_encoded_read(struct io_uring_cmd *cmd, unsigned int issue
+>  					      data->iov, cmd);
+>  		if (ret == -EIOCBQUEUED)
+>  			goto out_acct;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but could the copy_to_user()
+call just above this block in btrfs_uring_encoded_read() cause a deadlock?
+
+If sqe_addr points to a memory-mapped region of the exact same Btrfs file
+and extent being read, wouldn't a write page fault trigger
+btrfs_page_mkwrite()?
+
+Since the extent lock is already held by the current thread at this point
+when ret == -EIOCBQUEUED, this seems like it could create an unrecoverable
+self-deadlock.
+
+> +		btrfs_unlock_extent(io_tree, start, lockend, &cached_state);
+> +		btrfs_inode_unlock(inode, BTRFS_ILOCK_SHARED);
+>  	}
+>  
+>  out_free:
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260819025436.1949152-1-yangxiuwei@kylinos.cn?part=3
+

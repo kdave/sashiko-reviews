@@ -29,5 +29,6 @@ for mbox in wip.*; do
 	"$here/qpdecode.py" "$mbox" "$newdir/$mid"
 done
 
+cd "$here"
 git add new/*
 git commit -m"Update "$(date  +%Y-%m-%d)
