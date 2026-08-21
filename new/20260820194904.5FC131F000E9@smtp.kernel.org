@@ -1,0 +1,61 @@
+From sashiko-bot@kernel.org Thu Aug 20 21:49:14 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 6/7] orangefs: Remove launder_folio implementation
+Date: Thu, 20 Aug 2026 19:49:03 +0000
+Message-Id: <20260820194904.5FC131F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Removing `.launder_folio` causes `read()`, `write()`, and `mmap()` to spuriously fail with `-EBUSY` during cache invalidation when encountering dirty folios.
+--
+
+--- Patch [6]: [PATCH 6/7] orangefs: Remove launder_folio implementation ---
+commit 218daa910ec2f9105936277522ec316faf345c0b
+Author: Matthew Wilcox (Oracle) <willy@infradead.org>
+
+orangefs: Remove launder_folio implementation
+
+This commit removes the launder_folio hook from orangefs_address_operations.
+The underlying orangefs_launder_folio function is retained for use in
+other places.
+
+> diff --git a/fs/orangefs/inode.c b/fs/orangefs/inode.c
+> index 7143b64b5b255..c1f5658ba8af1 100644
+> --- a/fs/orangefs/inode.c
+> +++ b/fs/orangefs/inode.c
+> @@ -616,7 +616,6 @@ static const struct address_space_operations orangefs_address_operations = {
+>  	.release_folio = orangefs_release_folio,
+>  	.free_folio = orangefs_free_folio,
+>  	.migrate_folio = filemap_migrate_folio,
+> -	.launder_folio = orangefs_launder_folio,
+
+[Severity: High]
+Does removing launder_folio cause read, write, and mmap syscalls to spuriously
+fail with -EBUSY during cache invalidation when encountering dirty folios?
+
+If a user process mmaps an OrangeFS file and writes to it, dirtying pages via
+orangefs_page_mkwrite, and concurrently another thread calls read, the
+cache timeout expiration will trigger orangefs_revalidate_mapping:
+
+fs/orangefs/file.c:orangefs_revalidate_mapping() {
+    ...
+    unmap_mapping_range(mapping, 0, 0, 0);
+    ret = filemap_invalidate_pages(mapping, 0, OFFSET_MAX);
+    ...
+}
+
+If the mmap thread redirties a page before the invalidation processes it,
+folio_unmap_invalidate encounters a dirty folio.
+
+Before this patch, orangefs_launder_folio synchronously wrote out the
+redirtied page and freed its private data, allowing invalidation to succeed.
+
+Without launder_folio, folio_unmap_invalidate leaves the private data
+attached, causing filemap_release_folio to fail and -EBUSY to be returned,
+which propagates up to the VFS.
+
+>  	.direct_IO = orangefs_direct_IO,
+>  };
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260820193343.3852967-1-willy@infradead.org?part=6
+

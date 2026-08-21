@@ -1,0 +1,54 @@
+From sashiko-bot@kernel.org Thu Aug 20 21:42:40 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 5/7] orangefs: Use filemap_invalidate_pages()
+Date: Thu, 20 Aug 2026 19:42:29 +0000
+Message-Id: <20260820194230.41B9E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] orangefs_revalidate_mapping() updates mapping_time even if invalidation fails, potentially serving stale data to subsequent reads.
+--
+
+--- Patch [5]: [PATCH 5/7] orangefs: Use filemap_invalidate_pages() ---
+commit 47b25e517dda5aa6ef98431496c4e07c5c88ad4a
+Author: Matthew Wilcox (Oracle) <willy@infradead.org>
+
+orangefs: Use filemap_invalidate_pages()
+
+This commit simplifies orangefs_revalidate_mapping() by replacing open-coded
+invalidation logic with a single call to filemap_invalidate_pages().
+
+> diff --git a/fs/orangefs/file.c b/fs/orangefs/file.c
+> index 42591252e2396..36e3685f7e896 100644
+> --- a/fs/orangefs/file.c
+> +++ b/fs/orangefs/file.c
+> @@ -306,9 +306,7 @@ int orangefs_revalidate_mapping(struct inode *inode)
+>  	spin_unlock(&inode->i_lock);
+>  
+>  	unmap_mapping_range(mapping, 0, 0, 0);
+> -	ret = filemap_write_and_wait(mapping);
+> -	if (!ret)
+> -		ret = invalidate_inode_pages2(mapping);
+> +	ret = filemap_invalidate_pages(mapping, 0, OFFSET_MAX);
+>  
+>  	orangefs_inode->mapping_time = jiffies +
+>  	    orangefs_cache_timeout_msecs*HZ/1000;
+
+[Severity: High]
+This is a pre-existing issue, but should mapping_time be updated only if
+filemap_invalidate_pages() succeeds?
+
+If filemap_invalidate_pages() returns an error (such as -EBUSY due to
+elevated refcounts from an active GUP pin), the error is returned to the
+current caller but mapping_time is still updated to a future time.
+
+Subsequent reads within the cache timeout window will then see
+time_before(jiffies, orangefs_inode->mapping_time) as true and return
+success without attempting to invalidate the page cache or fetch new data.
+
+Could this result in stale data being served from the page cache?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260820193343.3852967-1-willy@infradead.org?part=5
+

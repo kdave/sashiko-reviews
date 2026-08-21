@@ -1,0 +1,81 @@
+From sashiko-bot@kernel.org Thu Aug 20 21:50:01 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/7] btrfs: Use filemap_invalidate_pages()
+Date: Thu, 20 Aug 2026 19:49:50 +0000
+Message-Id: <20260820194950.F3EDB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Replacement of invalidate_inode_pages2() with filemap_invalidate_pages() introduces synchronous writeback in error and teardown paths, causing deadlocks and skipping invalidation on failure.
+--
+
+--- Patch [3]: [PATCH 3/7] btrfs: Use filemap_invalidate_pages() ---
+commit 542633918dbb01d47500f8047dc6db295b173fe9
+Author: Matthew Wilcox (Oracle) <willy@infradead.org>
+
+btrfs: Use filemap_invalidate_pages()
+
+This patch replaces invalidate_inode_pages2() and
+invalidate_inode_pages2_range() with filemap_invalidate_pages() to
+perform bulk writeback before removing the page cache, removing the
+need for btrfs_launder_folio().
+
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+[ ... ]
+> @@ -4739,7 +4741,8 @@ static void btrfs_destroy_delalloc_inodes(struct btrfs_root *root)
+>  			unsigned int nofs_flag;
+>  
+>  			nofs_flag = memalloc_nofs_save();
+> -			invalidate_inode_pages2(inode->i_mapping);
+> +			filemap_invalidate_pages(inode->i_mapping, 0,
+> +					OFFSET_MAX);
+
+[Severity: Critical]
+Does this introduce synchronous writeback during transaction aborts?
+
+In teardown paths like btrfs_destroy_delalloc_inodes(), Btrfs intends to
+forcefully discard dirty pages. Because filemap_invalidate_pages() calls
+filemap_write_and_wait_range(), it attempts to write back these pages instead.
+
+Furthermore, if the writeback fails (which is likely during a transaction
+abort), filemap_invalidate_pages() returns early and skips the actual page
+invalidation. This leaves dirty pages stranded in memory and prevents inode
+eviction.
+
+[ ... ]
+> @@ -4837,7 +4840,7 @@ static void btrfs_cleanup_bg_io(struct btrfs_block_group *cache)
+>  		unsigned int nofs_flag;
+>  
+>  		nofs_flag = memalloc_nofs_save();
+> -		invalidate_inode_pages2(inode->i_mapping);
+> +		filemap_invalidate_pages(inode->i_mapping, 0, OFFSET_MAX);
+
+[Severity: Critical]
+Can this cause deadlocks during block group IO error cleanup?
+
+Similar to the delalloc teardown path, btrfs_cleanup_bg_io() handles error
+recovery and shouldn't attempt writeback. Initiating I/O here instead of
+forcefully dropping the cache can result in massive unnecessary I/O and
+potential deadlocks.
+
+> --- a/fs/btrfs/free-space-cache.c
+> +++ b/fs/btrfs/free-space-cache.c
+[ ... ]
+> @@ -1500,7 +1500,7 @@ static int __btrfs_write_out_cache(struct inode *inode,
+>  	io_ctl->inode = NULL;
+>  	io_ctl_free(io_ctl);
+>  	if (ret) {
+> -		invalidate_inode_pages2(inode->i_mapping);
+> +		filemap_invalidate_pages(inode->i_mapping, 0, OFFSET_MAX);
+
+[Severity: Critical]
+Is it safe to retry writeback in this error path?
+
+This block executes when __btrfs_write_out_cache() has already encountered
+an error (ret != 0). Calling filemap_invalidate_pages() synchronously attempts
+writeback again. If this predictably fails, it skips page invalidation and
+strands the pages in memory.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260820193343.3852967-1-willy@infradead.org?part=3
+

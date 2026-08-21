@@ -1,0 +1,99 @@
+From sashiko-bot@kernel.org Thu Aug 20 21:51:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 7/7] Remove folio_launder()
+Date: Thu, 20 Aug 2026 19:51:26 +0000
+Message-Id: <20260820195126.DCFD71F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Cache Coherency Regression: The patch series replaces `invalidate_inode_pages2_range()` with `filemap_invalidate_pages()` in filesystems like FUSE, NFS, and BTRFS for cache invalidation. `filemap_invalidate_pages()` performs bulk writeback and aborts immediately if `filemap_write_and_wait_range()` returns an error, skipping cache invalidation entirely. Previously, `invalidate_inode_pages2_range()` laundered dirty pages individually and continued invalidating clean pages even if a dirty page failed to write back. By aborting early, `filemap_invalidate_pages()` leaves clean, stale pages in the page cache upon any writeback error, causing silent data corruption and stale reads when syncing with remote servers.
+--
+
+--- Patch [7]: [PATCH 7/7] Remove folio_launder() ---
+commit 3fd895f31ae97b46112ca647b5fbdb4e55b9948c
+Author: Matthew Wilcox (Oracle) <willy@infradead.org>
+
+    Remove folio_launder()
+
+    When we do direct I/O, we need to evict any page cache that overlaps
+    the range in the file. This patch removes the inconsistency between
+    filesystems by checking whether the folio is dirty in the VFS and
+    failing the call to folio_unmap_invalidate() instead of laundering it.
+
+> diff --git a/mm/truncate.c b/mm/truncate.c
+> index b58ba940be474..7f7d65fa926a1 100644
+> --- a/mm/truncate.c
+> +++ b/mm/truncate.c
+[ ... ]
+> @@ -623,7 +614,6 @@ int folio_unmap_invalidate(struct address_space *mapping, struct folio *folio,
+>  			   gfp_t gfp)
+>  {
+>  	void (*free_folio)(struct folio *);
+> -	int ret;
+>  
+>  	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+>  
+> @@ -631,9 +621,8 @@ int folio_unmap_invalidate(struct address_space *mapping, struct folio *folio,
+>  		unmap_mapping_folio(folio);
+>  	BUG_ON(folio_mapped(folio));
+>  
+> -	ret = folio_launder(mapping, folio);
+> -	if (ret)
+> -		return ret;
+> +	if (folio_test_dirty(folio))
+> +		return -EBUSY;
+>  	if (folio->mapping != mapping)
+>  		return -EBUSY;
+>  	if (!filemap_release_folio(folio, gfp))
+
+[Severity: High]
+This patch series replaces invalidate_inode_pages2_range() with
+filemap_invalidate_pages() in filesystems like FUSE, NFS, and BTRFS for cache
+invalidation. Does this new approach cause a cache coherency regression?
+
+Looking at filemap_invalidate_pages(), it performs bulk writeback and aborts
+immediately if filemap_write_and_wait_range() returns an error:
+
+mm/filemap.c:filemap_invalidate_pages() {
+    ...
+    int ret = filemap_write_and_wait_range(mapping, pos, end);
+
+    if (ret)
+        return ret;
+
+    return invalidate_inode_pages2_range(mapping, pos >> PAGE_SHIFT,
+                                         end >> PAGE_SHIFT);
+}
+
+By returning early on a writeback error, it skips cache invalidation entirely.
+
+Previously, as seen here in invalidate_inode_pages2_range(), the code captured
+the error from folio_unmap_invalidate() but deliberately continued the loop to
+invalidate the remaining clean pages:
+
+mm/truncate.c:invalidate_inode_pages2_range() {
+    ...
+    ret2 = folio_unmap_invalidate(mapping, folio, GFP_KERNEL);
+    if (ret2 < 0)
+        ret = ret2;
+    folio_unlock(folio);
+    ...
+}
+
+For filesystems like FUSE that now use filemap_invalidate_pages():
+
+fs/fuse/inode.c:fuse_reverse_inval_inode() {
+    ...
+    if (offset >= 0)
+        filemap_invalidate_pages(inode->i_mapping, offset,
+                                 offset + len - 1);
+    ...
+}
+
+If a transient storage or network error occurs causing writeback to fail, the
+early return in filemap_invalidate_pages() leaves clean, stale pages in the
+page cache. Can this lead to silent data corruption and stale reads when
+syncing with remote servers?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260820193343.3852967-1-willy@infradead.org?part=7
+

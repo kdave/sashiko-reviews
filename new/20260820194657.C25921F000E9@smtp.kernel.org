@@ -1,0 +1,137 @@
+From sashiko-bot@kernel.org Thu Aug 20 21:47:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/7] nfs: Use filemap_invalidate_pages()
+Date: Thu, 20 Aug 2026 19:46:57 +0000
+Message-Id: <20260820194657.C25921F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] Removal of `nfs_launder_folio` breaks page cache invalidation for folios with pending NFS commits or concurrent writes, returning `-EBUSY` and leaving stale data.
+- [High] `filemap_invalidate_pages()` skips invalidation completely on writeback errors, preventing error recovery.
+- [Low] Passing `-1` as a `loff_t` byte offset to `filemap_invalidate_pages()` unintentionally bypasses the writeback phase.
+--
+
+--- Patch [4]: [PATCH 4/7] nfs: Use filemap_invalidate_pages() ---
+commit 8b753e215c3db6d223a97117006a944e0d96647b
+Author: Matthew Wilcox (Oracle) <willy@infradead.org>
+Subject: nfs: Use filemap_invalidate_pages()
+
+This commit replaces calls to invalidate_inode_pages2() and
+invalidate_inode_pages2_range() with filemap_invalidate_pages(), which does
+a bulk write first before removing the page cache. It also removes the
+nfs_launder_folio() callback.
+
+> diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+> index 36f2e85889220..792fbcb0f719a 100644
+> --- a/fs/nfs/dir.c
+> +++ b/fs/nfs/dir.c
+[ ... ]
+> @@ -1050,8 +1051,8 @@ static int find_and_lock_cache_page(struct nfs_readdir_descriptor *desc)
+>  		    memcmp(nfsi->cookieverf, verf, sizeof(nfsi->cookieverf))) {
+>  			memcpy(nfsi->cookieverf, verf,
+>  			       sizeof(nfsi->cookieverf));
+> -			invalidate_inode_pages2_range(desc->file->f_mapping, 1,
+> -						      -1);
+> +			filemap_invalidate_pages(desc->file->f_mapping,
+> +					PAGE_SIZE, -1);
+
+[Severity: Low]
+Does passing -1 as the end offset here unintentionally bypass the writeback
+phase of filemap_invalidate_pages()?
+
+If end is passed as -1, inside filemap_write_and_wait_range(), the signed
+evaluation lend < lstart (-1 < 4096) will evaluate to true, causing an
+immediate return.
+
+The invalidation step still executes because -1LL >> 12 casts to ULONG_MAX,
+but the writeback is completely skipped.
+
+Should this be OFFSET_MAX instead, as used elsewhere in this patch?
+
+>  			trace_nfs_readdir_invalidate_cache_range(
+>  				inode, 1, MAX_LFS_FILESIZE);
+>  		}
+> diff --git a/fs/nfs/direct.c b/fs/nfs/direct.c
+> index e626c72495e69..56ad855b90279 100644
+> --- a/fs/nfs/direct.c
+> +++ b/fs/nfs/direct.c
+[ ... ]
+> @@ -1060,8 +1060,7 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, struct iov_iter *iter,
+>  							    FLUSH_COND_STABLE);
+>  
+>  		if (mapping->nrpages) {
+> -			invalidate_inode_pages2_range(mapping,
+> -						      pos >> PAGE_SHIFT, end);
+> +			filemap_invalidate_pages(mapping, pos, end);
+>  		}
+
+[Severity: High]
+With nfs_launder_folio() removed, will this invalidation predictably fail
+when unstable NFS writes are present?
+
+When filemap_invalidate_pages() calls filemap_write_and_wait_range(), it does
+not wait for asynchronous NFS commits, leaving PG_private set on the folios.
+Then, invalidate_inode_pages2_range() calls nfs_release_folio(), which sees
+PG_private, triggers an async commit, but immediately returns false.
+
+This causes the invalidation to fail with -EBUSY.
+
+In the O_DIRECT write case here, does this mean subsequent buffered reads will
+return stale cached data instead of the newly written O_DIRECT data?
+
+>  		nfs_end_io_direct(inode);
+> diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+> index 5bcd4027d2033..089dd7df1790c 100644
+> --- a/fs/nfs/inode.c
+> +++ b/fs/nfs/inode.c
+[ ... ]
+> @@ -1323,7 +1323,8 @@ void nfs_file_clear_open_context(struct file *filp)
+>  		 * every page again.
+>  		 */
+>  		if (ctx->error < 0)
+> -			invalidate_inode_pages2(inode->i_mapping);
+> +			filemap_invalidate_pages(inode->i_mapping, 0,
+> +					OFFSET_MAX);
+
+[Severity: High]
+Does this skip invalidation completely if there are writeback errors?
+
+When ctx->error < 0, this path is trying to drop the corrupted cache. However,
+filemap_invalidate_pages() first calls filemap_write_and_wait_range(). If
+the mapping already has a writeback error, it immediately returns the error
+(e.g., -EIO) and completely skips the invalidate_inode_pages2_range() step.
+
+Previously, invalidate_inode_pages2() was called directly, which
+unconditionally invalidated the clean pages regardless of writeback failures.
+
+Could this prevent error recovery from clearing corrupted pages?
+
+>  		filp->private_data = NULL;
+>  		put_nfs_open_context_sync(ctx);
+>  	}
+> diff --git a/fs/nfs/nfs42proc.c b/fs/nfs/nfs42proc.c
+> index ab86246fc364f..8555fd0a7f710 100644
+> --- a/fs/nfs/nfs42proc.c
+> +++ b/fs/nfs/nfs42proc.c
+[ ... ]
+> @@ -395,8 +395,7 @@ static void nfs42_copy_dest_done(struct file *file, loff_t pos, loff_t len,
+>  	loff_t end = newsize - 1;
+>  
+>  	nfs_truncate_last_folio(mapping, oldsize, pos);
+> -	WARN_ON_ONCE(invalidate_inode_pages2_range(mapping, pos >> PAGE_SHIFT,
+> -						   end >> PAGE_SHIFT));
+> +	WARN_ON_ONCE(filemap_invalidate_pages(mapping, pos, end));
+
+[Severity: High]
+Because of the failure to invalidate folios with pending NFS commits (as
+noted above), will this now trigger spurious WARN_ON_ONCEs?
+
+When unstable writes are present, the -EBUSY failure from
+invalidate_inode_pages2_range() inside filemap_invalidate_pages() propagates
+up, triggering this warning.
+
+>  	spin_lock(&inode->i_lock);
+>  	if (newsize > i_size_read(inode))
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260820193343.3852967-1-willy@infradead.org?part=4
+

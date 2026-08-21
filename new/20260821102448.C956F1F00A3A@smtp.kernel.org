@@ -1,0 +1,71 @@
+From sashiko-bot@kernel.org Fri Aug 21 12:24:58 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: remove runtime tweakable feature sysfs interface
+Date: Fri, 21 Aug 2026 10:24:48 +0000
+Message-Id: <20260821102448.C956F1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] This problem wasn't introduced by this patch, but the patch fixes a race condition and NULL pointer dereference in `btrfs_feature_attr_store()` while failing to fix the identical preexisting vulnerability in `btrfs_label_store()`.
+--
+
+--- Patch [1]: [PATCH] btrfs: remove runtime tweakable feature sysfs interface ---
+commit f899ccd4af04489cf31c28aaa1c0fefa960beda1
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove runtime tweakable feature sysfs interface
+
+This patch removes the sysfs interface for modifying runtime features since 
+supported features are already statically enabled. It removes 
+btrfs_feature_attr_store() to prevent a race condition where sysfs writes 
+access transaction_kthread during mount or unmount.
+
+> diff --git a/fs/btrfs/sysfs.c b/fs/btrfs/sysfs.c
+> index 0d14570c8bc29..437f145222e83 100644
+> --- a/fs/btrfs/sysfs.c
+> +++ b/fs/btrfs/sysfs.c
+[ ... ]
+> -static ssize_t btrfs_feature_attr_store(struct kobject *kobj,
+> -					struct kobj_attribute *a,
+> -					const char *buf, size_t count)
+> -{
+[ ... ]
+> -	/*
+> -	 * We don't want to do full transaction commit from inside sysfs
+> -	 */
+> -	set_bit(BTRFS_FS_NEED_TRANS_COMMIT, &fs_info->flags);
+> -	wake_up_process(fs_info->transaction_kthread);
+> -
+> -	return count;
+> -}
+
+[Severity: High]
+This is a pre-existing issue, but since this patch explicitly removes
+btrfs_feature_attr_store() to fix a race with transaction_kthread, does
+btrfs_label_store() suffer from the exact same vulnerability?
+
+Looking at btrfs_label_store() in fs/btrfs/sysfs.c, it has identical logic
+and unconditionally calls:
+
+    set_bit(BTRFS_FS_NEED_TRANS_COMMIT, &fs_info->flags);
+    wake_up_process(fs_info->transaction_kthread);
+
+During mount in open_ctree(), sysfs interfaces are exposed before the kthread
+is created:
+
+    ret = btrfs_sysfs_add_mounted(fs_info);
+    // transaction_kthread initialized later
+
+And during unmount in close_ctree(), the kthread is stopped long before sysfs
+interfaces are removed:
+
+    kthread_stop(fs_info->transaction_kthread);
+    // btrfs_sysfs_remove_mounted() called later
+
+Could a concurrent write to the label sysfs attribute trigger a NULL pointer
+dereference or use-after-free panic during mount or unmount?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/8a598d76555b5944d34bb08fa8dbeea28fc05db9.1787307129.git.wqu@suse.com?part=1
+

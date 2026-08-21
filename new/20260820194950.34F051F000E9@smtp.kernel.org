@@ -1,0 +1,170 @@
+From sashiko-bot@kernel.org Thu Aug 20 21:50:00 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/7] fuse: Use filemap_invalidate_pages()
+Date: Thu, 20 Aug 2026 19:49:49 +0000
+Message-Id: <20260820194950.34F051F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] FUSE reverse page cache invalidation silently fails when requested to invalidate up to EOF (len <= 0).
+- [High] Direct I/O reads unconditionally invalidate the page cache, and both reads and writes can spuriously fail with -EBUSY.
+- [High] Cache invalidation is completely aborted if there is a pending or concurrent writeback error, leaving stale pages in memory.
+--
+
+--- Patch [2]: [PATCH 2/7] fuse: Use filemap_invalidate_pages() ---
+commit 37e2c9a80bc0edeb6f94d0c4239ecfa00b24cbd5
+Author: Matthew Wilcox (Oracle) <willy@infradead.org>
+
+    fuse: Use filemap_invalidate_pages()
+
+FUSE relies on invalidate_inode_pages2() / invalidate_inode_pages2_range()
+doing writeback by calling fuse_launder_folio(). This commit replaces
+these calls with filemap_invalidate_pages() and removes fuse_launder_folio().
+
+> --- a/fs/fuse/dir.c
+> +++ b/fs/fuse/dir.c
+[ ... ]
+> @@ -1912,7 +1913,8 @@ static int fuse_dir_open(struct inode *inode, struct file *file)
+>  		if (ff->open_flags & (FOPEN_STREAM | FOPEN_NONSEEKABLE))
+>  			nonseekable_open(inode, file);
+>  		if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+> -			invalidate_inode_pages2(inode->i_mapping);
+> +			filemap_invalidate_pages(inode->i_mapping, 0,
+> +					OFFSET_MAX);
+>  	}
+
+[Severity: High]
+Will cache invalidation completely abort here if there is a pending or
+concurrent writeback error?
+
+If a directory has a pending writeback error, filemap_invalidate_pages()
+will call filemap_write_and_wait_range(), which returns the pre-existing
+mapping error.
+
+When that happens, filemap_invalidate_pages() returns immediately without
+calling invalidate_inode_pages2_range(). Since the return value is ignored
+here, the invalidation is silently aborted, permanently leaving stale data
+in the page cache.
+
+Previously, invalidate_inode_pages2() attempted to invalidate every page
+regardless of whether others failed writeback.
+
+> --- a/fs/fuse/file.c
+> +++ b/fs/fuse/file.c
+[ ... ]
+> @@ -294,7 +294,8 @@ static int fuse_open(struct inode *inode, struct file *file)
+>  		if (is_truncate)
+>  			truncate_pagecache(inode, 0);
+>  		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+> -			invalidate_inode_pages2(inode->i_mapping);
+> +			filemap_invalidate_pages(inode->i_mapping, 0,
+> +					OFFSET_MAX);
+>  	}
+
+[Severity: High]
+Does this face the same silent abort issue on writeback error as mentioned
+above for fuse_dir_open()?
+
+[ ... ]
+> @@ -1661,8 +1660,6 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
+>  	size_t nmax = write ? fc->max_write : fc->max_read;
+>  	loff_t pos = *ppos;
+>  	size_t count = iov_iter_count(iter);
+> -	pgoff_t idx_from = pos >> PAGE_SHIFT;
+> -	pgoff_t idx_to = (pos + count - 1) >> PAGE_SHIFT;
+>  	ssize_t res = 0;
+>  	int err = 0;
+>  	struct fuse_io_args *ia;
+> @@ -1675,7 +1672,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
+>  		return -ENOMEM;
+>  
+>  	if (fopen_direct_io) {
+> -		res = filemap_write_and_wait_range(mapping, pos, pos + count - 1);
+> +		res = filemap_invalidate_pages(mapping, pos, pos + count - 1);
+>  		if (res) {
+>  			fuse_io_free(ia);
+>  			return res;
+>  		}
+>  	}
+
+[Severity: High]
+Can this cause direct I/O reads to unnecessarily evict clean page cache,
+and also cause direct I/O to spuriously fail with -EBUSY?
+
+The replacement here unconditionally calls filemap_invalidate_pages() for
+both reads and writes, whereas the original code only invalidated the cache
+for writes further down in the function.
+
+Invalidating on direct reads evicts clean pages, degrading performance for
+concurrent buffered readers.
+
+Additionally, filemap_invalidate_pages() returns errors propagated from
+invalidate_inode_pages2_range(). Because the FUSE launder_folio operation
+was deleted in this patch, if a folio is re-dirtied by a concurrent mmap
+write between the write-and-wait and invalidation phases,
+invalidate_inode_pages2_range() will fail with -EBUSY. Returning this
+error directly here can cause the read or write syscall to randomly fail
+with -EBUSY.
+
+> --- a/fs/fuse/inode.c
+> +++ b/fs/fuse/inode.c
+[ ... ]
+> @@ -382,7 +382,8 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
+>  		}
+>  
+>  		if (inval)
+> -			invalidate_inode_pages2(inode->i_mapping);
+> +			filemap_invalidate_pages(inode->i_mapping, 0,
+> +					OFFSET_MAX);
+>  	}
+
+[Severity: High]
+Does this face the same silent abort issue on writeback error as mentioned
+above for fuse_dir_open()?
+
+[ ... ]
+> @@ -547,8 +548,6 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
+>  {
+>  	struct fuse_inode *fi;
+>  	struct inode *inode;
+> -	pgoff_t pg_start;
+> -	pgoff_t pg_end;
+>  
+>  	inode = fuse_ilookup(fc, nodeid, NULL);
+>  	if (!inode)
+> @@ -561,15 +560,9 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
+>  
+>  	fuse_invalidate_attr(inode);
+>  	forget_all_cached_acls(inode);
+> -	if (offset >= 0) {
+> -		pg_start = offset >> PAGE_SHIFT;
+> -		if (len <= 0)
+> -			pg_end = -1;
+> -		else
+> -			pg_end = (offset + len - 1) >> PAGE_SHIFT;
+> -		invalidate_inode_pages2_range(inode->i_mapping,
+> -					      pg_start, pg_end);
+> -	}
+> +	if (offset >= 0)
+> +		filemap_invalidate_pages(inode->i_mapping, offset,
+> +				offset + len - 1);
+
+[Severity: High]
+Does this code silently fail to invalidate the page cache when the server
+requests invalidation to EOF?
+
+When a FUSE daemon sends a FUSE_NOTIFY_INVAL_INODE request with a length
+of 0, it semantically means "invalidate from offset to EOF".
+
+The original code explicitly checked if len <= 0 and set the end page index
+to -1 (ULONG_MAX). If len == 0 and offset > 0, the new calculation
+offset + len - 1 evaluates to offset - 1.
+
+Inside filemap_invalidate_pages(), filemap_write_and_wait_range() will
+immediately return 0 because lend < lstart. Following that,
+invalidate_inode_pages2_range() is called with start > end, which also
+returns 0 without invalidating any pages. This causes valid invalidation
+requests to be completely ignored.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260820193343.3852967-1-willy@infradead.org?part=2
+
