@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Tue Aug 25 18:42:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 3/4] btrfs: handle ENOMEM from
+ btrfs_insert_dir_item() without aborting
+Date: Tue, 25 Aug 2026 16:42:48 +0000
+Message-Id: <20260825164249.0EEC41F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Graceful -ENOMEM handling in btrfs_create_new_inode() permanently leaks the new inode, INODE_REF, and orphan item in the btree on the active filesystem.
+--
+
+commit 59579ea2499bb27e05fe0f9dc13d7cf5fc2a0cbe
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: handle ENOMEM from btrfs_insert_dir_item() without aborting
+
+The commit modifies btrfs_create_new_inode() and btrfs_add_link() to gracefully
+handle -ENOMEM from btrfs_insert_dir_item() without aborting the transaction.
+It adds the newly created inode to the orphan list and jumps to the discard
+label when an out-of-memory error occurs.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 3a2dca093c7db..5b79910d72f52 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -6863,7 +6863,27 @@ int btrfs_create_new_inode(struct btrfs_trans_handle *trans,
+>  	} else {
+>  		ret = btrfs_add_link(trans, BTRFS_I(dir), BTRFS_I(inode), name,
+>  				     false, BTRFS_I(inode)->dir_index);
+> -		if (unlikely(ret)) {
+> +		if (ret == -ENOMEM) {
+> +			/*
+> +			 * Orphan the new inode instead of aborting. The inode
+> +			 * item was already written with nlink 1, and discard's
+> +			 * eviction won't delete a bad inode, so nlink 0 must be
+> +			 * persisted here or orphan cleanup would see nlink > 0,
+> +			 * drop the orphan item, and leak the inode.
+> +			 */
+> +			clear_nlink(inode);
+> +			/* btrfs_orphan_add() aborts the transaction on failure. */
+> +			ret = btrfs_orphan_add(trans, BTRFS_I(inode));
+> +			if (ret)
+> +				goto discard;
+> +			ret = btrfs_update_inode(trans, BTRFS_I(inode));
+> +			if (ret) {
+> +				btrfs_abort_transaction(trans, ret);
+> +				goto discard;
+> +			}
+> +			ret = -ENOMEM;
+> +			goto discard;
+
+[Severity: Medium]
+Will this error path permanently leak the new inode, INODE_REF, and orphan item
+in the btree on the active filesystem?
+
+The error path adds the inode to the orphan list and jumps to discard without
+aborting the transaction, leaving the items in the committed btree.
+
+When discard_new_inode() runs, it marks the inode as bad. This causes
+btrfs_evict_inode() to unconditionally skip on-disk cleanup:
+
+fs/btrfs/inode.c:btrfs_evict_inode() {
+...
+	if (is_bad_inode(inode))
+		goto out;
+...
+}
+
+Because Btrfs only runs orphan cleanup at mount time, won't these metadata
+items accumulate and permanently consume space on the live filesystem until it
+is remounted?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260825-btrfs-enomem-v4-0-b9363fa8714a@kernel.org?part=3
+

@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Tue Aug 25 15:14:30 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 1/6] btrfs: export btrfs_match_compress_type(), move
+ it to compression.h
+Date: Tue, 25 Aug 2026 13:14:19 +0000
+Message-Id: <20260825131420.5232B1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] The function documentation comment incorrectly describes the return logic regarding the level suffix.
+--
+
+--- Patch [1]: [PATCH v4 1/6] btrfs: export btrfs_match_compress_type(), move it to compression.h ---
+commit 07291a674085b7a248960d8c211d57029ccccd44
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: export btrfs_match_compress_type(), move it to compression.h
+
+This commit exports btrfs_match_compress_type() from super.c and moves
+it to compression.c. It also introduces a kernel-doc comment to describe
+the function.
+
+> diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+> index c62b5148d5ac1..65d8b88b97323 100644
+> --- a/fs/btrfs/compression.c
+> +++ b/fs/btrfs/compression.c
+[ ... ]
+> @@ -1650,3 +1650,20 @@ int btrfs_compress_str2level(unsigned int type, const char *str, int *level_ret)
+>  	*level_ret = btrfs_compress_set_level(type, level);
+>  	return 0;
+>  }
+> +
+> +/**
+> + * btrfs_match_compress_type - Check if the string matches the compression type
+> + * @string:         The string to check
+> + * @type:           The compression type string (name) to match against (e.g. "zstd")
+> + * @may_have_level: If true, the string may have a level suffix (e.g., ":1")
+> + *
+> + * Return: %true if the string matches the type and, if %may_have_level is %true,
+> + * has a level suffix, %false otherwise.
+> + */
+> +bool btrfs_match_compress_type(const char *string, const char *type, bool may_have_level)
+> +{
+> +	const int len = strlen(type);
+> +
+> +	return (strncmp(string, type, len) == 0) &&
+> +		((may_have_level && string[len] == ':') || string[len] == '\0');
+> +}
+
+[Severity: Low]
+Does this documentation comment accurately describe the return logic?
+
+The comment implies that if may_have_level is true, it strictly requires the
+string to have a level suffix. However, looking at the implementation, the
+function will still return true for an exact match with no suffix because
+of the string[len] == \0 condition.
+
+Could this wording confuse developers into thinking a level suffix is
+mandatory when may_have_level is true, rather than optional?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260825130745.229008-1-koray.fra@gmail.com?part=1
+

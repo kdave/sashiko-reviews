@@ -1,0 +1,112 @@
+From sashiko-bot@kernel.org Mon Aug 24 19:12:54 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: set space_info before adding new free space in
+ btrfs_make_block_group()
+Date: Mon, 24 Aug 2026 17:12:42 +0000
+Message-Id: <20260824171243.211A11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [Critical] Early space_info assignment exposes an underflow in __btrfs_add_free_space_zoned(), causing new block groups to be erroneously marked for reclaim and leading to silent data corruption or fatal transaction aborts.
+
+Pre-existing issues:
+- [High] Missing btrfs_remove_free_space_cache() on the btrfs_add_new_free_space() error path leaks btrfs_free_space structures.
+--
+
+--- Patch [1]: [PATCH] btrfs: set space_info before adding new free space in btrfs_make_block_group() ---
+commit 3c93ff2dbdbb6fb64eaafd70e05315a865d97e00
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: set space_info before adding new free space in btrfs_make_block_group()
+
+btrfs_make_block_group() calls btrfs_add_new_free_space() before
+assigning cache->space_info. On a zoned filesystem that ends up in
+__btrfs_add_free_space_zoned(), which dereferences
+block_group->space_info and thus hits a NULL pointer dereference when a
+non-initial free space range is added (e.g. during relocation).
+
+Assign cache->space_info before the btrfs_add_new_free_space() call.
+
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 830460a40e865..ee182369254c0 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+
+[ ... ]
+
+> @@ -3074,21 +3074,25 @@ struct btrfs_block_group *btrfs_make_block_group(struct btrfs_trans_handle *tran
+
+[ ... ]
+
+>  	/*
+>  	 * Ensure the corresponding space_info object is created and
+>  	 * assigned to our block group. We want our bg to be added to the rbtree
+>  	 * with its ->space_info set.
+> +	 *
+> +	 * On a zoned filesystem btrfs_add_new_free_space() ends up in
+> +	 * __btrfs_add_free_space_zoned(), which dereferences
+> +	 * block_group->space_info, so it has to be set beforehand.
+>  	 */
+>  	cache->space_info = space_info;
+>  	ASSERT(cache->space_info);
+>  
+> +	ret = btrfs_add_new_free_space(cache, chunk_offset, chunk_offset + size, NULL);
+
+[Severity: Critical]
+Does moving this assignment earlier expose a latent underflow issue in
+__btrfs_add_free_space_zoned() that can cause a block group to be dropped
+from the transaction?
+
+When a new zoned block group spans excluded extents (like superblocks),
+btrfs_add_new_free_space() slices the range. Since the first slice size is
+less than the total length, it triggers the reclaim check in
+__btrfs_add_free_space_zoned():
+
+fs/btrfs/free-space-cache.c:__btrfs_add_free_space_zoned() {
+    ...
+    reclaimable_unusable = block_group->zone_unusable -
+                           (block_group->length - block_group->zone_capacity);
+    ...
+}
+
+For a new block group, zone_unusable is 0. If length is greater than
+zone_capacity, this unsigned subtraction underflows.
+
+The block group is then erroneously added to reclaim_bgs. Later in
+btrfs_make_block_group(), it calls:
+
+    btrfs_link_bg_list(cache, &trans->new_bgs);
+
+Could this silently fail because the list_head is already linked in
+reclaim_bgs, preventing it from being added to trans->new_bgs and resulting
+in the new block group never being written to the extent tree?
+
+> +	btrfs_free_excluded_extents(cache);
+> +	if (ret) {
+> +		btrfs_put_block_group(cache);
+
+[Severity: High]
+This is a pre-existing issue, but does this error path leak memory if
+btrfs_add_new_free_space() succeeds for an initial slice but fails for a
+subsequent slice (e.g. returning -ENOMEM)?
+
+btrfs_put_block_group() frees the free_space_ctl structure, but does not walk
+the rb-tree to free the successfully added extent items or revert discard
+stats.
+
+Would it be appropriate to call btrfs_remove_free_space_cache(cache) before
+calling btrfs_put_block_group() on this error path?
+
+> +		return ERR_PTR(ret);
+> +	}
+> +
+>  	ret = btrfs_add_block_group_cache(cache);
+>  	if (ret) {
+>  		btrfs_remove_free_space_cache(cache);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260824164758.2012077-1-johannes.thumshirn@wdc.com?part=1
+

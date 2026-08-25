@@ -1,0 +1,103 @@
+From sashiko-bot@kernel.org Fri Aug 21 20:03:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zstd: fix lost wakeup when waiting for a
+ workspace
+Date: Fri, 21 Aug 2026 18:03:00 +0000
+Message-Id: <20260821180300.A148A1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Tasks can sleep indefinitely in `zstd_get_workspace()` if the max-level fallback workspace fails to preallocate at mount time.
+- [High] Incorrect check in `zstd_put_workspace` permanently exempts arbitrary workspaces from LRU reclaim.
+--
+
+--- Patch [1]: [PATCH] btrfs: zstd: fix lost wakeup when waiting for a workspace ---
+commit 150a452ccf6825f3396f0b8b4a9127de6177a23f
+Author: FAN YE <fy15309206903@gmail.com>
+
+btrfs: zstd: fix lost wakeup when waiting for a workspace
+    
+A writer can sleep forever in zstd_get_workspace() even though a workspace
+is free. When zstd_alloc_workspace() fails, the task is queued on
+zwsm->wait and schedules unconditionally, never re-testing the pool.
+
+> diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+> index 86919293fd546..cb15cbd737c4c 100644
+> --- a/fs/btrfs/zstd.c
+> +++ b/fs/btrfs/zstd.c
+[ ... ]
+> @@ -307,8 +307,17 @@ struct list_head *zstd_get_workspace(struct btrfs_fs_info *fs_info, int level)
+>  		DEFINE_WAIT(wait);
+>  
+>  		prepare_to_wait(&zwsm->wait, &wait, TASK_UNINTERRUPTIBLE);
+> -		schedule();
+> +		/*
+> +		 * Re-check after being queued: zstd_put_workspace() only
+> +		 * wakes a queue that already has a sleeper, so a workspace
+> +		 * returned since the failed allocation woke nobody.
+> +		 */
+> +		ws = zstd_find_workspace(fs_info, level);
+> +		if (!ws)
+> +			schedule();
+>  		finish_wait(&zwsm->wait, &wait);
+> +		if (ws)
+> +			return ws;
+
+[Severity: High]
+This is a pre-existing issue, but can tasks sleep indefinitely in
+zstd_get_workspace() if the max-level fallback workspace fails to preallocate
+at mount time?
+
+In zstd_alloc_workspace_manager(), preallocation failure is logged but
+otherwise ignored without establishing the fallback workspace:
+
+    ws = zstd_alloc_workspace(fs_info, ZSTD_BTRFS_MAX_LEVEL);
+    if (IS_ERR(ws)) {
+        btrfs_warn(NULL, "cannot preallocate zstd compression workspace");
+    } else {
+        ...
+    }
+
+If this fails, later under memory pressure zstd_get_workspace() will fail
+to allocate a workspace and block on zwsm->wait.
+
+However, zstd_put_workspace() only wakes the queue when a max-level
+workspace is returned:
+
+    if (workspace->level == clip_level(ZSTD_BTRFS_MAX_LEVEL))
+        cond_wake_up(&zwsm->wait);
+
+Since no max-level workspace was preallocated, and none might be allocated
+dynamically (if no level-15 requests are made or if they also fail), is it
+possible the wakeup is never triggered and writers hang in
+TASK_UNINTERRUPTIBLE forever?
+
+[Severity: High]
+This is also a pre-existing issue, but does the idle list check in
+zstd_put_workspace() permanently exempt arbitrary workspaces from LRU reclaim?
+
+Looking at zstd_put_workspace():
+
+    /* Hide a max level workspace from reclaim */
+    if (list_empty(&zwsm->idle_ws[ZSTD_BTRFS_MAX_LEVEL - 1])) {
+        INIT_LIST_HEAD(&workspace->lru_list);
+    } else {
+
+This checks the global max-level idle list rather than checking the level of
+the current workspace being returned.
+
+Because zstd_find_workspace() can borrow higher-level workspaces as
+fallbacks, the max-level workspace can frequently be in use under load,
+making its idle list empty.
+
+If a lower-level workspace is returned during this window, it passes this
+check, its lru_list is re-initialized, and it bypasses insertion into
+zwsm->lru_list.
+
+Since the timer only scans lru_list, does this mean these dynamically
+allocated workspaces are never reclaimed, causing a memory leak?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260821-btrfs-zstd-lost-wakeup-v1-1-84f358d4ea67@gmail.com?part=1
+

@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Sat Aug 22 14:56:40 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zstd: keep the last max level workspace out of
+ reclaim
+Date: Sat, 22 Aug 2026 12:56:29 +0000
+Message-Id: <20260822125630.0F6C11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] The logic intended to protect the last max-level workspace from being reclaimed inadvertently allows lower-level reads to permanently hide surplus max-level workspaces from the reclaim timer, leading to severe memory hoarding.
+--
+
+--- Patch [1]: [PATCH] btrfs: zstd: keep the last max level workspace out of reclaim ---
+commit 362f421b295a4d51665c15d4ae8291d3cf53f22b
+Author: FAN YE <fy15309206903@gmail.com>
+
+btrfs: zstd: keep the last max level workspace out of reclaim
+
+This commit modifies the zstd_put_workspace logic to prevent the last max
+level workspace from being reclaimed. It unlinks the workspace from the LRU
+when the max level idle list is empty.
+
+> diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+> index 86919293fd546..8abc4e456f320 100644
+> --- a/fs/btrfs/zstd.c
+> +++ b/fs/btrfs/zstd.c
+[ ... ]
+> @@ -335,18 +335,17 @@ void zstd_put_workspace(struct btrfs_fs_info *fs_info, struct list_head *ws)
+>  	ASSERT(zwsm);
+>  	spin_lock_bh(&zwsm->lock);
+>  
+> -	/* A node is only taken off the lru if we are the corresponding level */
+> -	if (clip_level(workspace->req_level) == workspace->level) {
+[ ... ]
+> +	/* Forward progress depends on always keeping one max level workspace */
+> +	if (workspace->level == clip_level(ZSTD_BTRFS_MAX_LEVEL) &&
+> +	    list_empty(&zwsm->idle_ws[ZSTD_BTRFS_MAX_LEVEL - 1])) {
+> +		list_del_init(&workspace->lru_list);
+> +	} else if (clip_level(workspace->req_level) == workspace->level) {
+> +		/* A node is only taken off the lru if we are the corresponding level */
+> +		workspace->last_used = jiffies;
+> +		list_add(&workspace->lru_list, &zwsm->lru_list);
+> +		if (!timer_pending(&zwsm->timer))
+> +			mod_timer(&zwsm->timer,
+> +				  jiffies + ZSTD_BTRFS_RECLAIM_JIFFIES);
+>  	}
+
+[Severity: High]
+Does this logic permanently hide surplus max-level workspaces from the reclaim
+timer?
+
+If there are multiple max-level workspaces and they are borrowed by concurrent
+lower-level reads, they can bypass the LRU linkage when returned.
+
+For example, if two lower-level reads borrow two max-level workspaces (W1 and
+W2), the idle list for the max level becomes empty. When the first read returns
+W1, the idle list is empty, so W1 hits the first condition, gets unlinked from
+the LRU, and is added to the idle list.
+
+When the second read returns W2, the idle list is no longer empty, so it falls
+through to the else-if block. Since it was borrowed by a lower-level read,
+clip_level(workspace->req_level) does not equal workspace->level, and the
+block is skipped. W2 is never re-added to the LRU list.
+
+Over time, this can act as a one-way ratchet, converting all ON-LRU workspaces
+into OFF-LRU workspaces, which keeps these large workspaces pinned in memory
+forever.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260822-btrfs-zstd-max-level-reclaim-v1-1-0eb13c127480@gmail.com?part=1
+

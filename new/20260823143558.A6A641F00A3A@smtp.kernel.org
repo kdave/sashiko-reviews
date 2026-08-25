@@ -1,0 +1,138 @@
+From sashiko-bot@kernel.org Sun Aug 23 16:36:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zstd: fix hang when the workspace preallocation
+ fails
+Date: Sun, 23 Aug 2026 14:35:58 +0000
+Message-Id: <20260823143558.A6A641F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Tight CPU spin loop in `btrfs_get_workspace` when preallocation fails and memory is tight.
+- [High] Workspaces of lower compression levels are incorrectly hidden from the LRU reclaim list if the max-level workspace is in use.
+- [High] Time-of-check to time-of-use (TOCTOU) race condition in `zstd_get_workspace` causes a lost wakeup and indefinite task hang.
+--
+
+--- Patch [1]: [PATCH] btrfs: zstd: fix hang when the workspace preallocation fails ---
+commit a621e3e1cba259752e5caacce8ac867552c88483
+Author: FAN YE <fy15309206903@gmail.com>
+
+btrfs: zstd: fix hang when the workspace preallocation fails
+
+zstd_alloc_workspace_manager() only warns when the max level workspace it
+preallocates cannot be allocated, and the mount comes up with none. This
+counts the max level workspaces and retries the allocation instead of
+sleeping when there are none, backing off with memalloc_retry_wait().
+
+> btrfs_get_workspace() guards the same preallocation failure the same way,
+> using total_ws.
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does btrfs_get_workspace()
+suffer from a tight CPU spin loop when preallocation fails and memory is
+tight?
+
+When alloc_workspace() fails under severe memory pressure, and
+atomic_read(total_ws) == 0, the code prints a rate-limited warning and jumps
+directly back to again.
+
+fs/btrfs/compression.c:btrfs_get_workspace() {
+    ...
+    if (atomic_read(total_ws) == 0) {
+        static DEFINE_RATELIMIT_STATE(_rs,
+                /* once per minute */ 60 * HZ,
+                /* no burst */ 1);
+
+        if (__ratelimit(&_rs))
+            btrfs_warn(fs_info,
+                "no compression workspaces, low memory, retrying");
+    }
+    goto again;
+    ...
+}
+
+Unlike the patched zstd_get_workspace() which uses
+memalloc_retry_wait(GFP_KERNEL) to back off, btrfs_get_workspace()
+immediately retries the failed allocation without sleeping. Could this starve
+the system of CPU resources and lead to lockups?
+
+> diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+> index 86919293fd546..ef850dd43d3f8 100644
+> --- a/fs/btrfs/zstd.c
+> +++ b/fs/btrfs/zstd.c
+
+[ ... ]
+
+> @@ -303,6 +310,22 @@ struct list_head *zstd_get_workspace(struct btrfs_fs_info *fs_info, int level)
+>  	ws = zstd_alloc_workspace(fs_info, level);
+>  	memalloc_nofs_restore(nofs_flag);
+>  
+> +	if (!IS_ERR(ws) && clip_level(level) == ZSTD_BTRFS_MAX_LEVEL - 1)
+> +		atomic_inc(&zwsm->nr_max_level_ws);
+> +
+> +	/* Waiting without a workspace that can wake us would never end */
+> +	if (IS_ERR(ws) && !atomic_read(&zwsm->nr_max_level_ws)) {
+> +		static DEFINE_RATELIMIT_STATE(_rs,
+> +				/* once per minute */ 60 * HZ,
+> +				/* no burst */ 1);
+> +
+> +		if (__ratelimit(&_rs))
+> +			btrfs_warn(fs_info,
+> +				   "no zstd compression workspace, low memory, retrying");
+> +		memalloc_retry_wait(GFP_KERNEL);
+> +		goto again;
+> +	}
+> +
+>  	if (IS_ERR(ws)) {
+>  		DEFINE_WAIT(wait);
+>  
+>  		prepare_to_wait(&zwsm->wait, &wait, TASK_UNINTERRUPTIBLE);
+>  		schedule();
+>  		finish_wait(&zwsm->wait, &wait);
+>  
+>  		goto again;
+>  	}
+
+[Severity: High]
+This is a pre-existing issue, but is there a time-of-check to time-of-use
+(TOCTOU) race condition in zstd_get_workspace() that causes a lost wakeup?
+
+If the workspace allocation fails, the task calls prepare_to_wait() and
+unconditionally calls schedule() without re-checking the wait condition
+(e.g., verifying if an idle workspace is now available).
+
+If a concurrent zstd_put_workspace() calls cond_wake_up() between the failed
+allocation and prepare_to_wait(), will the wakeup be lost, leaving this
+thread in TASK_UNINTERRUPTIBLE indefinitely?
+
+[Severity: High]
+This is a pre-existing issue, but are workspaces of lower compression levels
+incorrectly hidden from the LRU reclaim list if the max-level workspace is in
+use?
+
+In zstd_put_workspace(), the code checks if the max-level idle list is empty
+to hide the max-level workspace from reclaim:
+
+fs/btrfs/zstd.c:zstd_put_workspace() {
+    ...
+    /* A node is only taken off the lru if we are the corresponding level */
+    if (clip_level(workspace->req_level) == workspace->level) {
+        /* Hide a max level workspace from reclaim */
+        if (list_empty(&zwsm->idle_ws[ZSTD_BTRFS_MAX_LEVEL - 1])) {
+            INIT_LIST_HEAD(&workspace->lru_list);
+        } else {
+    ...
+}
+
+This applies the logic based solely on the emptiness of the max-level idle
+list, without verifying that the currently returned workspace is actually a
+max-level workspace. If the max-level workspace is in use, ANY returned
+workspace (e.g. level 3) will execute INIT_LIST_HEAD(&workspace->lru_list)
+instead of being added to zwsm->lru_list.
+
+Could this lead to a permanent memory leak of lower level ZSTD workspaces by
+bypassing the timer-based reclaim mechanism?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260823-btrfs-zstd-prealloc-hang-v1-1-d11d25cfb467@gmail.com?part=1
+

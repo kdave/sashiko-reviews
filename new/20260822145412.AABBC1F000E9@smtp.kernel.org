@@ -1,0 +1,61 @@
+From sashiko-bot@kernel.org Sat Aug 22 16:54:22 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: dev-replace: fix missing barrier before waking
+ bio counter waiters
+Date: Sat, 22 Aug 2026 14:54:12 +0000
+Message-Id: <20260822145412.AABBC1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Result: High severity bug confirmed. Missing memory barriers in btrfs_bio_counter_inc_blocked() and btrfs_rm_dev_replace_blocked() break wait-free mutual exclusion.
+--
+
+--- Patch [1]: [PATCH] btrfs: dev-replace: fix missing barrier before waking bio counter waiters ---
+commit 393c5cc490aeb92dc857b7b0f4f369dd8e03cf6b
+Author: FAN YE <fy15309206903@gmail.com>
+
+btrfs: dev-replace: fix missing barrier before waking bio counter waiters
+
+btrfs_bio_counter_sub() gates the wakeup on cond_wake_up_nomb(), whose
+bare waitqueue_active() requires a full barrier from the preceding code.
+This commit uses cond_wake_up() instead to provide the necessary barrier.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index dc0834f920c3b..b2791480e2632 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -1353,7 +1353,7 @@ bool __pure btrfs_dev_replace_is_ongoing(struct btrfs_dev_replace *dev_replace)
+>  void btrfs_bio_counter_sub(struct btrfs_fs_info *fs_info, s64 amount)
+>  {
+>  	percpu_counter_sub(&fs_info->dev_replace.bio_counter, amount);
+> -	cond_wake_up_nomb(&fs_info->dev_replace.replace_wait);
+> +	cond_wake_up(&fs_info->dev_replace.replace_wait);
+>  }
+>  
+>  void btrfs_bio_counter_inc_blocked(struct btrfs_fs_info *fs_info)
+
+[Severity: High]
+This is a pre-existing issue, but does btrfs_bio_counter_inc_blocked() also
+need a memory barrier?
+
+Looking at btrfs_bio_counter_inc_blocked(), it increments the counter and
+then checks BTRFS_FS_STATE_DEV_REPLACING:
+
+	percpu_counter_inc(&fs_info->dev_replace.bio_counter);
+	if (likely(!test_bit(BTRFS_FS_STATE_DEV_REPLACING,
+			     &fs_info->fs_state)))
+
+Without an smp_mb() after percpu_counter_inc(), could the condition check be
+hoisted before the counter increment?
+
+Similarly, in btrfs_rm_dev_replace_blocked(), there appears to be a missing
+smp_mb__after_atomic() after setting the BTRFS_FS_STATE_DEV_REPLACING bit.
+
+Could this allow the store to be delayed past the counter load, breaking
+wait-free mutual exclusion between these two functions and leading to I/O
+being issued to replaced or freed devices?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260822-btrfs-dev-replace-bio-counter-barrier-v1-1-e718ae7d25e5@gmail.com?part=1
+

@@ -1,0 +1,112 @@
+From sashiko-bot@kernel.org Tue Aug 25 15:27:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 3/6] btrfs: add per-inode compression levels in
+ xattrs
+Date: Tue, 25 Aug 2026 13:27:46 +0000
+Message-Id: <20260825132747.0480C1F00A3F@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Property apply() can return -ENOMEM, violating invariants and triggering a kernel panic via assertion failure.
+
+Pre-existing issues:
+- [High] Non-atomic read-modify-write of inode->flags can cause concurrent flag updates to be lost.
+--
+
+--- Patch [3]: [PATCH v4 3/6] btrfs: add per-inode compression levels in xattrs ---
+commit 8673ad19c6745c75fb5a843025999023c76998c3
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: add per-inode compression levels in xattrs
+
+Add support for specifying compression algorithm and level in xattrs, storing 
+the level in a new prop_compress_level field in btrfs_inode. The patch updates
+prop_compression_apply() to parse the new format using kmemdup_nul() and 
+btrfs_compress_str2level().
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index a269124c3b929..a495a5d04f9e3 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+[ ... ]
+> @@ -343,23 +347,45 @@ static int prop_compression_apply(struct btrfs_inode *inode, const char *value,
+>  		return 0;
+>  	}
+>  
+> -	if (!strncmp("lzo", value, 3)) {
+> +	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+> +	if (!value_str)
+> +		return -ENOMEM;
+> +
+
+[Severity: High]
+Can this allocation failure trigger a kernel panic?
+
+In btrfs_set_prop(), there is an invariant that if the validate() callback
+succeeds, the apply() callback must not fail. This is enforced by an
+assertion immediately following the call:
+
+fs/btrfs/props.c:btrfs_set_prop() {
+	...
+	ret = handler->apply(inode, value, value_len);
+	/* We validated before, so it should not fail here. */
+	ASSERT(ret == 0);
+	...
+}
+
+If the system is under memory pressure and a user writes to the xattr,
+couldn't kmemdup_nul() fail, return -ENOMEM, and trip the assertion?
+
+> +	if (btrfs_match_compress_type(value_str, "lzo", true)) {
+>  		type = BTRFS_COMPRESS_LZO;
+>  		btrfs_set_fs_incompat(fs_info, COMPRESS_LZO);
+> -	} else if (!strncmp("zlib", value, 4)) {
+[ ... ]
+> +	/* Parse level if the algorithm supports it */
+> +	if (level_pos > 0) {
+> +		const char *level_str = value_str + level_pos;
+> +
+> +		/* and if user specified it */
+> +		if (level_str[0] == ':') {
+> +			ret = btrfs_compress_str2level(type, level_str, &level);
+> +			if (ret < 0)
+> +				goto out;
+> +		}
+>  	}
+>  
+>  	inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  	inode->flags |= BTRFS_INODE_COMPRESS;
+
+[Severity: High]
+This is a pre-existing issue, but does modifying inode->flags directly via
+non-atomic bitwise operators create a data race?
+
+While this update happens under the VFS inode_lock, the background writeback
+worker can concurrently determine that the data is incompressible and execute:
+
+fs/btrfs/inode.c:compress_file_range() {
+	...
+mark_incompressible:
+	if (!btrfs_test_opt(fs_info, FORCE_COMPRESS) && !inode->prop_compress)
+		inode->flags |= BTRFS_INODE_NOCOMPRESS;
+	...
+}
+
+Because compress_file_range() does not hold inode_lock, couldn't the
+non-atomic read-modify-write on this bitmask cause concurrent flag updates
+(like BTRFS_INODE_IMMUTABLE, BTRFS_INODE_APPEND, or BTRFS_INODE_NODATACOW)
+to be lost?
+
+>  	inode->prop_compress = type;
+> +	inode->prop_compress_level = level;
+>  
+> -	return 0;
+> +out:
+> +	kfree(value_str);
+> +	return ret;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260825130745.229008-1-koray.fra@gmail.com?part=3
+

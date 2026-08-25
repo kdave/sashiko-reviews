@@ -1,0 +1,72 @@
+From sashiko-bot@kernel.org Tue Aug 25 15:22:39 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 4/6] btrfs: support inheritance for per-inode
+ compression levels
+Date: Tue, 25 Aug 2026 13:22:28 +0000
+Message-Id: <20260825132229.6B4291F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Lockless, non-atomic reads of `inode->prop_compress` and `inode->prop_compress_level` in `prop_compression_extract()` can lead to inheriting a corrupted compression property.
+--
+
+--- Patch [4]: [PATCH v4 4/6] btrfs: support inheritance for per-inode compression levels ---
+commit 4c6f2b352b2c9472ef6c9ae8b017c97b4989bd19
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: support inheritance for per-inode compression levels
+
+This commit changes prop_handler's extract() signature to accept an output
+buffer and its length, allowing the compression algorithm and level string
+to be dynamically generated for inheritance. It updates the compression
+property extraction to concatenate the level to the statically compiled
+string when a level is set.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index a495a5d04f9e3..740a05ade9428 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+
+[ ... ]
+
+> @@ -404,12 +413,19 @@ static bool prop_compression_ignore(const struct btrfs_inode *inode)
+>  	return false;
+>  }
+>  
+> -static const char *prop_compression_extract(const struct btrfs_inode *inode)
+> +static const char *prop_compression_extract(const struct btrfs_inode *inode,
+> +					    char *buf, size_t len)
+>  {
+>  	switch (inode->prop_compress) {
+>  	case BTRFS_COMPRESS_ZLIB:
+>  	case BTRFS_COMPRESS_LZO:
+>  	case BTRFS_COMPRESS_ZSTD:
+> +		if (inode->prop_compress_level) {
+> +			snprintf(buf, len, "%s:%d",
+> +				 btrfs_compress_type2str(inode->prop_compress),
+> +				 inode->prop_compress_level);
+
+[Severity: Medium]
+Is there a race condition here between reading inode->prop_compress and
+inode->prop_compress_level?
+
+When creating a subvolume within a subdirectory, btrfs_create_new_inode()
+fetches the parent subvolume root inode and passes it to
+btrfs_inode_inherit_props() without acquiring its VFS i_rwsem.
+
+Concurrently, if another thread modifies the compression property of the root
+subvolume, this lockless read could see a mismatched compression combination
+(e.g., combining a newly set algorithm with an old level, such as "lzo:15").
+
+Since these fields are read independently without synchronization, could this
+result in an invalid compression string being inherited and permanently stored
+in the new subvolume's on-disk xattrs?
+
+> +			return buf;
+> +		}
+>  		return btrfs_compress_type2str(inode->prop_compress);
+>  	default:
+>  		break;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260825130745.229008-1-koray.fra@gmail.com?part=4
+

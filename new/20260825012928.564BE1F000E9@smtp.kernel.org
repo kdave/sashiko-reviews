@@ -1,0 +1,71 @@
+From sashiko-bot@kernel.org Tue Aug 25 03:29:39 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: tree-checker: add qgroup status item check
+Date: Tue, 25 Aug 2026 01:29:27 +0000
+Message-Id: <20260825012928.564BE1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Strict validation of qgroup status version, flags, and item size in the tree-checker will cause mount failures instead of graceful degradation.
+--
+
+--- Patch [1]: [PATCH] btrfs: tree-checker: add qgroup status item check ---
+commit e774fcdc135e6716e78d52a4df4ab6d9d6120e4a
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: tree-checker: add qgroup status item check
+
+This patch adds validation for the qgroup status item to the tree checker,
+verifying the key, item size, version, and flags.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 0ce91396b517f..a99fa7729c0b2 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+[ ... ]
+> +static int check_qgroup_status_item(const struct extent_buffer *leaf,
+> +				    const struct btrfs_key *key, int slot)
+> +{
+> +	struct btrfs_qgroup_status_item *qsi;
+> +	const u32 item_size = btrfs_item_size(leaf, slot);
+[ ... ]
+> +	if (unlikely(item_size != sizeof(*qsi) && item_size != old_qsi_size)) {
+> +		generic_err(leaf, slot,
+> +			    "invalid qgroup status item size, has %u expect %zu or %u",
+> +			    item_size, sizeof(*qsi), old_qsi_size);
+> +		return -EUCLEAN;
+> +	}
+> +
+> +	qsi = btrfs_item_ptr(leaf, slot, struct btrfs_qgroup_status_item);
+> +	if (unlikely(btrfs_qgroup_status_version(leaf, qsi) !=
+> +		     BTRFS_QGROUP_STATUS_VERSION)) {
+> +		generic_err(leaf, slot,
+> +			    "invalid qgroup status version, has %llu expect %u",
+> +			    btrfs_qgroup_status_version(leaf, qsi),
+> +			    BTRFS_QGROUP_STATUS_VERSION);
+> +		return -EUCLEAN;
+> +	}
+> +	flags = btrfs_qgroup_status_flags(leaf, qsi);
+> +	if (unlikely(flags & ~BTRFS_QGROUP_STATUS_FLAGS_MASK)) {
+> +		generic_err(leaf, slot,
+> +			    "unknown qgroup status flags, has 0x%llx unknown flags 0x%llx",
+> +			    flags, flags & ~BTRFS_QGROUP_STATUS_FLAGS_MASK);
+> +		return -EUCLEAN;
+> +	}
+
+[Severity: High]
+Does returning -EUCLEAN for unknown sizes, versions, and flags prevent
+graceful degradation on older kernels?
+
+If a filesystem is used on a newer kernel that adds a new qgroup flag or
+expands the item size without adding an incompat bit, mounting it on this
+kernel would fail completely. The tree checker intercepts the quota tree
+root read during mount and returns -EUCLEAN, which aborts the mount process.
+
+Previously, btrfs_read_qgroup_config() handled unexpected versions by logging
+a message and disabling quotas, allowing the mount to proceed. Should the
+tree checker avoid strict checks on feature flags and exact sizes unless
+they are protected by incompat bits?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/abf2a17bcdd62cedc285867435cdb852a383bf51.1787620696.git.wqu@suse.com?part=1
+

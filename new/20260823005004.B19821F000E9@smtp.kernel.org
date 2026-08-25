@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Sun Aug 23 02:50:14 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: zstd: keep the last max level workspace out
+ of reclaim
+Date: Sun, 23 Aug 2026 00:50:04 +0000
+Message-Id: <20260823005004.B19821F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Permanent deadlock if `zstd_alloc_workspace_manager` fails to preallocate the initial max-level workspace.
+--
+
+--- Patch [1]: [PATCH v2] btrfs: zstd: keep the last max level workspace out of reclaim ---
+commit 9d0d1b9dc387b784d151616dfa05f9d2d3017bd6
+Author: FAN YE <fy15309206903@gmail.com>
+
+btrfs: zstd: keep the last max level workspace out of reclaim
+
+This commit changes how the last max level zstd workspace is protected
+from reclaim, replacing an idle list snapshot check with a dedicated
+pinned_ws pointer. This ensures at least one max level workspace is kept
+off the LRU list, preventing the reclaim timer from freeing it and
+stranding sleeping tasks.
+
+Fixes: 3f93aef535c8 ("btrfs: add zstd compression level support")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: FAN YE <fy15309206903@gmail.com>
+
+> diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+> index 86919293fd546..8bd9045da9dd9 100644
+> --- a/fs/btrfs/zstd.c
+> +++ b/fs/btrfs/zstd.c
+
+[ ... ]
+
+> @@ -204,6 +206,7 @@ int zstd_alloc_workspace_manager(struct btrfs_fs_info *fs_info)
+>  	} else {
+>  		set_bit(ZSTD_BTRFS_MAX_LEVEL - 1, &zwsm->active_map);
+>  		list_add(ws, &zwsm->idle_ws[ZSTD_BTRFS_MAX_LEVEL - 1]);
+> +		zwsm->pinned_ws = list_to_workspace(ws);
+>  	}
+>  	return 0;
+>  }
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does the error handling here
+lead to a permanent deadlock under memory pressure?
+
+If zstd_alloc_workspace_manager() fails to preallocate the initial
+max-level workspace, it prints a warning but still returns 0 (success),
+leaving the system with 0 max-level workspaces:
+
+fs/btrfs/zstd.c:zstd_alloc_workspace_manager() {
+	ws = zstd_alloc_workspace(fs_info, ZSTD_BTRFS_MAX_LEVEL);
+	if (IS_ERR(ws)) {
+		btrfs_warn(NULL, "cannot preallocate zstd compression workspace");
+	} else {
+		...
+	return 0;
+}
+
+If a later allocation in zstd_get_workspace() also fails, tasks will go to
+sleep on zwsm->wait indefinitely:
+
+fs/btrfs/zstd.c:zstd_get_workspace() {
+	...
+	if (IS_ERR(ws)) {
+		DEFINE_WAIT(wait);
+		prepare_to_wait(&zwsm->wait, &wait, TASK_UNINTERRUPTIBLE);
+	...
+}
+
+Since zstd_put_workspace() only calls cond_wake_up(&zwsm->wait) when putting
+a max-level workspace, and none were ever successfully allocated to begin
+with, will these tasks be left waiting forever without a waker?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260823-btrfs-zstd-max-level-reclaim-v2-1-2a84517cfeb4@gmail.com?part=1
+
