@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Wed Aug 26 12:07:52 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: tree-checker: add qgroup status item check
+Date: Wed, 26 Aug 2026 10:07:41 +0000
+Message-Id: <20260826100741.B3B171F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [Medium] Strict flag mask check in tree-checker prevents forward compatibility, contradicting the commit's intent for loose size and version checks.
+
+Pre-existing issues:
+- [High] Missing validation of SIMPLE_QUOTA incompat feature in tree-checker allows crafted images to trigger a kernel panic via ASSERT.
+--
+
+commit 7032b4aed2eff070873dd12e9506ddc114813c7b
+Author: Qu Wenruo <wqu@suse.com>
+btrfs: tree-checker: add qgroup status item check
+
+This commit adds a tree-checker for the qgroup status item in btrfs.
+It validates the key, item size, version, and flags, intentionally relaxing
+size and version checks to theoretically support future structural expansions.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 0ce91396b517f..ff268ebb22d73 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+[ ... ]
+> @@ -2313,6 +2313,67 @@ static int check_free_space_bitmap(struct extent_buffer *leaf,
+[ ... ]
+> +	flags = btrfs_qgroup_status_flags(leaf, qsi);
+> +	if (unlikely(flags & ~BTRFS_QGROUP_STATUS_FLAGS_MASK)) {
+
+[Severity: Medium]
+The commit message mentions loosening size and version checks to allow
+older kernels to mount future newer qgroup expansions. Does this strict flag
+mask check contradict that intent?
+
+If a future kernel introduces a new persistent flag, this check will reject
+the qgroup tree with -EUCLEAN, breaking forward compatibility and causing a
+hard mount failure when reading valid future metadata.
+
+> +		generic_err(leaf, slot,
+> +			    "unknown qgroup status flags, has 0x%llx unknown flags 0x%llx",
+> +			    flags, flags & ~BTRFS_QGROUP_STATUS_FLAGS_MASK);
+> +		return -EUCLEAN;
+> +	}
+> +	if (unlikely(flags & BTRFS_QGROUP_STATUS_FLAG_SIMPLE_MODE &&
+
+[Severity: High]
+This is a pre-existing issue, but this newly added check_qgroup_status_item()
+misses an opportunity to validate the SIMPLE_QUOTA incompat feature.
+
+If a crafted filesystem image has the BTRFS_QGROUP_STATUS_FLAG_SIMPLE_MODE
+flag set but lacks the SIMPLE_QUOTA incompat feature flag in the superblock,
+can it trigger a kernel panic on systems compiled with CONFIG_BTRFS_ASSERT?
+
+Later in the mount process, btrfs_read_qgroup_config() will process this
+item and call qgroup_read_enable_gen(), which hits:
+ASSERT(btrfs_fs_incompat(fs_info, SIMPLE_QUOTA))
+
+Should this tree-checker cross-check the incompat feature to prevent a
+potential DoS from untrusted input?
+
+> +		     item_size < sizeof(*qsi))) {
+> +		generic_err(leaf, slot,
+> +			    "invalid qgroup status item size, has %u expect at least %zu",
+> +			    item_size, sizeof(*qsi));
+> +		return -EUCLEAN;
+> +	}
+> +	return 0;
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/f8f6232eb92cc8789461c2219915845aae1850ac.1787737993.git.wqu@suse.com?part=1
+

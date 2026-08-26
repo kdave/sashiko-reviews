@@ -1,0 +1,156 @@
+From sashiko-bot@kernel.org Wed Aug 26 06:50:22 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/4] btrfs: zoned: track only sequential zones as
+ active
+Date: Wed, 26 Aug 2026 04:50:11 +0000
+Message-Id: <20260826045012.4DD081F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Double list_add_tail on zone_active_bgs when mounting a filesystem with inconsistent active bits causes list corruption.
+- [High] btrfs_zone_activate() leaks active zone slots and double-decrements reserved_active_zones on partial failure and subsequent retries.
+- [High] Unprotected increment of `zinfo->reserved_active_zones` in `call_zone_finish` leads to data race and lost updates.
+--
+
+commit fa3d6144164a39accb5a78a6709e6c752daf53e7
+Author: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+btrfs: zoned: track only sequential zones as active
+
+This commit addresses an issue where active zone accounting diverges across
+remounts because conventional zones report as NOT_WP and are excluded at
+mount, yet they decrease reserved_active_zones during mount recovery. To
+keep both counters aligned on the same physical resource, it restricts
+active-zone tracking solely to sequential stripes.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 9d448cdd60c4b..0d964ada3ad47 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> @@ -2005,6 +2004,8 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	if (!ret) {
+>  		cache->meta_write_pointer = cache->alloc_offset + cache->start;
+>  		if (test_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &cache->runtime_flags)) {
+> +			ASSERT(test_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE,
+> +					&cache->runtime_flags));
+>  			btrfs_get_block_group(cache);
+>  			spin_lock(&fs_info->zone_active_bgs_lock);
+>  			list_add_tail(&cache->active_bg_list,
+>  				      &fs_info->zone_active_bgs);
+>  			spin_unlock(&fs_info->zone_active_bgs_lock);
+
+[Severity: Critical]
+This is a pre-existing issue, but does unconditionally adding the block group
+to the active list here cause list corruption?
+
+When mounting a zoned Btrfs filesystem, if a multi-stripe block group has
+inconsistent active bits, btrfs_load_block_group_by_raid_type() recovers it
+by calling btrfs_zone_activate().
+
+btrfs_zone_activate() adds the block group to fs_info->zone_active_bgs. When
+btrfs_load_block_group_by_raid_type() returns success,
+btrfs_load_block_group_zone_info() sees BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE is
+set and calls list_add_tail() again using the exact same list node.
+
+Can this lead to severe linked list corruption and kernel hangs during list
+traversal?
+
+[ ... ]
+> @@ -2448,7 +2467,7 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+>  		if (!device->bdev)
+>  			continue;
+>  
+> -		if (zinfo->max_active_zones == 0)
+> +		if (!btrfs_needs_active_zone_tracking(device, physical))
+>  			continue;
+>  
+>  		if (is_data)
+>  			reserved = zinfo->reserved_active_zones;
+>  		/*
+>  		 * For the data block group, leave active zones for one
+>  		 * metadata block group and one system block group.
+>  		 */
+>  		if (atomic_read(&zinfo->active_zones_left) <= reserved) {
+>  			ret = false;
+>  			goto out_unlock;
+>  		}
+>  
+>  		if (!btrfs_dev_set_active_zone(device, physical)) {
+>  			/* Cannot activate the zone */
+>  			ret = false;
+>  			goto out_unlock;
+>  		}
+
+[Severity: High]
+This is a pre-existing issue, but does this error path bail out without
+rolling back previously activated stripes in the same loop?
+
+When activating a multi-stripe block group, if an early stripe succeeds but a
+later stripe fails, the function returns false without rolling back the
+successful stripes.
+
+On a subsequent retry, btrfs_dev_set_active_zone() returns true for the
+already-active stripes, causing the code to execute this decrement a
+second time:
+
+    if (!is_data)
+        zinfo->reserved_active_zones--;
+
+Does this leak active zone slots and underflow reserved_active_zones,
+allowing data block groups to incorrectly consume zones reserved for metadata?
+
+[ ... ]
+> @@ -2514,26 +2533,22 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+>  	struct btrfs_device *device = stripe->dev;
+>  	const u64 physical = stripe->physical;
+>  	struct btrfs_zoned_device_info *zinfo = device->zone_info;
+> +	unsigned int nofs_flags;
+>  	int ret;
+>  
+>  	if (!device->bdev)
+>  		return 0;
+>  
+> -	if (zinfo->max_active_zones == 0)
+> +	if (!btrfs_needs_active_zone_tracking(device, physical))
+>  		return 0;
+>  
+> -	if (btrfs_dev_is_sequential(device, physical)) {
+> -		unsigned int nofs_flags;
+> -
+> -		nofs_flags = memalloc_nofs_save();
+> -		ret = blkdev_zone_mgmt(device->bdev, REQ_OP_ZONE_FINISH,
+> -				       physical >> SECTOR_SHIFT,
+> -				       zinfo->zone_size >> SECTOR_SHIFT);
+> -		memalloc_nofs_restore(nofs_flags);
+> -
+> -		if (ret)
+> -			return ret;
+> -	}
+> +	nofs_flags = memalloc_nofs_save();
+> +	ret = blkdev_zone_mgmt(device->bdev, REQ_OP_ZONE_FINISH,
+> +			       physical >> SECTOR_SHIFT,
+> +			       zinfo->zone_size >> SECTOR_SHIFT);
+> +	memalloc_nofs_restore(nofs_flags);
+> +	if (ret)
+> +		return ret;
+>  
+>  	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
+>  		zinfo->reserved_active_zones++;
+
+[Severity: High]
+This is a pre-existing issue, but is there a data race on
+zinfo->reserved_active_zones here?
+
+call_zone_finish() increments zinfo->reserved_active_zones without lock
+protection, racing with btrfs_zone_activate() and
+btrfs_check_active_zone_reservation() which decrement the same variable under
+fs_info->zone_active_bgs_lock.
+
+Could this lead to lost updates and drift the reservation counter, potentially
+blocking metadata operations or allowing overallocations?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1787717573.git.zhudongjiang@fygo.io?part=1
+

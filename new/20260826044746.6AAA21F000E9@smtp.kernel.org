@@ -1,0 +1,107 @@
+From sashiko-bot@kernel.org Wed Aug 26 06:47:56 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/4] btrfs: zoned: recover active non-data block
+ group roles on mount
+Date: Wed, 26 Aug 2026 04:47:45 +0000
+Message-Id: <20260826044746.6AAA21F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Unconditional device modification during read-only mount breaks rescue operations and physically write-protected devices by issuing REQ_OP_ZONE_FINISH.
+
+Pre-existing issues:
+- [High] Pre-existing data race on `device->zone_info->reserved_active_zones` counter.
+--
+
+commit d5901f0d3bfe703a3e8135cdfc6040c14d631265
+Author: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+btrfs: zoned: recover active non-data block group roles on mount
+
+After a remount, a later write can activate a new metadata or system
+block group without finishing the recovered one. Repeating this across
+remounts consumes additional active-zone slots and reservations, and can
+eventually exhaust all active-zone slots.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index e6bbb0b1b38c2..cd1f46ec62f03 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -3713,7 +3713,12 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
+>  
+>  	btrfs_free_zone_cache(fs_info);
+>  
+> -	btrfs_check_active_zone_reservation(fs_info);
+> +	ret = btrfs_restore_active_nondata_bgs(fs_info);
+> +	if (ret) {
+> +		btrfs_err(fs_info, "failed to restore active non-data block groups: %pe",
+> +			  ERR_PTR(ret));
+> +		goto fail_sysfs;
+> +	}
+
+[Severity: High]
+Does this sequence cause unconditional device writes on read-only mounts?
+
+Because open_ctree() calls btrfs_restore_active_nondata_bgs() before the
+sb_rdonly(sb) check, the following sequence occurs:
+
+open_ctree()
+  btrfs_restore_active_nondata_bgs()
+    finish_extra_active_nondata_bgs()
+      do_zone_finish(..., true)
+        call_zone_finish()
+
+If the filesystem is mounted read-only (e.g., -o ro,rescue=nologreplay) or the
+underlying block device is physically write-protected, call_zone_finish() will
+issue a REQ_OP_ZONE_FINISH bio. If the device rejects this bio, will it abort
+the mount completely and break data rescue operations?
+
+>  	if (!sb_rdonly(sb) && fs_info->fs_devices->missing_devices &&
+>  	    !btrfs_check_rw_degradable(fs_info, NULL)) {
+
+[ ... ]
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 0d964ada3ad47..ee7d518bec15c 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -3115,7 +3194,11 @@ void btrfs_check_active_zone_reservation(struct btrfs_fs_info *fs_info)
+>  			device->zone_info->reserved_active_zones--;
+>  		}
+>  	}
+> +	fs_info->active_meta_bg = active_meta_bg;
+> +	fs_info->active_system_bg = active_system_bg;
+>  	spin_unlock(&fs_info->zone_active_bgs_lock);
+>  
+
+[Severity: High]
+This is a pre-existing issue, but does this code leave reserved_active_zones
+updates vulnerable to a data race elsewhere?
+
+While the decrement of reserved_active_zones here is protected by the
+fs_info->zone_active_bgs_lock spinlock, it appears call_zone_finish()
+increments it without holding this lock:
+
+fs/btrfs/zoned.c:call_zone_finish() {
+    ...
+    if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
+        zinfo->reserved_active_zones++;
+    ...
+}
+
+Could this unprotected increment race with other block group zone finish
+operations or btrfs_zone_activate(), causing the counter to go out of sync?
+If the counter underflows, could it allow hardware max active zones limits
+to be exceeded? If it leaks reservations, could it prevent new metadata
+allocations and force a read-only filesystem?
+
+> +	return finish_extra_active_nondata_bgs(fs_info);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1787717573.git.zhudongjiang@fygo.io?part=2
+
