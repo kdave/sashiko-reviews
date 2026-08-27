@@ -1,0 +1,115 @@
+From sashiko-bot@kernel.org Thu Aug 27 09:16:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: reject new qgroup rescan during subvolume
+ dropping
+Date: Thu, 27 Aug 2026 07:16:48 +0000
+Message-Id: <20260827071648.806B61F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] qgroup_rescan_init() overloads -EINPROGRESS for REJECT_RESCAN, causing silent failures in quota enable.
+- [High] Disabling and re-enabling quotas permanently leaks BTRFS_QGROUP_STATUS_BIT_RESCAN, breaking future rescans.
+--
+
+commit 9e6f714db509a085d29fbc2f1e4ac95e55035737
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: reject new qgroup rescan during subvolume dropping
+
+This commit introduces BTRFS_QGROUP_RUNTIME_BIT_REJECT_RESCAN to prevent
+new qgroup rescans during a subvolume drop. It also updates quota enable
+and disable functions to handle the new flag without overriding it.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index e6bbb0b1b38c2..dd00e8ced8837 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -1496,7 +1496,11 @@ static int cleaner_kthread(void *arg)
+>  
+>  		btrfs_run_delayed_iputs(fs_info);
+>  
+> +		set_bit(BTRFS_QGROUP_RUNTIME_BIT_REJECT_RESCAN,
+> +			&fs_info->qgroup_flags);
+>  		again = btrfs_clean_one_deleted_snapshot(fs_info);
+> +		clear_bit(BTRFS_QGROUP_RUNTIME_BIT_REJECT_RESCAN,
+> +			  &fs_info->qgroup_flags);
+>  		mutex_unlock(&fs_info->cleaner_mutex);
+
+[Severity: High]
+Since cleaner_kthread() sets BTRFS_QGROUP_RUNTIME_BIT_REJECT_RESCAN here
+without acquiring subvol_sem or qgroup_ioctl_lock, can this race with a
+concurrent quota enable?
+
+If a user executes btrfs quota enable concurrently, qgroup_rescan_init()
+encounters the REJECT_RESCAN bit and overloads the return code
+-EINPROGRESS. Looking at btrfs_quota_enable(), it catches this specific
+error code and assumes another thread has already queued the rescan:
+
+fs/btrfs/qgroup.c:btrfs_quota_enable() {
+    ...
+    ret = qgroup_rescan_init(fs_info, 0, 1);
+    if (!ret) {
+        qgroup_rescan_queued = true;
+        btrfs_queue_work(fs_info->qgroup_rescan_workers,
+                 &fs_info->qgroup_rescan_work);
+    } else {
+        ASSERT(ret == -EINPROGRESS);
+        ret = 0;
+    }
+    ...
+}
+
+Does this mean btrfs_quota_enable() will fail to initialize accounting
+without returning an error, and leave quotas inconsistent because the
+rescan is never executed?
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index 2f2f4e0a3b2e4..cc08e7b2f68f1 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -1105,7 +1105,7 @@ int btrfs_quota_enable(struct btrfs_fs_info *fs_info,
+>  				 struct btrfs_qgroup_status_item);
+>  	btrfs_set_qgroup_status_generation(leaf, ptr, trans->transid);
+>  	btrfs_set_qgroup_status_version(leaf, ptr, BTRFS_QGROUP_STATUS_VERSION);
+> -	fs_info->qgroup_flags = (1UL << BTRFS_QGROUP_STATUS_BIT_ON);
+> +	set_bit(BTRFS_QGROUP_STATUS_BIT_ON, &fs_info->qgroup_flags);
+
+[ ... ]
+
+> @@ -1407,8 +1407,14 @@ int btrfs_quota_disable(struct btrfs_fs_info *fs_info)
+>  	spin_lock(&fs_info->qgroup_lock);
+>  	quota_root = fs_info->quota_root;
+>  	fs_info->quota_root = NULL;
+> +	/*
+> +	 * Clear all on-disk and runtime bits, except RESCAN related ones, that
+> +	 * are either handled by rescan thread, or the caller who rejects rescan.
+> +	 */
+>  	clear_bit(BTRFS_QGROUP_STATUS_BIT_ON, &fs_info->qgroup_flags);
+>  	clear_bit(BTRFS_QGROUP_STATUS_BIT_SIMPLE_MODE, &fs_info->qgroup_flags);
+> +	clear_bit(BTRFS_QGROUP_STATUS_BIT_INCONSISTENT, &fs_info->qgroup_flags);
+> +	clear_bit(BTRFS_QGROUP_RUNTIME_BIT_NO_ACCOUNTING, &fs_info->qgroup_flags);
+
+[Severity: High]
+Does skipping the clearance of BTRFS_QGROUP_STATUS_BIT_RESCAN here cause
+the bit to leak and prevent future rescans?
+
+This modifies btrfs_quota_disable() to leave the RESCAN bit for the rescan
+worker to handle. However, during quota disable, btrfs_qgroup_rescan_worker()
+evaluates stopped as true and CANCEL_RESCAN as false, which bypasses the bit
+clearance:
+
+fs/btrfs/qgroup.c:btrfs_qgroup_rescan_worker() {
+    ...
+    if (!stopped || test_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN,
+                 &fs_info->qgroup_flags))
+        clear_bit(BTRFS_QGROUP_STATUS_BIT_RESCAN, &fs_info->qgroup_flags);
+    ...
+}
+
+Because btrfs_quota_enable() is changed to use set_bit() instead of overwriting
+the flags, the leaked RESCAN bit is carried forward. Will any future
+qgroup_rescan_init() invocation hit this stale bit and abort with
+-EINPROGRESS, preventing future qgroup rescans?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1787812966.git.wqu@suse.com?part=1
+
