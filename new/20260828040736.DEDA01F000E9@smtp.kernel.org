@@ -1,0 +1,104 @@
+From sashiko-bot@kernel.org Fri Aug 28 06:07:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 2/4] btrfs: zoned: recover active non-data block
+ group roles on mount
+Date: Fri, 28 Aug 2026 04:07:36 +0000
+Message-Id: <20260828040736.DEDA01F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs_restore_active_nondata_bgs unconditionally issues REQ_OP_ZONE_FINISH during mount, violating read-only mount semantics and causing mount failures on strictly read-only devices.
+--
+
+commit 1e61d83913bd7b758238d60c50c363d0a03d9282
+Author: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+btrfs: zoned: recover active non-data block group roles on mount
+
+This commit restores runtime-only block group role assignments across
+remounts by selecting active block groups for the normal metadata and
+system roles, and finishing the unselected ones.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index e6bbb0b1b38c2..cd1f46ec62f03 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -3713,7 +3713,12 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
+>  
+>  	btrfs_free_zone_cache(fs_info);
+>  
+> -	btrfs_check_active_zone_reservation(fs_info);
+> +	ret = btrfs_restore_active_nondata_bgs(fs_info);
+> +	if (ret) {
+> +		btrfs_err(fs_info, "failed to restore active non-data block groups: %pe",
+> +			  ERR_PTR(ret));
+> +		goto fail_sysfs;
+> +	}
+
+[Severity: High]
+Does this unconditionally trigger write operations on the block device before
+evaluating if this is a read-only mount? 
+
+Since open_ctree() calls btrfs_restore_active_nondata_bgs() before checking
+sb_rdonly(sb) or the nologreplay mount option, this recovery process will
+execute even when the user requests a strictly read-only mount.
+
+>  	if (!sb_rdonly(sb) && fs_info->fs_devices->missing_devices &&
+>  	    !btrfs_check_rw_degradable(fs_info, NULL)) {
+
+[ ... ]
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 0d964ada3ad47..ee7d518bec15c 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -3056,22 +3056,77 @@ int btrfs_zoned_activate_one_bg(struct btrfs_space_info *space_info, bool do_fin
+>  	return 0;
+>  }
+>  
+> +static int finish_extra_active_nondata_bgs(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct btrfs_block_group *block_group;
+> +	struct btrfs_block_group *next;
+> +	u64 tail_unusable;
+> +	int ret;
+> +
+> +	list_for_each_entry_safe(block_group, next, &fs_info->zone_active_bgs,
+> +				 active_bg_list) {
+> +		if (!(block_group->flags &
+> +		      (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)))
+> +			continue;
+> +
+> +		if (block_group == fs_info->active_meta_bg ||
+> +		    block_group == fs_info->active_system_bg)
+> +			continue;
+> +
+> +		btrfs_get_block_group(block_group);
+> +		spin_lock(&block_group->lock);
+> +		tail_unusable = block_group->zone_capacity - block_group->alloc_offset;
+> +		spin_unlock(&block_group->lock);
+> +
+> +		ret = do_zone_finish(block_group, true);
+
+[Severity: High]
+Will this cause mount failures on read-only devices?
+
+The call chain from open_ctree() -> btrfs_restore_active_nondata_bgs() ->
+finish_extra_active_nondata_bgs() calls do_zone_finish(), which ultimately
+issues a blkdev_zone_mgmt(REQ_OP_ZONE_FINISH) write operation to the disk.
+
+If the filesystem is mounted on a strictly read-only device (such as a
+hardware write-protected drive during a data rescue scenario), won't this
+attempt to write to the drive fail with an error like -EPERM, causing the
+entire mount to abort?
+
+> +		if (!ret) {
+> +			struct btrfs_space_info *space_info = block_group->space_info;
+> +
+> +			/* Account for the unused tail abandoned by ZONE_FINISH. */
+> +			spin_lock(&space_info->lock);
+> +			spin_lock(&block_group->lock);
+> +			block_group->zone_unusable += tail_unusable;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1787887776.git.zhudongjiang@fygo.io?part=2
+

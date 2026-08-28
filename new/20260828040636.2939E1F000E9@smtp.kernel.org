@@ -1,0 +1,119 @@
+From sashiko-bot@kernel.org Fri Aug 28 06:06:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 1/4] btrfs: zoned: track only sequential zones as
+ active
+Date: Fri, 28 Aug 2026 04:06:35 +0000
+Message-Id: <20260828040636.2939E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Double-decrement and state leak of `reserved_active_zones` during runtime retries of `btrfs_zone_activate` on multi-stripe block groups.
+- [High] Data race on `device->zone_info->reserved_active_zones` between `call_zone_finish()` and `btrfs_zone_activate()`.
+--
+
+commit 6fb9c504c7218f12b24d0c6f6e1d6e5691ab0bff
+Author: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+btrfs: zoned: track only sequential zones as active
+
+This patch modifies active-zone tracking to strictly apply to sequential
+zones, ensuring that active zone counters do not diverge across remounts.
+It restricts active-zone bitmap and reservation updates to sequential
+stripes to avoid exhausting slots for data operations.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 9d448cdd60c4b..0d964ada3ad47 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -2448,7 +2467,7 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+>  		if (!device->bdev)
+>  			continue;
+>  
+> -		if (zinfo->max_active_zones == 0)
+> +		if (!btrfs_needs_active_zone_tracking(device, physical))
+>  			continue;
+>  
+>  		if (is_data)
+
+[Severity: High]
+This isn't a bug introduced by this patch, but is a pre-existing issue with
+how we handle reserved active zones when activation fails.
+
+If btrfs_zone_activate() fails midway through its stripe loop (for example,
+due to active zone limits), it aborts without rolling back the already
+activated stripes. When callers like check_bg_is_active() retry the 
+activation on the same multi-stripe block group, btrfs_dev_set_active_zone()
+will trivially succeed for the previously activated stripes. 
+
+However, the loop continues and unconditionally executes the decrement for
+non-data block groups:
+
+        if (!is_data)
+                zinfo->reserved_active_zones--;
+
+Could this double-decrement permanently lower the reserved_active_zones 
+counter? If the counter drops below zero, data block groups could bypass the
+reservation limit and exhaust all active zone slots. This might prevent 
+metadata block groups from activating during synchronous transaction 
+writeback, forcing a transaction abort and a read-only filesystem.
+
+[ ... ]
+
+> @@ -2514,26 +2533,22 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+>  	struct btrfs_device *device = stripe->dev;
+>  	const u64 physical = stripe->physical;
+>  	struct btrfs_zoned_device_info *zinfo = device->zone_info;
+> +	unsigned int nofs_flags;
+>  	int ret;
+>  
+>  	if (!device->bdev)
+>  		return 0;
+>  
+> -	if (zinfo->max_active_zones == 0)
+> +	if (!btrfs_needs_active_zone_tracking(device, physical))
+>  		return 0;
+>  
+> -	if (btrfs_dev_is_sequential(device, physical)) {
+> -		unsigned int nofs_flags;
+> -
+> -		nofs_flags = memalloc_nofs_save();
+> -		ret = blkdev_zone_mgmt(device->bdev, REQ_OP_ZONE_FINISH,
+> -				       physical >> SECTOR_SHIFT,
+> -				       zinfo->zone_size >> SECTOR_SHIFT);
+> -		memalloc_nofs_restore(nofs_flags);
+> -
+> -		if (ret)
+> -			return ret;
+> -	}
+> +	nofs_flags = memalloc_nofs_save();
+> +	ret = blkdev_zone_mgmt(device->bdev, REQ_OP_ZONE_FINISH,
+> +			       physical >> SECTOR_SHIFT,
+> +			       zinfo->zone_size >> SECTOR_SHIFT);
+> +	memalloc_nofs_restore(nofs_flags);
+> +	if (ret)
+> +		return ret;
+>  
+>  	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
+>  		zinfo->reserved_active_zones++;
+
+[Severity: High]
+This is a pre-existing issue, but does this increment in call_zone_finish()
+introduce a data race with the decrement in btrfs_zone_activate()?
+
+In btrfs_zone_activate(), the counter is decremented while holding the
+fs_info->zone_active_bgs_lock. Concurrently, call_zone_finish() can run
+asynchronously (such as from background zone finishing) and increment
+this same counter without holding the zone_active_bgs_lock.
+
+Since reserved_active_zones is a plain integer, can concurrent 
+read-modify-write operations clobber each other? This drift could lead 
+to either transaction aborts if the counter drops too low, or artificial 
+deadlocks for data block groups if it goes too high.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1787887776.git.zhudongjiang@fygo.io?part=1
+
