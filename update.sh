@@ -1,11 +1,11 @@
-#!/bin/sh
+#!/bin/bash
 
 src="${1:-$HOME/sashiko-sync}"
 here=$(pwd)
 newdir="$here/new"
 donedir="$here/done"
 
-if ! [ -f "$src" ]; then
+if ! [[ -f "$src" ]]; then
 	echo "ERROR: cannot find mail sources sashiko-sync"
 	exit
 fi
@@ -30,6 +30,8 @@ for mbox in wip.*; do
 done
 
 cd "$here"
-grep -L '^From sashiko-bot@kernel.org' new/* | xargs rm -- -v
+grep -L '^From sashiko-bot@kernel.org' new/* | xargs rm -v --
 git add new/*
+./update-readme.sh
+git add README.md
 git commit -m"Update "$(date  +%Y-%m-%d)
