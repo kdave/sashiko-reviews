@@ -30,5 +30,6 @@ for mbox in wip.*; do
 done
 
 cd "$here"
+grep -L '^From sashiko-bot@kernel.org' new/* | xargs rm -- -v
 git add new/*
 git commit -m"Update "$(date  +%Y-%m-%d)
