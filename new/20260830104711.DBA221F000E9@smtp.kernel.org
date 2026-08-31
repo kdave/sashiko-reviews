@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Sun Aug 30 12:47:22 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/3] linux/log2.h: Add 64-bit safe variants of
+ power-of-two functions
+Date: Sun, 30 Aug 2026 10:47:11 +0000
+Message-Id: <20260830104711.DBA221F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] `__roundup_pow_of_two_u64()` computes the wrong value for `n = 1` when optimizations propagate the constant, due to misuse of `ilog2(0)`.
+- [Low] Kernel-doc comment for `__rounddown_pow_of_two_u64` incorrectly uses the suffix `_64` instead of `_u64`.
+--
+
+commit 1b2e30cc48e12ee945f73271fbcb60bed282f343
+Author: David Gow <david@davidgow.net>
+
+linux/log2.h: Add 64-bit safe variants of power-of-two functions
+
+This commit adds 64-bit safe variants of power-of-two functions which always
+operate on a 64-bit value regardless of sizeof(long). It also removes a
+conflicting implementation from i915.
+
+> diff --git a/include/linux/log2.h b/include/linux/log2.h
+> index e17ceb32e0c97..fc44e59f57328 100644
+> --- a/include/linux/log2.h
+> +++ b/include/linux/log2.h
+[ ... ]
+> @@ -195,6 +211,63 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
+>  	__rounddown_pow_of_two(n)		\
+>   )
+>  
+> +/**
+> + * __rounddown_pow_of_two_64() - round a 64-bit value down to nearest power of two
+> + * @n: value to round down
+> + */
+> +static inline __attribute_const__
+> +u64 __rounddown_pow_of_two_u64(u64 n)
+
+[Severity: Low]
+Is there a typo in the kernel-doc function name?
+
+The comment documents __rounddown_pow_of_two_64, but the function is named
+__rounddown_pow_of_two_u64. Will this cause kernel-doc warnings?
+
+> +{
+> +	return 1ULL << ilog2(n);
+> +}
+> +
+[ ... ]
+> +/**
+> + * __roundup_pow_of_two_u64() - round a 64-bit value up to nearest power of two
+> + * @n: value to round up
+> + */
+> +static inline __attribute_const__
+> +u64 __roundup_pow_of_two_u64(u64 n)
+> +{
+> +	return 1ULL << (ilog2(n - 1) + 1);
+> +}
+
+[Severity: High]
+Can this compute the wrong value for n = 1 if the compiler propagates the
+constant after macro expansion?
+
+If n = 1 is passed to roundup_pow_of_two_u64(n) and __builtin_constant_p(n)
+evaluates to false at macro expansion time, it will fall back to calling this
+inline function.
+
+When the compiler later inlines the function and proves n = 1 via constant
+propagation, it will evaluate ilog2(0).
+
+Inside the ilog2(0) macro, __builtin_constant_p(0) evaluates to true, so it
+takes the constant branch (0 < 2 ? 0 : ...), which evaluates to 0.
+
+Would this result in 1ULL << (0 + 1) returning 2 instead of 1?
+
+Should this use fls64(n - 1) instead, similar to how the 32-bit
+__roundup_pow_of_two() uses fls_long(n - 1)?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260830103321.2042968-1-david@davidgow.net?part=1
+

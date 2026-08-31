@@ -1,0 +1,69 @@
+From sashiko-bot@kernel.org Mon Aug 31 07:52:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RESEND v2] btrfs: fix use-after-free in
+ mark_block_group_to_copy
+Date: Mon, 31 Aug 2026 05:52:15 +0000
+Message-Id: <20260831055215.97FDA1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Unbalanced up_read on commit_root_sem in btrfs_next_old_leaf when down_read_trylock fails.
+--
+
+commit feac978347d4c3d5466ee45f3fc29243b4ab0641
+Author: Hongling Zeng <zenghongling@kylinos.cn>
+
+btrfs: fix use-after-free in mark_block_group_to_copy
+
+This commit fixes a use-after-free issue when iterating over the commit root
+with skip_locking=true. It protects the commit root search by setting
+path->need_commit_sem to true in mark_block_group_to_copy().
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 318ddb7904292..7e78215b2049b 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -493,6 +493,7 @@ static int mark_block_group_to_copy(struct btrfs_fs_info *fs_info,
+>  	path->reada = READA_FORWARD;
+>  	path->search_commit_root = true;
+>  	path->skip_locking = true;
+> +	path->need_commit_sem = true;
+
+[Severity: High]
+This is a pre-existing issue, but does relying on path->need_commit_sem expose
+a structural logic flaw in btrfs_next_old_leaf() located in fs/btrfs/ctree.c?
+
+Looking at btrfs_next_old_leaf(), when both path->need_commit_sem and
+path->nowait are true, the code attempts to take the lock:
+
+    if (!down_read_trylock(&fs_info->commit_root_sem)) {
+        ret = -EAGAIN;
+        goto done;
+    }
+
+If the semaphore is contended and down_read_trylock() fails, the failure
+path jumps directly to the done label. The cleanup logic there expects the
+lock to be held and unconditionally unlocks it:
+
+done:
+    ...
+    if (path->need_commit_sem)
+        up_read(&fs_info->commit_root_sem);
+
+Could this unbalanced up_read() on an unheld read-write semaphore corrupt
+the lock state (such as causing a negative lock count) and lead to panics
+or deadlocks?
+
+Although there may currently be no callers that set both need_commit_sem
+and nowait simultaneously in this specific path, the error-handling logic
+explicitly includes logic to handle their combination, leaving the path
+vulnerable when need_commit_sem is used.
+
+>  
+>  	key.objectid = src_dev->devid;
+>  	key.type = BTRFS_DEV_EXTENT_KEY;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831053801.51572-1-zenghongling@kylinos.cn?part=1
+

@@ -1,0 +1,71 @@
+From sashiko-bot@kernel.org Mon Aug 31 15:56:42 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH AUTOSEL 6.18-5.15] btrfs: protect sb_write_pointer()
+ with invalidate lock
+Date: Mon, 31 Aug 2026 13:56:31 +0000
+Message-Id: <20260831135631.E5AD21F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] btrfs_read_disk_super() is missing the filemap_invalidate_lock() protection against the BLKBSZSET race, leaving the filesystem vulnerable to mount-time crashes.
+--
+
+commit bbebc77bbf2c782852ab912e2af57a6baf24c726
+Author: KangNing Liao <lkangn.kernel@gmail.com>
+
+btrfs: protect sb_write_pointer() with invalidate lock
+
+sb_write_pointer() reads the super block from the block device page cache
+using read_cache_page_gfp(). This has the same race with BLKBSZSET as the
+one fixed by commit 3f29d661e568 ("btrfs: sync read disk super and set
+block size").
+
+Take the mapping invalidate lock around read_cache_page_gfp() to
+serialize the read against block size changes.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index d1db7fa1fe583..43540c297b179 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -130,8 +130,10 @@ static int sb_write_pointer(struct block_device *bdev, struct blk_zone *zones,
+>  			u64 bytenr = ALIGN_DOWN(zone_end, BTRFS_SUPER_INFO_SIZE) -
+>  						BTRFS_SUPER_INFO_SIZE;
+>  
+> +			filemap_invalidate_lock(mapping);
+>  			page[i] = read_cache_page_gfp(mapping,
+>  					bytenr >> PAGE_SHIFT, GFP_NOFS);
+> +			filemap_invalidate_unlock(mapping);
+>  			if (IS_ERR(page[i])) {
+>  				if (i == 1)
+>  					btrfs_release_disk_super(super[0]);
+
+[Severity: High]
+This is a pre-existing issue, but while reviewing this fix for
+sb_write_pointer(), I noticed the exact same race condition appears to still
+exist in btrfs_read_disk_super().
+
+In fs/btrfs/volumes.c:btrfs_read_disk_super(), the primary superblock read
+path performs an unprotected page cache read:
+
+    page = read_cache_page_gfp(mapping, bytenr >> PAGE_SHIFT, GFP_NOFS);
+    if (IS_ERR(page))
+            return ERR_CAST(page);
+
+Since btrfs_read_disk_super() is missing the filemap_invalidate_lock()
+protection against the BLKBSZSET race, could a concurrent BLKBSZSET ioctl
+during a superblock read still alter mapping->flags and
+mapping_min_folio_order() between folio allocation and filemap_add_folio()?
+
+If this occurs, it appears this could lead to a VM_BUG_ON_FOLIO or a NULL
+pointer dereference in create_empty_buffers() during mount. The commit
+under review correctly protects sb_write_pointer() and notes that upstream
+commit 3f29d661e568 fixed the same issue in btrfs_read_disk_super(), but
+the current tree does not seem to contain that prerequisite fix.
+
+Should btrfs_read_disk_super() also be protected with
+filemap_invalidate_lock() in this tree to fully close this race condition?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831133314.4125787-19-sashal@kernel.org?part=1
+

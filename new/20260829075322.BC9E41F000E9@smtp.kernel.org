@@ -1,0 +1,91 @@
+From sashiko-bot@kernel.org Sat Aug 29 09:53:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix deadlocks with transaction commit when
+ cloning inline extents
+Date: Sat, 29 Aug 2026 07:53:22 +0000
+Message-Id: <20260829075322.BC9E41F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] A NULL pointer dereference occurs in the error path of copy_inline_to_page() if btrfs_start_transaction() fails.
+- [High] Removing BTRFS_INODE_NO_DELALLOC_FLUSH introduces a self-deadlock when starting subsequent transactions during a clone operation.
+--
+
+commit 7100416da2d04d98af2cf774caaa79c81da5e72f
+Author: Melon Liu <melon1335@163.com>
+
+btrfs: fix deadlocks with transaction commit when cloning inline extents
+
+This commit addresses deadlock windows between reflink operations and
+transaction commits by starting transactions earlier and updating destination
+i_size while the folio is still locked. It also completely removes the
+BTRFS_INODE_NO_DELALLOC_FLUSH runtime flag.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 3c10a0ef00023..00795c3de3caa 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -8919,10 +8919,6 @@ static int start_delalloc_inodes(struct btrfs_root *root, long *nr_to_write,
+>  
+>  		list_move_tail(&inode->delalloc_inodes, &root->delalloc_inodes);
+>  
+> -		if (in_reclaim_context &&
+> -		    test_bit(BTRFS_INODE_NO_DELALLOC_FLUSH, &inode->runtime_flags))
+> -			continue;
+> -
+
+[Severity: High]
+Could the removal of this exclusion logic lead to a self-deadlock when
+space reclaim is triggered during a clone operation?
+
+Since BTRFS_INODE_NO_DELALLOC_FLUSH is completely removed here and in
+btrfs_clone(), if a reflink operation clones an inline extent and proceeds
+to punch a trailing hole via btrfs_replace_file_extents(), calling
+btrfs_start_transaction() can trigger shrink_delalloc().
+
+This would queue writeback for the destination inode's dirty folio, and
+extent_writepage() would attempt to acquire the exact same extent lock
+that is already held by the clone ioctl, resulting in an AB-BA inversion
+and hanging the task.
+
+> diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+> index d2a4101912bdb..11950a2cdf02c 100644
+> --- a/fs/btrfs/reflink.c
+> +++ b/fs/btrfs/reflink.c
+[ ... ]
+> @@ -84,6 +85,18 @@ static int copy_inline_to_page(struct btrfs_inode *inode,
+>  	if (ret)
+>  		goto out;
+>  
+> +	/*
+> +	 * Start the transaction before creating and dirtying the folio, otherwise
+> +	 * commit writeback can deadlock on the destination range locked by the
+> +	 * caller.
+> +	 */
+> +	*trans_out = btrfs_start_transaction(inode->root, 1);
+> +	if (IS_ERR(*trans_out)) {
+> +		ret = PTR_ERR(*trans_out);
+> +		*trans_out = NULL;
+> +		goto out_unlock;
+> +	}
+> +
+
+[Severity: Critical]
+Will this new goto out_unlock trigger a NULL pointer dereference if
+btrfs_start_transaction() fails?
+
+At this point in copy_inline_to_page(), the folio variable is still
+initialized to NULL. If the transaction start fails, such as from ENOSPC,
+we jump to the out_unlock label where the cleanup code checks
+if (!IS_ERR(folio)).
+
+Because IS_ERR(NULL) evaluates to false, !IS_ERR(NULL) is true. The
+cleanup path will then unconditionally call folio_unlock(NULL) and
+folio_put(NULL), crashing the kernel.
+
+Since unprivileged users can trigger ENOSPC conditions via the FICLONE
+ioctl, can this be exploited to cause a local DoS?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/a74ov5nvs5u4nkqhrs5lp2jaj664wewkqqsjxzhuemzazzmzvx@eeof6sjb3xdc?part=1
+
