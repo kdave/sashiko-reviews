@@ -1,0 +1,105 @@
+From sashiko-bot@kernel.org Mon Aug 31 17:43:17 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH AUTOSEL 6.18] btrfs: balance: fix potential bg lookup
+ failure in chunk_usage_filter()
+Date: Mon, 31 Aug 2026 15:43:06 +0000
+Message-Id: <20260831154306.E3CF41F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Incomplete fix: NULL pointer dereference remains in chunk_usage_range_filter()
+- [High] Unresolved NULL pointer dereference in btrfs_may_alloc_data_chunk() during balance
+--
+
+commit 1ad1da96b8fc1b44f72123e0604903e47499a7ab
+Author: ZhengYuan Huang <gality369@gmail.com>
+
+btrfs: balance: fix potential bg lookup failure in chunk_usage_filter()
+
+Running btrfs balance with a usage filter (-dusage=N) can trigger a KASAN
+null-ptr-deref when metadata corruption causes a chunk to have no
+corresponding block group. This patch adds a NULL check after
+btrfs_lookup_block_group() in chunk_usage_filter() and propagates the error.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 2bec544d8ba30..85df71d5c8cd5 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -3863,14 +3863,19 @@ static bool chunk_usage_range_filter(struct btrfs_fs_info *fs_info, u64 chunk_of
+>  	return ret;
+>  }
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does chunk_usage_range_filter()
+also need a similar NULL check?
+
+If a balance operation is run with a usage range filter on a corrupted
+filesystem with an orphaned chunk, btrfs_lookup_block_group() can
+return NULL:
+
+fs/btrfs/volumes.c:chunk_usage_range_filter() {
+    ...
+	cache = btrfs_lookup_block_group(fs_info, chunk_offset);
+	chunk_used = cache->used;
+    ...
+}
+
+Will this cause a NULL pointer dereference here, similar to the one
+fixed in chunk_usage_filter()?
+
+>  
+> -static bool chunk_usage_filter(struct btrfs_fs_info *fs_info, u64 chunk_offset,
+> -			       struct btrfs_balance_args *bargs)
+> +static int chunk_usage_filter(struct btrfs_fs_info *fs_info, u64 chunk_offset,
+> +			      struct btrfs_balance_args *bargs)
+>  {
+
+[ ... ]
+
+> @@ -4172,6 +4182,10 @@ static int __btrfs_balance(struct btrfs_fs_info *fs_info)
+>  		ret = should_balance_chunk(leaf, chunk, found_key.offset);
+>  
+>  		btrfs_release_path(path);
+> +		if (ret < 0) {
+> +			mutex_unlock(&fs_info->reclaim_bgs_lock);
+> +			goto error;
+> +		}
+>  		if (!ret) {
+>  			mutex_unlock(&fs_info->reclaim_bgs_lock);
+>  			goto loop;
+
+[Severity: High]
+This is a pre-existing issue, but does a similar NULL pointer dereference
+still occur if the balance operation is run without usage filters?
+
+If __btrfs_balance() skips the newly patched chunk_usage_filter(), the
+balance loop eventually passes the orphaned chunk to
+btrfs_may_alloc_data_chunk():
+
+fs/btrfs/volumes.c:__btrfs_balance() {
+    ...
+		if (!chunk_reserved) {
+			...
+			ret = btrfs_may_alloc_data_chunk(fs_info,
+							 found_key.offset);
+    ...
+}
+
+This function then looks up the block group and dereferences it
+unconditionally:
+
+fs/btrfs/volumes.c:btrfs_may_alloc_data_chunk() {
+    ...
+	cache = btrfs_lookup_block_group(fs_info, offset);
+	ASSERT(cache);
+	chunk_type = cache->flags;
+    ...
+}
+
+In non-debug builds where the ASSERT is compiled out, will this result in a
+kernel panic when reading cache->flags?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831133314.4125787-340-sashal@kernel.org?part=1
+

@@ -1,0 +1,108 @@
+From sashiko-bot@kernel.org Mon Aug 31 16:38:31 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH AUTOSEL 6.18-5.15] btrfs: tree-checker: validate
+ INODE_REF's namelen
+Date: Mon, 31 Aug 2026 14:38:20 +0000
+Message-Id: <20260831143821.7E0581F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] The patch fixes a stack buffer overflow for INODE_REF items, but btrfs_get_name() remains vulnerable to the exact same overflow via BTRFS_ROOT_BACKREF_KEY.
+- [Critical] btrfs_get_name() blindly decrements path->slots[0] and interprets the resulting item as a BTRFS_ROOT_BACKREF_KEY without bounds or type checks, leading to memory corruption.
+--
+
+commit 3efad68c11809041a364b147572ece2b87bf4492
+Author: Weiming Shi <bestswngs@gmail.com>
+
+btrfs: tree-checker: validate INODE_REF's namelen
+
+The patch adds an extra namelen verification for INODE_REF items to prevent
+an out-of-boundary access. A crafted btrfs image could otherwise provide a
+namelen larger than the available memory buffer.
+
+Link: https://lore.kernel.org/linux-btrfs/aik0hEV6ehKx6Ldv@Air.local/
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index c10b4c242acfc..5846a57189a90 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -1766,6 +1766,12 @@ static int check_inode_ref(struct extent_buffer *leaf,
+>  
+>  		iref = (struct btrfs_inode_ref *)ptr;
+>  		namelen = btrfs_inode_ref_name_len(leaf, iref);
+> +		if (unlikely(namelen == 0 || namelen > BTRFS_NAME_LEN)) {
+> +			inode_ref_err(leaf, slot,
+> +				"invalid inode ref name length, has %u expect [1, %u]",
+> +				namelen, BTRFS_NAME_LEN);
+> +			return -EUCLEAN;
+> +		}
+
+[Severity: Critical]
+This is a pre-existing issue, but the patch fixes a stack buffer overflow for
+INODE_REF items, while btrfs_get_name() remains vulnerable to the exact same
+overflow via BTRFS_ROOT_BACKREF_KEY.
+
+In fs/btrfs/tree-checker.c:check_leaf_item(), BTRFS_ROOT_BACKREF_KEY is
+completely missing from the validation switch:
+
+    switch (key->type) {
+    case BTRFS_EXTENT_DATA_KEY:
+    ...
+    // BTRFS_ROOT_BACKREF_KEY is missing here
+    }
+
+The complete absence of BTRFS_ROOT_BACKREF_KEY in the metadata validation switch
+allows oversized subvolume names to bypass tree-checker.
+
+This then leads to an out-of-bounds stack write in
+fs/btrfs/export.c:btrfs_get_name():
+
+    name_len = btrfs_root_ref_name_len(leaf, rref);
+    // ...
+    read_extent_buffer(leaf, name, name_ptr, name_len);
+    name[name_len] = '\0';
+
+Does this mean a maliciously crafted filesystem image with an oversized
+name_len inside a BTRFS_ROOT_BACKREF_KEY item could still trigger a stack buffer
+overflow when accessed via NFS?
+
+[Severity: Critical]
+This is a pre-existing issue, but btrfs_get_name() blindly decrements
+path->slots[0] and interprets the resulting item as a BTRFS_ROOT_BACKREF_KEY
+without bounds or type checks:
+
+In fs/btrfs/export.c:btrfs_get_name():
+
+    ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+    if (ret < 0) {
+        return ret;
+    } else if (ret > 0) {
+        if (ino == BTRFS_FIRST_FREE_OBJECTID)
+            path->slots[0]--;
+        else
+            return -ENOENT;
+    }
+    leaf = path->nodes[0];
+
+    if (ino == BTRFS_FIRST_FREE_OBJECTID) {
+        rref = btrfs_item_ptr(leaf, path->slots[0],
+                     struct btrfs_root_ref);
+        name_ptr = (unsigned long)(rref + 1);
+        name_len = btrfs_root_ref_name_len(leaf, rref);
+
+If btrfs_search_slot() returns a value greater than 0 indicating the key was
+not found, and path->slots[0] is 0, doesn't path->slots[0]-- underflow to -1?
+
+Additionally, the item at the decremented slot is blindly interpreted as a
+btrfs_root_ref without verifying its key type or objectid. Can this cause the
+code to read a garbage name_len from an unrelated item and trigger a stack
+overflow?
+
+>  		if (unlikely(ptr + sizeof(*iref) + namelen > end)) {
+>  			inode_ref_err(leaf, slot,
+>  				"inode ref overflow, ptr %lu end %lu namelen %u",
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831133314.4125787-116-sashal@kernel.org?part=1
+

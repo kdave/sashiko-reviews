@@ -1,0 +1,88 @@
+From sashiko-bot@kernel.org Mon Aug 31 17:17:06 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH AUTOSEL 6.18-5.10] btrfs: fix use-after-free on reloc
+ root after error in insert_dirty_subvol()
+Date: Mon, 31 Aug 2026 15:16:47 +0000
+Message-Id: <20260831151648.197541F00A3E@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Concurrent Use-After-Free race on reloc_root due to missing reloc_mutex synchronization
+--
+
+commit d01c58f662bed3cc592d297b957ed8a89bfec9d6
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix use-after-free on reloc root after error in insert_dirty_subvol()
+
+This commit addresses a use-after-free issue on a reloc root by ensuring
+that root->reloc_root is cleared and properly dereferenced if
+merge_reloc_root() fails. It clears the pointer before jumping to the error
+path where the reloc root is freed.
+
+Link: https://lore.kernel.org/linux-btrfs/6a1ebde9.c1435f33.112120.0176.GAE@google.com/
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 0765e06d00b80..3a0a34b3c3671 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+
+[ ... ]
+
+> @@ -1860,13 +1865,32 @@ void merge_reloc_roots(struct reloc_control *rc)
+>  				goto out;
+>  			}
+>  			ret = merge_reloc_root(rc, root);
+> -			btrfs_put_root(root);
+>  			if (ret) {
+> -				if (list_empty(&reloc_root->root_list))
+> +				/*
+> +				 * Clear the reloc root since below we will call
+> +				 * free_reloc_roots(), otherwise we leave
+> +				 * root->reloc_root pointing to a freed reloc
+> +				 * root and trigger a use-after-free during
+> +				 * unmount or elsewhere.
+> +				 */
+> +				clear_reloc_root(root);
+> +				btrfs_put_root(root);
+> +				/*
+> +				 * We are adding the reloc_root to the local
+> +				 * reloc_roots list, so we add a ref for this
+> +				 * list which will be dropped below by the call
+> +				 * to free_reloc_roots().
+> +				 */
+> +				if (list_empty(&reloc_root->root_list)) {
+>  					list_add_tail(&reloc_root->root_list,
+>  						      &reloc_roots);
+> +					btrfs_grab_root(reloc_root);
+> +				}
+> +				/* Now drop the ref for root->reloc_root. */
+> +				btrfs_put_root(reloc_root);
+
+[Severity: Critical]
+This is a pre-existing issue, but does dropping the reference to reloc_root
+here without holding fs_info->reloc_mutex leave us vulnerable to a concurrent
+use-after-free?
+
+During the error path in merge_reloc_roots(), we call clear_reloc_root(root)
+which sets root->reloc_root = NULL, and then drop the reference to
+reloc_root. Since this happens without holding fs_info->reloc_mutex, can
+another thread modifying the subvolume trigger btrfs_record_root_in_trans()
+and take reloc_mutex to call btrfs_init_reloc_root()?
+
+Because btrfs_init_reloc_root() lacks a read memory barrier between checking
+BTRFS_ROOT_DEAD_RELOC_TREE and reading root->reloc_root, could the CPU
+reorder the read and fetch the old reloc_root pointer?
+
+If so, could merge_reloc_roots() free reloc_root while the concurrent thread
+dereferences it via btrfs_set_root_last_trans()?
+
+>  				goto out;
+>  			}
+> +			btrfs_put_root(root);
+>  		} else {
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831133314.4125787-234-sashal@kernel.org?part=1
+

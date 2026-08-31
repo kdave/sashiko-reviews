@@ -1,0 +1,68 @@
+From sashiko-bot@kernel.org Mon Aug 31 17:02:04 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH AUTOSEL 6.18] btrfs: validate properties before setting
+ them
+Date: Mon, 31 Aug 2026 15:01:52 +0000
+Message-Id: <20260831150153.43E2C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Adding property validation inside `btrfs_set_prop()` causes it to return `-EINVAL` for uncompressible files, which triggers a fatal transaction abort in `btrfs_fileattr_set()`.
+--
+
+commit e28a2dec0e6ec3b3b14db510fa123c0d13025594
+Author: Filipe Manana <fdmanana@suse.com>
+
+    btrfs: validate properties before setting them
+
+We set the xattr and then attempt to apply the property. If the apply
+fails we then attempt to delete the xattr to avoid an inconsistency.
+However we don't verify if the deletion succeed, so if it fails we
+leave an inconsistency between the state in the btree and the in-memory
+inode.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index adc956432d2f1..bb77d46376d4b 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+> @@ -127,14 +127,24 @@ int btrfs_set_prop(struct btrfs_trans_handle *trans, struct btrfs_inode *inode,
+>  		return ret;
+>  	}
+>  
+> +	ret = handler->validate(inode, value, value_len);
+> +	if (ret)
+> +		return ret;
+
+[Severity: High]
+Will this new validation step trigger an unintended transaction abort
+in the ioctl path?
+
+If a user creates a file on a mount with -o nodatasum (which sets
+BTRFS_INODE_NODATASUM without NODATACOW), and then calls ioctl(FS_IOC_SETFLAGS)
+to set the compression flag, handler->validate() (prop_compression_validate())
+returns -EINVAL because btrfs_inode_can_compress() returns false.
+
+This -EINVAL is then returned to the caller in fs/btrfs/ioctl.c:
+btrfs_fileattr_set(), which treats it as a fatal error since it is inside an
+active transaction:
+
+fs/btrfs/ioctl.c:btrfs_fileattr_set() {
+    ...
+	if (comp) {
+		ret = btrfs_set_prop(trans, inode, "btrfs.compression",
+				     comp, strlen(comp), 0);
+		if (unlikely(ret)) {
+			btrfs_abort_transaction(trans, ret);
+			goto out_end_trans;
+		}
+	}
+    ...
+}
+
+Could an unprivileged user with write access to their own file exploit this to
+crash the filesystem by triggering a transaction abort?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831133314.4125787-208-sashal@kernel.org?part=1
+
