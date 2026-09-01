@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Mon Aug 31 19:41:56 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH AUTOSEL 6.18] btrfs: zoned: always set
+ data_relocation_bg
+Date: Mon, 31 Aug 2026 17:41:45 +0000
+Message-Id: <20260831174146.600EB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Accounting error during block group migration causing `disk_total` underflow and `bytes_zone_unusable` leak.
+--
+
+commit a65d1902315788f34dc8fb8174891f317fdcd45a
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: always set data_relocation_bg
+
+When searching for a data relocation block-group on mount,
+btrfs_zoned_reserve_data_reloc_bg() is looking for the first empty DATA
+block-group. It corrects a regression to ensure the first empty DATA
+block-group is picked without being erroneously skipped.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index d1db7fa1fe583..80f666f8f5e2f 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -2583,8 +2577,6 @@ void btrfs_zoned_reserve_data_reloc_bg(struct btrfs_fs_info *fs_info)
+>  
+>  			down_write(&space_info->groups_sem);
+>  			list_del_init(&bg->list);
+> -			/* We can assume this as we choose the second empty one. */
+> -			ASSERT(!list_empty(&space_info->block_groups[index]));
+>  			up_write(&space_info->groups_sem);
+>  
+>  			spin_lock(&space_info->lock);
+
+[Severity: High]
+This is a pre-existing issue, but does this accounting logic incorrectly
+subtract bg->zone_unusable from space_info->disk_total during block group
+migration?
+
+When migrating an empty data block group to a relocation block group during
+mount time on a zoned filesystem in btrfs_zoned_reserve_data_reloc_bg() in
+fs/btrfs/zoned.c, the code immediately following this lock performs:
+
+    space_info->disk_total -= bg->length * factor;
+    space_info->disk_total -= bg->zone_unusable;
+
+Should this be calling btrfs_space_info_update_bytes_zone_unusable() instead
+to properly update bytes_zone_unusable? By subtracting from disk_total
+directly, it seems to artificially lower disk_total while leaking
+bytes_zone_unusable in the original space info. Since bytes_zone_unusable
+is counted as used space, could this leak cause the filesystem to falsely
+report less free space and trigger premature ENOSPC during data allocations?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831133314.4125787-648-sashal@kernel.org?part=1
+

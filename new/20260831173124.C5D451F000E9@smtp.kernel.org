@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Mon Aug 31 19:31:35 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH AUTOSEL 6.18-6.12] btrfs: use on-disk uuid for s_uuid in
+ temp_fsid mounts
+Date: Mon, 31 Aug 2026 17:31:24 +0000
+Message-Id: <20260831173124.C5D451F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] btrfs_setup_sprout() changes the filesystem UUID but fails to update the VFS-visible sb->s_uuid.
+--
+
+commit 3fc41d4e2598e42826f4e1b45d32bc499d21371c
+Author: Anand Jain <asj@kernel.org>
+
+btrfs: use on-disk uuid for s_uuid in temp_fsid mounts
+
+When mounting a cloned filesystem with a temporary fsuuid, layered modules
+like overlayfs require a persistent identifier. This commit ensures that
+sb->s_uuid carries the original on-disk UUID instead of the temporary random
+fs_devices->fsid.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 0aa7e5d1b05f6..39f21964d01dd 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -3433,7 +3433,16 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
+>  	/* Update the values for the current filesystem. */
+>  	sb->s_blocksize = sectorsize;
+>  	sb->s_blocksize_bits = blksize_bits(sectorsize);
+> -	memcpy(&sb->s_uuid, fs_info->fs_devices->fsid, BTRFS_FSID_SIZE);
+> +	/*
+> +	 * When temp_fsid is active, fs_devices->fsid is assigned a random UUID
+> +	 * at mount. This inconsistent UUID causes issues for layered filesystems
+> +	 * like OverlayFS. Since metadata_uuid may or may not be set, provide the
+> +	 * on-disk UUID directly from the super_copy.
+> +	 */
+> +	if (fs_info->fs_devices->temp_fsid)
+> +		memcpy(&sb->s_uuid, fs_info->super_copy->fsid, BTRFS_FSID_SIZE);
+> +	else
+> +		memcpy(&sb->s_uuid, fs_info->fs_devices->fsid, BTRFS_FSID_SIZE);
+>  
+>  	mutex_lock(&fs_info->chunk_mutex);
+>  	ret = btrfs_read_sys_array(fs_info);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but since you are fixing
+sb->s_uuid semantics here, does btrfs_setup_sprout() in fs/btrfs/volumes.c
+also need attention?
+
+When a read-only seed device is sprouted into a read-write filesystem, a new
+random UUID is generated for the filesystem:
+
+fs/btrfs/volumes.c:btrfs_setup_sprout() {
+    ...
+    generate_random_uuid(fs_devices->fsid);
+    memcpy(fs_devices->metadata_uuid, fs_devices->fsid, BTRFS_FSID_SIZE);
+    memcpy(disk_super->fsid, fs_devices->fsid, BTRFS_FSID_SIZE);
+    ...
+}
+
+However, the VFS superblock's UUID (sb->s_uuid) is not updated. Layered
+security modules like EVM could calculate HMACs for new or modified files
+using the stale seed UUID during the sprouted session.
+
+Upon unmounting and remounting, the mount process will correctly set
+sb->s_uuid to the new sprouted UUID, which can cause EVM to fail validation
+of the previously created HMACs.
+
+This is reachable when adding a device to a seeded Btrfs filesystem via:
+btrfs_ioctl_add_dev() -> btrfs_init_new_device() -> btrfs_setup_sprout()
+
+Should btrfs_setup_sprout() also update sb->s_uuid to prevent this state
+inconsistency?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260831133314.4125787-623-sashal@kernel.org?part=1
+
