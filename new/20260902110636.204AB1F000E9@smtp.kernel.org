@@ -1,0 +1,88 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:06:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 09/11] mm/migrate: thread migration policy through a
+ control struct
+Date: Wed, 02 Sep 2026 11:06:35 +0000
+Message-Id: <20260902110636.204AB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Uninitialized stack variable `async_ctl` is used when retrying split folios if the original mode was `MIGRATE_ASYNC`, which may lead to garbage memory access and unintended sleeping/blocking during async migration.
+--
+
+commit 678caf4cac0f47a63b961c745929e7b638e650c8
+Author: Shivank Garg <shivankg@amd.com>
+
+mm/migrate: thread migration policy through a control struct
+
+This commit introduces struct migrate_control to bundle the migration mode
+and reason parameters into a single structure. It passes this control struct
+through internal migration helpers instead of using separate parameters.
+
+> diff --git a/mm/migrate.c b/mm/migrate.c
+> --- a/mm/migrate.c
+> +++ b/mm/migrate.c
+[ ... ]
+> @@ -2189,27 +2188,29 @@ static int migrate_folios_batch(struct list_head *from,
+>   */
+>  static int __migrate_lru_folios(struct list_head *from, new_folio_t get_new_folio,
+>  		free_folio_t put_new_folio, unsigned long private,
+> -		enum migrate_mode mode, enum migrate_reason reason,
+> -		struct list_head *ret_folios,
+> +		const struct migrate_control *ctl, struct list_head *ret_folios,
+>  		struct migrate_pages_stats *stats)
+>  {
+>  	int rc, nr_failed = 0;
+>  	LIST_HEAD(folios);
+>  	LIST_HEAD(split_folios);
+>  	struct migrate_pages_stats astats;
+> +	struct migrate_control async_ctl;
+>  
+> -	if (mode == MIGRATE_ASYNC) {
+> +	if (ctl->mode == MIGRATE_ASYNC) {
+>  		rc = migrate_folios_batch(from, get_new_folio, put_new_folio,
+> -				private, mode, reason, ret_folios,
+> +				private, ctl, ret_folios,
+>  				&split_folios, stats,
+>  				NR_MAX_MIGRATE_PAGES_RETRY);
+>  		goto out;
+>  	}
+>  
+> +	async_ctl = *ctl;
+> +	async_ctl.mode = MIGRATE_ASYNC;
+[ ... ]
+>  out:
+>  	if (rc < 0) {
+>  		list_splice_tail(&split_folios, ret_folios);
+>  	} else if (!list_empty(&split_folios)) {
+>  		/*
+>  		 * Folios split along the way get one asynchronous attempt at
+>  		 * their new order.  Their failure is not counted: the large
+>  		 * folio they came from was already counted as one failure.
+>  		 */
+>  		migrate_folios_batch(&split_folios, get_new_folio, put_new_folio,
+> -				private, MIGRATE_ASYNC, reason, ret_folios,
+> +				private, &async_ctl, ret_folios,
+>  				NULL, stats, 1);
+
+[Severity: High]
+Can this lead to an uninitialized stack variable being used?
+
+If __migrate_lru_folios() is called with ctl->mode == MIGRATE_ASYNC, the
+early check jumps directly to the out label, bypassing the initialization
+of async_ctl. If large folios were split during that first pass, the
+!list_empty(&split_folios) check will be true.
+
+Could this cause migrate_folios_batch() to execute with garbage policy? For
+example, it might interpret the uninitialized async_ctl.mode as MIGRATE_SYNC,
+causing unintended blocking and sleeping during what should be an asynchronous
+migration.
+
+>  		list_splice_tail_init(&split_folios, ret_folios);
+>  	}
+>  
+>  	return rc;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=9
+

@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:11:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 11/11] mm/migrate: pass migrate_control to
+ migrate_folio()
+Date: Wed, 02 Sep 2026 11:10:56 +0000
+Message-Id: <20260902111057.5F8F61F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] JFS metapage migration crashes or leaks references because it accesses `src->private` after `filemap_migrate_folio()` has detached it.
+--
+
+commit 0c092f89cb8cd82947c067576e2c9c259c2c1dc2
+Author: Shivank Garg <shivankg@amd.com>
+
+mm/migrate: pass migrate_control to migrate_folio()
+
+This commit updates migrate_folio() callbacks across various filesystems to 
+accept a migrate_control structure instead of a simple migrate_mode enum. 
+This change allows additional policy information to reach folio-specific 
+migration code, while preserving the existing migration mode behavior.
+
+> diff --git a/fs/jfs/jfs_metapage.c b/fs/jfs/jfs_metapage.c
+> index 41fe12e641cee..7958edacb4971 100644
+> --- a/fs/jfs/jfs_metapage.c
+> +++ b/fs/jfs/jfs_metapage.c
+[ ... ]
+> @@ -241,7 +241,7 @@ static int __metapage_migrate_folio(struct address_space *mapping,
+>  	if (metapage_locked(mp))
+>  		return -EAGAIN;
+>  
+> -	rc = filemap_migrate_folio(mapping, dst, src, mode);
+> +	rc = filemap_migrate_folio(mapping, dst, src, ctl);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but does this code crash or leak 
+folio references during migration due to accessing a detached private pointer?
+
+When __metapage_migrate_folio() calls filemap_migrate_folio(), the migration 
+core delegates to __migrate_folio(). That function moves the private data 
+from the source to the destination folio:
+
+mm/migrate.c:__migrate_folio() {
+    ...
+    if (src_private)
+        folio_attach_private(dst, folio_detach_private(src));
+    ...
+}
+
+This detaches the JFS meta_anchor or metapage pointer, leaving src->private 
+as NULL. 
+
+Shortly after the filemap_migrate_folio() call returns successfully, the JFS 
+code calls remove_metapage(src, mp). When MPS_PER_PAGE > 1, remove_metapage() 
+reads the now-NULL src->private pointer:
+
+fs/jfs/jfs_metapage.c:remove_metapage() {
+    struct meta_anchor *a = folio->private;
+    ...
+    BUG_ON(a->mp[index] != mp);
+    ...
+}
+
+Dereferencing 'a' here triggers a severe NULL pointer dereference and kernel 
+panic.
+
+Alternatively, if MPS_PER_PAGE == 1, insert_metapage(dst, mp) is called. 
+Since dst->private is already set to mp by the migration core, the call to 
+folio_attach_private(dst, mp) inside insert_metapage() succeeds but 
+increments the destination folio's refcount a second time. The subsequent 
+remove_metapage(src, mp) calls folio_detach_private(src) which does nothing 
+since it is already NULL. Can this path permanently leak a folio reference 
+count?
+
+>  	if (rc)
+>  		return rc;
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=11
+

@@ -1,0 +1,26 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:01:21 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 02/11] mm/migrate: handle retries in
+ migrate_folios_move()
+Date: Wed, 02 Sep 2026 11:01:09 +0000
+Message-Id: <20260902110110.5E0051F000E9@smtp.kernel.org>
+
+> After extracting the unmap phase, migrate_pages_batch() still drives the
+> retry loop for the move phase and passes its retry bookkeeping to
+> migrate_folios_move(). This splits the move phase across the two
+> functions and requires several output parameters.
+> 
+> Move the retry loop and its bookkeeping into migrate_folios_move().
+> The function now takes the number of passes and reports failures through
+> @nr_failed, matching migrate_folios_unmap().
+> 
+> No functional change is intended.
+> 
+> Signed-off-by: Shivank Garg <shivankg@amd.com>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=2
+
+

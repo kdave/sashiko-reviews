@@ -1,0 +1,22 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:02:21 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 06/11] mm/migrate: rename migrate_pages_batch() to
+ migrate_folios_batch()
+Date: Wed, 02 Sep 2026 11:02:10 +0000
+Message-Id: <20260902110211.629D31F000E9@smtp.kernel.org>
+
+> migrate_pages_batch() operates on folios and calls the folio-based unmap,
+> move and undo helpers. Now that movable_ops-based page migration has been
+> separated out, rename it to migrate_folios_batch().
+> 
+> No functional changes intended.
+> 
+> Suggested-by: Zi Yan <ziy@nvidia.com>
+> Signed-off-by: Shivank Garg <shivankg@amd.com>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=6
+
+

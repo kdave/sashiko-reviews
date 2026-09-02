@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:11:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 10/11] mm/migrate: pass migrate_control to
+ migrate_pages()
+Date: Wed, 02 Sep 2026 11:11:33 +0000
+Message-Id: <20260902111133.9C4EC1F00ACF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Uninitialized `async_ctl` structure is passed to `migrate_folios_batch()` when `ctl->mode == MIGRATE_ASYNC`.
+--
+
+commit c0d77495768f5e8f1e4f178497970348e9942beb
+Author: Shivank Garg <shivankg@amd.com>
+
+mm/migrate: pass migrate_control to migrate_pages()
+
+migrate_pages() still takes mode and reason separately and reconstructs a
+migrate_control internally. This prevents callers from supplying additional
+migration policy without extending its argument list.
+
+> diff --git a/mm/migrate.c b/mm/migrate.c
+> index e4bc7122076e1..549f8b57092cc 100644
+> --- a/mm/migrate.c
+> +++ b/mm/migrate.c
+> @@ -2359,7 +2354,7 @@ int migrate_pages(struct list_head *from, new_folio_t get_new_folio,
+>  	rc_gather += rc;
+>  
+>  	rc = migrate_lru_folios(from, get_new_folio, put_new_folio,
+> -			private, &ctl, &ret_folios, &stats);
+> +			private, ctl, &ret_folios, &stats);
+>  	if (rc < 0) {
+>  		rc_gather = rc;
+>  		goto out;
+
+[Severity: High]
+Does this execution path introduce a regression where an uninitialized
+structure is passed when the initial mode is MIGRATE_ASYNC?
+
+Looking at __migrate_lru_folios() which is called via migrate_lru_folios():
+
+mm/migrate.c:__migrate_lru_folios() {
+	struct migrate_control async_ctl;
+
+	if (ctl->mode == MIGRATE_ASYNC) {
+		rc = migrate_folios_batch(...);
+		goto out;
+	}
+
+	async_ctl = *ctl;
+	async_ctl.mode = MIGRATE_ASYNC;
+...
+out:
+...
+	} else if (!list_empty(&split_folios)) {
+		migrate_folios_batch(&split_folios, get_new_folio, put_new_folio,
+				private, &async_ctl, ret_folios,
+				NULL, stats, 1);
+	}
+}
+
+If a caller invokes migrate_pages() with MIGRATE_ASYNC (such as DAMON or
+NUMA balancing), the execution jumps to the out label, skipping the
+initialization of the async_ctl structure.
+
+If a large folio fails to migrate and is successfully split, the split folios
+are placed into the split_folios list. Then migrate_folios_batch() is called
+to retry the split folios, passing the uninitialized async_ctl structure.
+
+Could this regression lead to unpredictable migration behavior by using
+garbage data from the stack for the mode and reason fields, potentially
+sleeping in paths that expect asynchronous behavior?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=10
+

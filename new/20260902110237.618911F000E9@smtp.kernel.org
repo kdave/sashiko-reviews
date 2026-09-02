@@ -1,0 +1,24 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:02:48 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 04/11] mm/migrate: use a dedicated list for hugetlb
+ folios
+Date: Wed, 02 Sep 2026 11:02:36 +0000
+Message-Id: <20260902110237.618911F000E9@smtp.kernel.org>
+
+> migrate_hugetlbs() scans the full source list on every retry pass, even
+> though it only handles hugetlb folios.
+> 
+> Move hugetlb folios to a local list before migration and move any remaining
+> folios to @ret_folios. This avoids scanning unrelated folios and removes
+> the later hugetlb check from migrate_pages().
+> 
+> No functional change intended.
+> 
+> Signed-off-by: Shivank Garg <shivankg@amd.com>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=4
+
+

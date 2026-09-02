@@ -1,0 +1,22 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:06:36 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 03/11] mm/migrate: factor out folio splitting on
+ allocation failure
+Date: Wed, 02 Sep 2026 11:06:24 +0000
+Message-Id: <20260902110625.25D7F1F000E9@smtp.kernel.org>
+
+> If destination folio allocation fails, migrate_folios_unmap() may split
+> a large folio and retry migration with smaller folios. Factor this logic
+> out into migrate_folio_split_on_alloc_fail() to simplify the allocation
+> failure path.
+> 
+> No functional change intended.
+> 
+> Signed-off-by: Shivank Garg <shivankg@amd.com>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=3
+
+

@@ -1,0 +1,24 @@
+From sashiko-bot@kernel.org Wed Sep  2 13:00:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 08/11] mm/migrate: move LRU batching into
+ migrate_lru_folios()
+Date: Wed, 02 Sep 2026 11:00:38 +0000
+Message-Id: <20260902110038.7D51C1F000E9@smtp.kernel.org>
+
+> The NR_MAX_BATCHED_MIGRATION limit is specific to LRU folio migration,
+> where the batch engine can keep multiple folios locked at once.
+> 
+> Move the batching loop into migrate_lru_folios() and rename the per-batch
+> worker to __migrate_lru_folios(). This leaves migrate_pages() responsible
+> only for dispatching the different migration classes.
+> 
+> No functional change intended.
+> 
+> Signed-off-by: Shivank Garg <shivankg@amd.com>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260902-migrate-refactor-shivank-v1-0-9dcca87669c4@amd.com?part=8
+
+
