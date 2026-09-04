@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Fri Sep  4 02:11:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8] loop: Fix NULL pointer dereference in lo_rw_aio()
+Date: Fri, 04 Sep 2026 00:11:38 +0000
+Message-Id: <20260904001139.600211F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Missing `post_release` call on `bdev_open()` error paths fails to flush the asynchronous `lo_clr_work`, leading to Use-After-Free and kernel panics upon module unload or device removal.
+--
+
+commit 2a185bcd13e7aae146603f1adf8ea0500c99c925
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+
+loop: Fix NULL pointer dereference in lo_rw_aio()
+    
+syzbot is reporting NULL pointer dereference in lo_rw_aio().
+An analysis by the Gemini AI collaborator considers that this problem
+is caused by a timing shift primarily exposed by commit 65565ca5f99b.
+This patch introduces a grace period for flushing outstanding I/O and
+adds a dedicated callback for the loop module to the block core layer.
+
+Link: https://syzkaller.appspot.com/bug?extid=cd8a9a308e879a4e2c28 [1]
+Link: https://syzkaller.appspot.com/bug?extid=bc273027d5643e48e5b3 [2]
+Link: https://lkml.kernel.org/r/fbb3edda-f108-4e5b-acf2-266f043f8125@I-love.SAKURA.ne.jp [3]
+Link: https://lkml.kernel.org/r/9f8b5ab0-efbc-4cf3-a1f8-b43377416946@I-love.SAKURA.ne.jp [4]
+
+> diff --git a/block/bdev.c b/block/bdev.c
+> index cd83230837406..7ce5acaacf43f 100644
+> --- a/block/bdev.c
+> +++ b/block/bdev.c
+> @@ -1188,6 +1188,8 @@ void bdev_release(struct file *bdev_file)
+>  	else
+>  		blkdev_put_whole(bdev);
+>  	mutex_unlock(&disk->open_mutex);
+> +	if (bdev->bd_disk->fops->post_release)
+> +		bdev->bd_disk->fops->post_release(bdev->bd_disk);
+>  
+>  	module_put(disk->fops->owner);
+>  put_no_open:
+[Severity: High]
+Is it possible for the asynchronous lo_clr_work to be left unflushed on
+error paths, leading to a use-after-free upon module unload or device
+removal?
+
+In bdev_release(), if we take the early exit due to an open failure:
+
+block/bdev.c:bdev_release() {
+    ...
+	if (IS_ERR(holder))
+		goto put_no_open;
+    ...
+}
+
+This jumps over the newly added post_release() invocation, bypassing the
+synchronization.
+
+A similar situation occurs in bdev_open() during rollback:
+
+block/bdev.c:bdev_open() {
+    ...
+put_module:
+	module_put(disk->fops->owner);
+abort_claiming:
+	if (holder)
+		bd_abort_claiming(bdev, holder);
+	mutex_unlock(&disk->open_mutex);
+    ...
+}
+
+This error path drops the module reference without invoking post_release()
+to flush the newly-queued asynchronous teardown work.
+
+If an autoclear loop device is opened but bdev_open() fails (for example,
+when opening an empty partition where blkdev_get_part() fails),
+blkdev_put_whole() is called to rollback. This drops bd_openers to 0 and
+triggers lo_release(), which queues the lo_clr_work asynchronously.
+
+bdev_open() then jumps to the put_module error path and returns without
+calling the post_release() callback. The subsequent VFS cleanup calls
+bdev_release() with an error pointer (IS_ERR(holder)), which also bypasses
+post_release(). The work remains pending on the workqueue without any flush,
+which could allow it to access freed loop_device structures.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/dc2f1e00-5e10-4e02-9415-c6ecb2cbc6b3@I-love.SAKURA.ne.jp?part=1
+

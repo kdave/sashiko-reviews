@@ -1,0 +1,48 @@
+From sashiko-bot@kernel.org Fri Sep  4 13:56:19 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: fix repeated words in comments
+Date: Fri, 04 Sep 2026 11:56:03 +0000
+Message-Id: <20260904115603.AE79D1F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] Blindly removing a repeated word creates a logically meaningless and tautological sentence.
+--
+
+commit 799e62ddbbfad2a8259c9c1afa990ba6d891cf66
+Author: Hemanth Selam <hemanth.selam@gmail.com>
+
+btrfs: fix repeated words in comments
+
+Drop words accidentally written twice, reported by checkpatch.pl as a
+possible repeated word.  Only touches comments, no code changes.
+
+[ ... ]
+
+> diff --git a/include/uapi/linux/btrfs_tree.h b/include/uapi/linux/btrfs_tree.h
+> index 192fee5635bd1..47ee52859b458 100644
+> --- a/include/uapi/linux/btrfs_tree.h
+> +++ b/include/uapi/linux/btrfs_tree.h
+> @@ -230,7 +230,7 @@
+>   *
+>   * Stored as an inline ref rather to avoid wasting space on a separate item on
+>   * top of the existing extent item. However, unlike the other inline refs,
+> - * there is one one owner ref per extent rather than one per extent.
+> + * there is one owner ref per extent rather than one per extent.
+
+[Severity: Low]
+Does dropping the repeated word here create a tautological sentence?
+
+The original comment for BTRFS_EXTENT_OWNER_REF_KEY contained a typo ("one
+one"), but simply removing one of the words leaves the documentation saying
+"there is one owner ref per extent rather than one per extent".
+
+Could this be corrected to convey the intended meaning (likely "one owner ref
+per extent rather than one per reference")?
+
+>   *
+>   * Because of this, it goes at the front of the list of inline refs, and thus
+>   * must have a lower type value than any other inline ref type (to satisfy the
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260904115202.7113-1-hemanth.selam@gmail.com?part=2
+

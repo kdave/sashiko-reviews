@@ -1,0 +1,52 @@
+From sashiko-bot@kernel.org Thu Sep  3 14:37:50 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix unnecessary transaction commit fallback from
+ btrfs_log_all_parents()
+Date: Thu, 03 Sep 2026 12:37:40 +0000
+Message-Id: <20260903123740.8B34E1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Improper validation of untrusted on-disk data using ASSERT() can cause a kernel panic (local DoS).
+--
+
+commit 8b0e2909ca5d216c73c900310ba60a58c215ac4e
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix unnecessary transaction commit fallback from btrfs_log_all_parents()
+
+This commit fixes an issue where an unnecessary transaction commit is
+triggered when btrfs_log_all_parents() returns 1 without doing any work.
+It prevents this by resetting 'ret' to 0 after calling btrfs_search_slot().
+
+> diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+> index 7ba7b6098aa58..0b9518a042728 100644
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+> @@ -7286,6 +7286,16 @@ static int btrfs_log_all_parents(struct btrfs_trans_handle *trans,
+>  	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+>  	if (ret < 0)
+>  		goto out;
+> +	/*
+> +	 * There can't be an inode ref key with offset 0 because inode numbers
+> +	 * start at BTRFS_FIRST_FREE_OBJECTID.
+> +	 */
+> +	ASSERT(ret > 0);
+
+[Severity: High]
+Could this assertion cause a kernel panic on a maliciously crafted image?
+
+Since the Btrfs tree-checker (check_inode_ref() in fs/btrfs/tree-checker.c)
+does not validate that the parent inode number (the key's offset) is greater
+than or equal to BTRFS_FIRST_FREE_OBJECTID, a crafted image could theoretically
+contain a key with offset 0.
+
+If btrfs_search_slot() finds this exact key, it returns 0, and the assertion
+will fail. With CONFIG_BTRFS_ASSERT enabled, this evaluates to BUG(),
+triggering a local DoS when a user calls fsync() on the affected inode.
+
+Before this patch, the code gracefully handled this by letting btrfs_iget()
+fail with an error pointer.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/8efdd4a651d579b37ad7929f613fc3bf8598bae1.1788438374.git.fdmanana@suse.com?part=1
+

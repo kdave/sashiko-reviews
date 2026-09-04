@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Fri Sep  4 01:31:51 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7.1] loop: Fix NULL pointer dereference in lo_rw_aio()
+Date: Thu, 03 Sep 2026 23:31:40 +0000
+Message-Id: <20260903233141.04BE01F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Asynchronous loop device teardown breaks synchronous close semantics expected by userspace.
+--
+
+commit 75916769dc93f2d9e7bfedf9899fc882094de627
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+
+loop: Fix NULL pointer dereference in lo_rw_aio()
+
+This commit introduces a grace period for flushing outstanding I/O by deferring
+the loop device teardown to a workqueue during lo_release(). This is intended
+to avoid lockdep warnings when flushing I/O without holding disk->open_mutex.
+
+Link: https://syzkaller.appspot.com/bug?extid=cd8a9a308e879a4e2c28
+Link: https://syzkaller.appspot.com/bug?extid=bc273027d5643e48e5b3
+Link: https://lkml.kernel.org/r/fbb3edda-f108-4e5b-acf2-266f043f8125@I-love.SAKURA.ne.jp
+Link: https://lkml.kernel.org/r/9f8b5ab0-efbc-4cf3-a1f8-b43377416946@I-love.SAKURA.ne.jp
+
+> diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+> index 6f12976035b09..516118b3a16c0 100644
+> --- a/drivers/block/loop.c
+> +++ b/drivers/block/loop.c
+
+[ ... ]
+
+> @@ -1769,8 +1799,20 @@ static void lo_release(struct gendisk *disk)
+>  	need_clear = (lo->lo_state == Lo_rundown);
+>  	mutex_unlock(&lo->lo_mutex);
+>  
+> -	if (need_clear)
+> -		__loop_clr_fd(lo);
+> +	if (!need_clear)
+> +		return;
+> +	/*
+> +	 * In order to flush outstanding I/O before clearing the backing
+> +	 * device, defer __loop_clr_fd() to WQ context. The Lo_rundown state
+> +	 * guarantees that lo_open() will fail with -ENXIO.
+> +	 *
+> +	 * Grab disk reference which will be dropped as soon as
+> +	 * returning from lo_release() and releasing disk->open_mutex.
+> +	 * We don't need to grab disk->fops->owner reference because
+> +	 * we are holding one obtained by loop_configure().
+> +	 */
+> +	get_device(disk_to_dev(disk));
+> +	queue_work(system_long_wq, &lo->lo_clr_work);
+
+[Severity: High]
+Does deferring the teardown to a workqueue introduce a userspace ABI
+regression here?
+
+By scheduling the teardown asynchronously instead of running it synchronously
+in lo_release(), the final close() on the loop device will return to userspace
+before the backing file is actually released via fput().
+
+Could subsequent userspace operations interacting with the backing file, such
+as unmounting a layered filesystem, fail spuriously with -EBUSY? The commit
+message mentions that this asynchronous approach was previously reverted for
+breaking userspace tests like xfs/259; does re-introducing this queue_work()
+call also re-introduce that regression?
+
+>  }
+>  
+>  static void lo_free_disk(struct gendisk *disk)
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/9ac07477-b2be-482b-9e97-87acf9635307@I-love.SAKURA.ne.jp?part=1
+

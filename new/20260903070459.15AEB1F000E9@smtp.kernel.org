@@ -1,0 +1,165 @@
+From sashiko-bot@kernel.org Thu Sep  3 09:05:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: split sectorsize into datasize and
+ sectorsize
+Date: Thu, 03 Sep 2026 07:04:58 +0000
+Message-Id: <20260903070459.15AEB1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 5 potential issue(s) to consider:
+- [Critical] Unconditional read of `datasize` bytes in `btrfs_do_readpage` causes critical data corruption and out-of-bounds reads.
+- [High] Race condition in clearing `EXTENT_NODATASUM` causes spurious data relocation failures.
+- [High] Padding uncompressed read sizes to `datasize` in `btrfs_encoded_read` causes out-of-bounds disk reads.
+- [Medium] Missing initialization of `sectorsize` in `btrfs_alloc_dummy_fs_info` breaks test configurations.
+- [Medium] Incorrect offset increment in free space tree tests skips bitmap bits.
+--
+
+commit d3ef95bb4e283b4f6de28c3b715b266de6140ab5
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: split sectorsize into datasize and sectorsize
+
+This commit separates the minimal data IO size (datasize) from the sector
+size to prepare for incoming features. While all data IO will use datasize,
+data checksum calculations will continue to respect sectorsize.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index a221b63bdb205..8dc6d6ab952db 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+> @@ -1063,7 +1063,7 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
+>  	u64 last_byte = i_size_read(inode);
+>  	struct extent_map *em;
+>  	int ret = 0;
+> -	const size_t blocksize = fs_info->sectorsize;
+> +	const size_t blocksize = fs_info->datasize;
+>  
+>  	if (bio_ctrl->ractl)
+>  		locked_end = readahead_pos(bio_ctrl->ractl) + readahead_length(bio_ctrl->ractl) - 1;
+> @@ -1094,7 +1094,7 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
+>  		u64 em_gen;
+>  		unsigned int queued;
+>  
+> -		ASSERT(IS_ALIGNED(cur, fs_info->sectorsize));
+> +		ASSERT(IS_ALIGNED(cur, fs_info->datasize));
+>  		if (cur >= last_byte) {
+>  			folio_zero_range(folio, pg_offset, end - cur + 1);
+>  			end_folio_read(vi, folio, true, cur, end - cur + 1);
+
+[Severity: Critical]
+Does unconditionally stepping and reading by datasize cause the read
+loop to ignore the actual physical extent length (em->len)?
+
+If a file has physical extents or holes smaller than datasize (e.g., from
+legacy filesystems or unaligned clones), it seems this loop will unconditionally
+submit a bio for datasize bytes. This could read past the physical extent
+boundary, mapping unrelated disk data into the page cache, and completely
+skipping subsequent file extents. Can this cause data corruption or an
+information leak?
+
+> diff --git a/fs/btrfs/file-item.c b/fs/btrfs/file-item.c
+> index 581ca5653be93..f0a99116c6057 100644
+> --- a/fs/btrfs/file-item.c
+> +++ b/fs/btrfs/file-item.c
+[ ... ]
+> @@ -3518,9 +3519,17 @@ bool btrfs_bio_data_csum_ok(struct btrfs_bio *bbio,
+>  	if (btrfs_is_data_reloc_root(inode->root) &&
+>  	    btrfs_test_range_bit(&inode->io_tree, file_offset, end, EXTENT_NODATASUM,
+>  				 NULL)) {
+> -		/* Skip the range without csum for data reloc inode */
+> -		btrfs_clear_extent_bit(&inode->io_tree, file_offset, end,
+> -				       EXTENT_NODATASUM, NULL);
+> +		/*
+> +		 * Skip the range without csum for data reloc inode.
+> +		 *
+> +		 * For datasize > sectorsize case, we can have multiple
+> +		 * sectors inside a data block. Only clear the EXTENT_NODATASUM
+> +		 * flag for the last sector of the block.
+> +		 */
+> +		if (IS_ALIGNED(end + 1, fs_info->datasize))
+> +			btrfs_clear_extent_bit(&inode->io_tree,
+> +					       round_down(file_offset, fs_info->datasize),
+> +					       end, EXTENT_NODATASUM, NULL);
+>  		return true;
+>  	}
+
+[Severity: High]
+Does clearing the EXTENT_NODATASUM flag for the entire block upon the
+completion of a single sector introduce a race condition with other in-flight
+bios for the same block?
+
+When relocating a data block where datasize is greater than sectorsize, the
+read operation might be split across multiple bios. If the bio containing the
+final sector completes first, it will clear the flag for the entire datasize
+block. Subsequent bio completions for earlier sectors in the same block would
+then evaluate btrfs_test_range_bit() to false, attempting checksum verification
+on an inode that lacks checksums. Could this lead to spurious data relocation
+failures?
+
+> diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+> index 20e15dc30bfb5..6aa0b8d5a5f78 100644
+> --- a/fs/btrfs/file.c
+> +++ b/fs/btrfs/file.c
+[ ... ]
+> @@ -9834,7 +9843,7 @@ ssize_t btrfs_encoded_read(struct kiocb *iocb, struct iov_iter *iter,
+>  		count = start + *disk_io_size - iocb->ki_pos;
+>  		encoded->len = count;
+>  		encoded->unencoded_len = count;
+> -		*disk_io_size = ALIGN(*disk_io_size, fs_info->sectorsize);
+> +		*disk_io_size = ALIGN(*disk_io_size, fs_info->datasize);
+>  	}
+>  	btrfs_free_extent_map(em);
+
+[Severity: High]
+Does padding the disk I/O size to datasize for uncompressed reads force
+out-of-bounds disk reads?
+
+If an unprivileged user issues a BTRFS_IOC_ENCODED_READ ioctl for an
+uncompressed extent whose length is not aligned to datasize (like legacy
+extents), it appears this will arbitrarily pad the physical read size. The
+block layer might then read past the actual physical extent and fetch unrelated
+disk data, which could be returned to userspace.
+
+> diff --git a/fs/btrfs/tests/btrfs-tests.c b/fs/btrfs/tests/btrfs-tests.c
+> index 6287d940323d6..d56f2cebfd6fc 100644
+> --- a/fs/btrfs/tests/btrfs-tests.c
+> +++ b/fs/btrfs/tests/btrfs-tests.c
+> @@ -138,8 +138,8 @@ struct btrfs_fs_info *btrfs_alloc_dummy_fs_info(u32 nodesize, u32 sectorsize)
+>  	btrfs_init_fs_info(fs_info);
+>  
+>  	fs_info->nodesize = nodesize;
+> -	fs_info->sectorsize = sectorsize;
+> -	fs_info->sectorsize_bits = ilog2(sectorsize);
+> +	fs_info->datasize = sectorsize;
+> +	fs_info->datasize_bits = ilog2(sectorsize);
+
+[Severity: Medium]
+Does this code leave fs_info->sectorsize uninitialized? 
+
+By replacing the assignment to sectorsize with datasize, the dummy
+filesystem might default to a 4096 sector size from btrfs_init_fs_info(),
+even if a different value was passed to btrfs_alloc_dummy_fs_info(). Could
+this corrupt test assumptions for non-default sector sizes?
+
+> diff --git a/fs/btrfs/tests/free-space-tree-tests.c b/fs/btrfs/tests/free-space-tree-tests.c
+> index 8dee057f41fdd..191444addf7de 100644
+> --- a/fs/btrfs/tests/free-space-tree-tests.c
+> +++ b/fs/btrfs/tests/free-space-tree-tests.c
+> @@ -68,7 +68,7 @@ static int __check_free_space_extents(struct btrfs_trans_handle *trans,
+>  					i++;
+>  				}
+>  				prev_bit = bit;
+> -				offset += fs_info->sectorsize;
+> +				offset += fs_info->datasize;
+>  			}
+
+[Severity: Medium]
+Will this offset increment skip bits in the free space bitmap if datasize
+is larger than sectorsize? 
+
+Each bit in the free space tree bitmap represents sectorsize bytes, so
+stepping by datasize might break the bit-by-bit contiguous check and
+cause the verification test to fail.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788417288.git.wqu@suse.com?part=1
+

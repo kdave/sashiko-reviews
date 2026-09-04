@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Thu Sep  3 18:15:00 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 3/3] btrfs: tree-checker: validate parent field for
+ inode extref items
+Date: Thu, 03 Sep 2026 16:14:50 +0000
+Message-Id: <20260903161450.A4D401F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Missing bounds validation for name_len field in btrfs_inode_extref items against semantic filesystem limits.
+--
+
+commit 684a11028273b8b487c6681c68b640bcc3837660
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: tree-checker: validate parent field for inode extref items
+
+This commit adds a validation check for the parent field of an inode extref
+item in subvolume trees. It ensures the parent inode number falls within the
+valid range of free objectids.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -2019,6 +2021,16 @@ static int check_inode_extref(struct extent_buffer *leaf,
+>  			return -EUCLEAN;
+>  		}
+>  
+> +		parent = btrfs_inode_extref_parent(leaf, extref);
+> +		if (unlikely(is_fstree && (parent < BTRFS_FIRST_FREE_OBJECTID ||
+> +					   parent > BTRFS_LAST_FREE_OBJECTID))) {
+> +			inode_ref_err(leaf, slot,
+> +		      "invalid parent for extref key, have %llu expect [%llu, %lld]",
+> +			      parent, BTRFS_FIRST_FREE_OBJECTID,
+> +				      BTRFS_LAST_FREE_OBJECTID);
+> +			return -EUCLEAN;
+> +		}
+> +
+>  		namelen = btrfs_inode_extref_name_len(leaf, extref);
+>  		if (unlikely(ptr + sizeof(*extref) + namelen > end)) {
+
+[Severity: High]
+This is a pre-existing issue, but is there a missing bounds validation for
+namelen against semantic filesystem limits?
+
+While the check_inode_extref() function ensures the item does not overflow
+the extent buffer boundary, it seems to omit checking namelen against limits
+like BTRFS_NAME_LEN or ensuring it is non-zero, which is typically done in
+the sibling check_inode_ref() function.
+
+Could this allow malformed inode_extref items with 0-length names or
+oversized names to bypass the btree checker?
+
+Processing these invalid names downstream during log replay or backref
+resolution might lead to logic errors, zero-size pointer allocations, or
+transaction aborts that can cause mount failures.
+
+>  			inode_ref_err(leaf, slot,
+>  				"inode extref overflow, ptr %lu end %lu namelen %u",
+>  				ptr, end, namelen);
+>  			return -EUCLEAN;
+>  		}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788451065.git.fdmanana@suse.com?part=3
+

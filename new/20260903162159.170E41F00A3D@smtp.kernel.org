@@ -1,0 +1,83 @@
+From sashiko-bot@kernel.org Thu Sep  3 18:22:09 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 2/3] btrfs: tree-checker: validate key offset for
+ inode ref keys
+Date: Thu, 03 Sep 2026 16:21:58 +0000
+Message-Id: <20260903162159.170E41F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [Low] Type mismatch in format string for BTRFS_LAST_FREE_OBJECTID triggers a compiler warning.
+
+Pre-existing issues:
+- [High] Missing name length validation in check_inode_extref allows maliciously crafted filesystem images to bypass BTRFS_NAME_LEN constraints.
+--
+
+commit 438a1788f8c27328e787fe0f90908ffd242c3a5b
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: tree-checker: validate key offset for inode ref keys
+
+For a subvolume tree, the offset of an inode ref key corresponds to an
+inode number, and that must always be within the range of
+BTRFS_FIRST_FREE_OBJECTID to BTRFS_LAST_FREE_OBJECTID.
+This commit adds a check for that condition in check_inode_ref().
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 622334ffd2401..7dff824cfc4ca 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -1951,6 +1951,16 @@ static int check_inode_ref(struct extent_buffer *leaf,
+>  		return -EUCLEAN;
+>  	}
+>  
+> +	if (unlikely(btrfs_is_fstree(btrfs_header_owner(leaf)) &&
+> +	     (key->offset < BTRFS_FIRST_FREE_OBJECTID ||
+> +	      key->offset > BTRFS_LAST_FREE_OBJECTID))) {
+> +		inode_ref_err(leaf, slot,
+> +			      "invalid offset for ref key, have %llu expect [%llu, %lld]",
+> +			      key->offset, BTRFS_FIRST_FREE_OBJECTID,
+> +			      BTRFS_LAST_FREE_OBJECTID);
+                                              ^^^^^^^^^^^^^^^^^^^^^^^^
+
+[Severity: Low]
+Does this cause a signed/unsigned type mismatch?
+
+The format string uses %lld (signed long long), but it is passed
+BTRFS_LAST_FREE_OBJECTID, which is defined as -256ULL (an unsigned long long).
+
+While this intentionally prints -256 at runtime due to 2's complement
+representation, it technically violates the format specifier's expected type.
+In builds using stricter warning flags like -Wformat-signedness (in W=1 or
+W=3), this causes a compiler warning.
+
+Could this argument be explicitly cast to (s64) to resolve the mismatch and
+match conventions used elsewhere in the Btrfs codebase?
+
+[ ... ]
+
+This is a pre-existing issue, but looking at the adjacent check_inode_extref()
+function in the same file:
+
+fs/btrfs/tree-checker.c:check_inode_extref() {
+[ ... ]
+		namelen = btrfs_inode_extref_name_len(leaf, extref);
+		if (unlikely(ptr + sizeof(*extref) + namelen > end)) {
+            ^^^^^^^^
+
+[Severity: High]
+Are we missing structural limit checks for extended references here?
+
+This checks that the length doesn't exceed the item boundary, but it omits the
+domain-specific validation (namelen == 0 or namelen > BTRFS_NAME_LEN) that is
+enforced in check_inode_ref().
+
+Could an attacker mount a crafted image containing a BTRFS_INODE_EXTREF_KEY
+with a namelen of 0 or a massive length? Bypassing these bounds could pass
+corrupted states downstream, risking kmalloc(0) (which returns ZERO_SIZE_PTR)
+or directory logic errors.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788451065.git.fdmanana@suse.com?part=2
+

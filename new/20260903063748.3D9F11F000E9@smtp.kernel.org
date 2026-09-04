@@ -1,0 +1,104 @@
+From sashiko-bot@kernel.org Thu Sep  3 08:37:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/3] btrfs: promote async checksumming out of
+ EXPERIMENTAL
+Date: Thu, 03 Sep 2026 06:37:47 +0000
+Message-Id: <20260903063748.3D9F11F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+New issues:
+- [High] The patch unconditionally enables asynchronous checksum calculation but fails to remove the corresponding `CONFIG_BTRFS_EXPERIMENTAL` guard in `should_async_write()`, resulting in a severe double-offload performance regression for non-experimental builds.
+- [Low] The `async` parameter in `btrfs_csum_one_bio()` and its synchronous code path are rendered unreachable dead code.
+
+Pre-existing issues:
+- [High] Unconditionally enabling async checksumming delegates all data checksum calculations to `system_wq`, which lacks the `WQ_MEM_RECLAIM` flag, creating a critical memory reclaim deadlock vector.
+--
+
+commit e1661733d4ef26b6cfc9f895986928e2b4322ae3
+Author: Daniel Vacek <neelx@suse.com>
+
+btrfs: promote async checksumming out of EXPERIMENTAL
+
+This commit promotes the async checksumming feature out of the experimental
+stage by removing the CONFIG_BTRFS_EXPERIMENTAL guard in btrfs_bio_csum()
+and making it the default for all builds.
+
+> diff --git a/fs/btrfs/bio.c b/fs/btrfs/bio.c
+> index 771b7d598aeee..db426ee6e5876 100644
+> --- a/fs/btrfs/bio.c
+> +++ b/fs/btrfs/bio.c
+> @@ -569,11 +569,7 @@ static int btrfs_bio_csum(struct btrfs_bio *bbio)
+>  {
+>  	if (bbio->bio.bi_opf & REQ_META)
+>  		return btree_csum_one_bio(bbio);
+> -#ifdef CONFIG_BTRFS_EXPERIMENTAL
+>  	return btrfs_csum_one_bio(bbio, true);
+
+[Severity: High]
+This isn't a bug introduced by this patch, but making this call
+unconditionally async exposes a pre-existing memory reclaim deadlock vector.
+
+By promoting the experimental feature, btrfs_bio_csum() now unconditionally
+calls btrfs_csum_one_bio() with async set to true. This function uses
+schedule_work() to offload the checksum calculations to the generic
+system_wq:
+
+fs/btrfs/file-item.c:btrfs_csum_one_bio() {
+        ...
+        INIT_WORK(&bbio->csum_work, csum_one_bio_work);
+        schedule_work(&bbio->csum_work);
+        return 0;
+}
+
+Since system_wq lacks the WQ_MEM_RECLAIM flag, if the system is under memory
+pressure and tasks on system_wq block on memory allocations, could the
+filesystem writeback path stall indefinitely waiting for csum_work?
+
+[Severity: High]
+Did this patch miss removing the CONFIG_BTRFS_EXPERIMENTAL guard in
+should_async_write()?
+
+In standard non-experimental builds, should_async_write() evaluates to true
+due to the remaining guard:
+
+fs/btrfs/bio.c:should_async_write() {
+#ifdef CONFIG_BTRFS_EXPERIMENTAL
+        return false;
+#endif
+        ...
+}
+
+This causes btrfs_submit_chunk() to defer the bio to fs_info->workers. Then,
+on the worker thread, run_one_async_start() calls btrfs_bio_csum(), which
+now unconditionally calls btrfs_csum_one_bio() with async = true, causing
+a second offload via schedule_work() to system_wq.
+
+Could this result in a severe double-offload performance regression on the
+write path for standard builds?
+
+[Severity: Low]
+Does making btrfs_bio_csum() unconditionally pass true render the
+synchronous path in btrfs_csum_one_bio() unreachable dead code?
+
+fs/btrfs/file-item.c:btrfs_csum_one_bio() {
+        ...
+        if (!async) {
+                csum_one_bio(bbio);
+                return 0;
+        }
+        ...
+}
+
+Since btrfs_bio_csum() is the sole caller of btrfs_csum_one_bio(), would
+it be cleaner to remove this unused synchronous execution branch?
+
+> -#else
+> -	return btrfs_csum_one_bio(bbio, false);
+> -#endif
+>  }
+>
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260903062317.3928665-1-neelx@suse.com?part=3
+

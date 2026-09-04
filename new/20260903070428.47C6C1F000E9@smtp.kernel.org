@@ -1,0 +1,101 @@
+From sashiko-bot@kernel.org Thu Sep  3 09:04:38 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: implement a new incompat feature, raid56_vsl
+Date: Thu, 03 Sep 2026 07:04:27 +0000
+Message-Id: <20260903070428.47C6C1F000E9@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Critical] Missing upper bound validation on the new `data_size` superblock field allows maliciously large values, causing critical integer overflows in `calc_block_max_order()` and direct I/O.
+- [Medium] The new `data_size` field in the UAPI `struct btrfs_super_block` is incorrectly defined as `__u32` instead of `__le32`.
+- [Medium] The patch fails to disable or reject LZO compression and Mixed Block Groups when `RAID56_VSL` is enabled, contradicting the commit message claims and breaking fundamental invariants.
+--
+
+commit a2dfc112db956462bec4c1893ddb58dde5a55a7a
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: implement a new incompat feature, raid56_vsl
+
+This patch implements the data size portion of a new RAID56 Variable Stripe
+Length (VSL) feature, which forces data reads and writes to follow a data
+size specified in the superblock. It also introduces the new data_size field
+in the btrfs_super_block and incorporates initial incompat checks.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index a7bda164593fa..902e5e137a336 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+[ ... ]
+> @@ -2526,6 +2526,16 @@ int btrfs_validate_super(const struct btrfs_fs_info *fs_info,
+>  		ret = -EINVAL;
+>  	}
+>  
+> +	if (btrfs_fs_incompat(fs_info, RAID56_VSL)) {
+> +		const u32 data_size = btrfs_super_data_size(sb);
+> +
+> +		if (unlikely(!is_power_of_2(data_size) || data_size <= sectorsize)) {
+> +			btrfs_err(fs_info,
+> +		"invalid data size, has %u expect power of 2 values larger than %u",
+> +				  data_size, sectorsize);
+> +			ret = -EINVAL;
+> +		}
+
+[Severity: Critical]
+Is an upper bound check for data_size missing here?
+
+Without an upper bound, a maliciously crafted filesystem could set data_size
+to an extremely large power of two. This unbounded datasize then flows into
+block order calculations and direct I/O logic.
+
+For instance, in calc_block_max_order(), the bitwise left shift could
+overflow a 32-bit signed integer if datasize_bits is excessively large:
+
+	max_size = min(BTRFS_MAX_BLOCKS_PER_FOLIO << datasize_bits,
+		       BTRFS_MAX_FOLIO_SIZE);
+
+Furthermore, an unbounded data_size can cause 32-bit overflows in direct I/O
+paths such as btrfs_dio_iomap_begin() when multiplying datasize * BIO_MAX_VECS,
+which could wrap the len variable to 0 and corrupt the extent lock range.
+
+[Severity: Medium]
+Should there be explicit checks in this function to reject LZO compression and
+Mixed Block Groups when RAID56_VSL is enabled?
+
+The commit message states that LZO compression and mixed block groups are
+incompatible and will cause data read errors or mount failures. 
+
+However, there is no validation here to actively reject BTRFS_COMPRESS_LZO
+if this incompat feature is present.
+
+Similarly, if a user specifically sets nodesize to match datasize at mkfs time,
+the mount could succeed with mixed block groups despite RAID56_VSL being
+enabled.
+
+> diff --git a/include/uapi/linux/btrfs_tree.h b/include/uapi/linux/btrfs_tree.h
+> index b6ccaf848e4b3..e601417eec6df 100644
+> --- a/include/uapi/linux/btrfs_tree.h
+> +++ b/include/uapi/linux/btrfs_tree.h
+[ ... ]
+> @@ -724,9 +724,10 @@ struct btrfs_super_block {
+>  	__le64 remap_root;
+>  	__le64 remap_root_generation;
+>  	__u8 remap_root_level;
+> +	__u32 data_size;
+
+[Severity: Medium]
+Should data_size be defined as __le32 instead of __u32?
+
+This is a UAPI structure exposed to userspace, and the field is accessed in
+the kernel via get_unaligned_le32, meaning it is stored as little-endian
+on disk.
+
+Defining it as __u32 will cause userspace tools on big-endian architectures to
+interpret the on-disk value incorrectly.
+
+>  
+>  	/* Future expansion */
+> -	__u8 reserved[199];
+> +	__u8 reserved[195];
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788417288.git.wqu@suse.com?part=2
+

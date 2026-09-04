@@ -1,0 +1,56 @@
+From sashiko-bot@kernel.org Thu Sep  3 17:52:07 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/3] btrfs: tree-checker: validate key offset for inode
+ ref keys
+Date: Thu, 03 Sep 2026 15:51:56 +0000
+Message-Id: <20260903155157.4912B1F00A3D@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Misplaced parenthesis in `btrfs_is_fstree` call causes the new inode reference offset bounds check to always evaluate to false, rendering the validation completely ineffective.
+--
+
+commit f53ecd7e7d137877df0dfe64603e6a5aad2861a7
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: tree-checker: validate key offset for inode ref keys
+
+This commit introduces a check in check_inode_ref() to validate that the
+offset of an inode ref key in a subvolume tree falls within the accepted
+free objectid range.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 622334ffd2401..3a83f44c8a770 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -1951,6 +1951,16 @@ static int check_inode_ref(struct extent_buffer *leaf,
+>  		return -EUCLEAN;
+>  	}
+>  
+> +	if (unlikely(btrfs_is_fstree(btrfs_header_owner(leaf) &&
+> +	     (key->offset < BTRFS_FIRST_FREE_OBJECTID ||
+> +	      key->offset > BTRFS_LAST_FREE_OBJECTID)))) {
+
+[Severity: High]
+Does this misplaced parenthesis cause the validation check to always evaluate
+to false?
+
+In check_inode_ref() within fs/btrfs/tree-checker.c, the entire logical
+expression is passed as the rootid argument to btrfs_is_fstree() rather
+than just btrfs_header_owner(leaf).
+
+Because the boolean result of the logical expression evaluates to 0 or 1,
+and BTRFS_FIRST_FREE_OBJECTID is 256, btrfs_is_fstree() will unconditionally
+return false. This completely bypasses the new validation logic.
+
+> +		inode_ref_err(leaf, slot,
+> +			      "invalid offset for ref key, have %llu expect [%llu, %lld]",
+> +			      key->offset, BTRFS_FIRST_FREE_OBJECTID,
+> +			      BTRFS_LAST_FREE_OBJECTID);
+> +		return -EUCLEAN;
+> +	}
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788449622.git.fdmanana@suse.com?part=2
+

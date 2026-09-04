@@ -1,0 +1,104 @@
+From sashiko-bot@kernel.org Thu Sep  3 18:07:19 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/3] btrfs: tree-checker: validate parent field for
+ inode extref items
+Date: Thu, 03 Sep 2026 16:07:09 +0000
+Message-Id: <20260903160709.849B11F00A3F@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Misplaced parenthesis in `check_inode_ref` causes `btrfs_is_fstree` to evaluate a boolean expression, bypassing validation entirely.
+
+Pre-existing issues:
+- [High] Missing bounds validation for `namelen` in `check_inode_extref`.
+--
+
+commit 104edef3d49f1abebee7f52239ad118b9254c36a
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: tree-checker: validate parent field for inode extref items
+
+For a subvolume tree, the parent field of an inode extref item corresponds
+to an inode number, and that must always be within the range:
+
+   [ BTRFS_FIRST_FREE_OBJECTID (256), BTRFS_LAST_FREE_OBJECTID (-256) ]
+
+Add a check for that in check_inode_extref().
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 3a83f44c8a770..344b2730c553b 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -2004,12 +2004,14 @@ static int check_inode_extref(struct extent_buffer *leaf,
+>  {
+>  	unsigned long ptr = btrfs_item_ptr_offset(leaf, slot);
+>  	unsigned long end = ptr + btrfs_item_size(leaf, slot);
+> +	const bool is_fstree = btrfs_is_fstree(btrfs_header_owner(leaf));
+>  
+>  	if (unlikely(!check_prev_ino(leaf, key, slot, prev_key)))
+>  		return -EUCLEAN;
+>  
+>  	while (ptr < end) {
+>  		struct btrfs_inode_extref *extref = (struct btrfs_inode_extref *)ptr;
+> +		u64 parent;
+>  		u16 namelen;
+>  
+>  		if (unlikely(ptr + sizeof(*extref) > end)) {
+> @@ -2019,6 +2021,16 @@ static int check_inode_extref(struct extent_buffer *leaf,
+>  			return -EUCLEAN;
+>  		}
+>  
+> +		parent = btrfs_inode_extref_parent(leaf, extref);
+> +		if (unlikely(is_fstree && (parent < BTRFS_FIRST_FREE_OBJECTID ||
+> +					   parent > BTRFS_LAST_FREE_OBJECTID))) {
+> +			inode_ref_err(leaf, slot,
+> +		      "invalid parent for extref key, have %llu expect [%llu, %lld]",
+> +			      parent, BTRFS_FIRST_FREE_OBJECTID,
+> +				      BTRFS_LAST_FREE_OBJECTID);
+> +			return -EUCLEAN;
+> +		}
+> +
+>  		namelen = btrfs_inode_extref_name_len(leaf, extref);
+>  		if (unlikely(ptr + sizeof(*extref) + namelen > end)) {
+
+[Severity: High]
+This is a pre-existing issue, but I noticed a missing bounds validation for
+namelen in check_inode_extref().
+
+Does this code fail to prevent malformed inode extrefs with namelen == 0 or
+namelen > BTRFS_NAME_LEN?
+
+If namelen is 0, subsequent reads might return a ZERO_SIZE_PTR (e.g., in
+read_alloc_one_name), leading to kernel crashes upon dereference. If namelen
+exceeds 255, it can overflow fixed-size structures.
+
+>  			inode_ref_err(leaf, slot,
+>  				"inode extref overflow, ptr %lu end %lu namelen %u",
+>  				ptr, end, namelen);
+>  			return -EUCLEAN;
+>  		}
+
+[Severity: High]
+Is there a misplaced parenthesis in check_inode_ref() that causes
+btrfs_is_fstree() to evaluate a boolean expression?
+
+Does this code short-circuit the offset validation entirely?
+
+fs/btrfs/tree-checker.c:check_inode_ref() {
+    ...
+	if (unlikely(btrfs_is_fstree(btrfs_header_owner(leaf) &&
+	     (key->offset < BTRFS_FIRST_FREE_OBJECTID ||
+	      key->offset > BTRFS_LAST_FREE_OBJECTID)))) {
+		inode_ref_err(leaf, slot,
+			      "invalid offset for ref key, have %llu expect [%llu, %lld]",
+    ...
+}
+
+Because btrfs_is_fstree() receives the result of the && expression (0 or 1,
+both less than BTRFS_FIRST_FREE_OBJECTID), it appears to always return false,
+bypassing the validation check for malformed filesystem images.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788449622.git.fdmanana@suse.com?part=3
+

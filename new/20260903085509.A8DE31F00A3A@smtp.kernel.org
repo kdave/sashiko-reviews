@@ -1,0 +1,84 @@
+From sashiko-bot@kernel.org Thu Sep  3 10:55:20 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: move async csum generation out of experimental
+ features
+Date: Thu, 03 Sep 2026 08:55:09 +0000
+Message-Id: <20260903085509.A8DE31F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Memory reclaim deadlock due to offloading writeback checksum calculation to a workqueue lacking WQ_MEM_RECLAIM.
+--
+
+commit b6ade0396b635e0d1273c0fe98e0faa31ea9b34f
+Author: Qu Wenruo <wqu@suse.com>
+
+    btrfs: move async csum generation out of experimental features
+    
+    Commit dd57c78aec39 ("btrfs: introduce btrfs_bio::async_csum")
+    introduced asynchronous data checksum generation for data writes.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index a1d83ad9a4c00..0046f3cb75a11 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -1968,9 +1967,6 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
+>  	unsigned int flags = WQ_MEM_RECLAIM | WQ_FREEZABLE | WQ_UNBOUND;
+>  	unsigned int ordered_flags = WQ_MEM_RECLAIM | WQ_FREEZABLE;
+>  
+> -	fs_info->workers =
+> -		btrfs_alloc_workqueue(fs_info, "worker", flags, max_active, 16);
+> -
+
+[Severity: Critical]
+By removing the fs_info->workers workqueue, do we lose the WQ_MEM_RECLAIM
+forward progress guarantee for async write submission?
+
+[ ... ]
+
+> diff --git a/fs/btrfs/file-item.c b/fs/btrfs/file-item.c
+> index 0fed4e0d32d54..7dbd9b8eec11b 100644
+> --- a/fs/btrfs/file-item.c
+> +++ b/fs/btrfs/file-item.c
+> @@ -825,7 +825,7 @@ static void csum_one_bio_work(struct work_struct *work)
+>  /*
+>   * Calculate checksums of the data contained inside a bio.
+>   */
+> -int btrfs_csum_one_bio(struct btrfs_bio *bbio, bool async)
+> +int btrfs_csum_one_bio(struct btrfs_bio *bbio)
+>  {
+>  	struct btrfs_ordered_extent *ordered = bbio->ordered;
+>  	struct btrfs_inode *inode = bbio->inode;
+> @@ -849,10 +849,6 @@ int btrfs_csum_one_bio(struct btrfs_bio *bbio, bool async)
+>  	btrfs_add_ordered_sum(ordered, sums);
+>  
+>  	bbio->csum_saved_iter = bio->bi_iter;
+> -	if (!async) {
+> -		csum_one_bio(bbio);
+> -		return 0;
+> -	}
+>  	bio_inc_remaining(bio);
+>  	INIT_WORK(&bbio->csum_work, csum_one_bio_work);
+>  	schedule_work(&bbio->csum_work);
+
+[Severity: Critical]
+Does this code create a memory reclaim deadlock?
+
+During memory pressure, kswapd or direct reclaim can initiate data writeback.
+In btrfs_submit_chunk(), btrfs_csum_one_bio() is called to compute data
+checksums. This function increments the bio's remaining count and offloads
+the checksum computation to system_percpu_wq via schedule_work(). The bio's
+writeback completion is delayed until this work item finishes.
+
+Because system_percpu_wq lacks the WQ_MEM_RECLAIM flag, it has no rescuer
+thread. If all workers in the pool are blocked waiting for memory and
+kthread_create() cannot allocate memory to spawn new workers, csum_work will
+never execute. This permanently stalls the writeback bio, preventing
+PG_writeback from being cleared, which permanently blocks direct reclaim and
+deadlocks the system.
+
+Now that the safe fs_info->workers workqueue has been removed, the
+schedule_work() path is the default. Could this lead to a system-wide freeze?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/700ba6c46da86ace18a502b43c5e61d16a556060.1788424754.git.wqu@suse.com?part=1
+
