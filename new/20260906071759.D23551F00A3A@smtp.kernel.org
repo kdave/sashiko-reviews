@@ -1,0 +1,121 @@
+From sashiko-bot@kernel.org Sun Sep  6 09:18:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/2] btrfs: introduce more accurate usebackuproot
+ options
+Date: Sun, 06 Sep 2026 07:17:59 +0000
+Message-Id: <20260906071759.D23551F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] The legacy rescue options `rescue=usebackuproot` and `rescue=all` now unconditionally force loading an older backup root (slot 1) and skip the main roots entirely, breaking the fallback semantics and causing silent data loss of the most recent transaction.
+- [Medium] `rescue=usebackuproot_0` fails the mount with `-EINVAL` if the backup roots are corrupted, despite its intent to use the main superblock.
+--
+
+commit 5b208e35adfade1c87882eea1e75eb230cb1efad
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce more accurate usebackuproot options
+
+This patch introduces finer control over the usebackuproot rescue option
+by adding rescue=usebackuproot_0, 1, 2, and 3. This allows users to choose
+which specific backup slot to use, with 0 meaning the newest slot.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 422fda467440c..406c46d1fba1c 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -2713,10 +2713,14 @@ static int __cold init_tree_roots(struct btrfs_fs_info *fs_info)
+>  	int ret = 0;
+>  
+>  	if (use_backup) {
+> -		ret = read_backup_root(fs_info, 1);
+> +		ASSERT(fs_info->use_backup_slot >= 0 &&
+> +		       fs_info->use_backup_slot < BTRFS_NUM_BACKUP_ROOTS);
+> +
+> +		ret = read_backup_root(fs_info, fs_info->use_backup_slot);
+>  		if (ret < 0) {
+>  			btrfs_err(fs_info,
+> -				  "failed to load backup roots at slot %d", 1);
+> +				  "failed to load backup roots at slot %d",
+> +				  fs_info->use_backup_slot);
+>  			return ret;
+>  		}
+
+[Severity: Medium]
+Will rescue=usebackuproot_0 fail the mount with -EINVAL if the backup roots are
+corrupted, despite its intent to use the main superblock?
+
+While usebackuproot_0 is intended to use the primary roots ('no need to load any
+backup root'), it still triggers read_backup_root(fs_info, 0) here. 
+
+If find_newest_super_backup() returns a negative value due to corrupted backup
+roots:
+
+fs/btrfs/disk-io.c:read_backup_root() {
+    ...
+    if (priority < BTRFS_NUM_BACKUP_ROOTS && backup_index >= 0) {
+        if (priority == 0)
+            return backup_index;
+        ...
+    } else {
+        return -EINVAL;
+    }
+}
+
+read_backup_root() returns -EINVAL, which causes init_tree_roots() to abort the
+mount here. A normal mount ignores a corrupted backup array and succeeds.
+
+[ ... ]
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index 464129b1b0d4c..b5c1ff357aaf5 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -588,6 +597,14 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+>  		switch (result.uint_32) {
+>  		case Opt_rescue_usebackuproot:
+>  			btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+> +			ctx->use_backup_slot = 1;
+> +			break;
+
+[Severity: Critical]
+Does this unconditionally force loading an older backup root (slot 1) and skip
+the main roots entirely, breaking the fallback semantics and causing silent
+data loss of the most recent transaction?
+
+In the legacy implementation, the kernel would try the primary roots first and
+only fall back to backup roots if loading failed. The new code in this patch
+series removes the loop and unconditionally calls read_backup_root() in
+init_tree_roots() when these options are used. This overwrites the superblock
+roots in memory with the previous transaction's roots, discarding the latest
+transaction even if it is completely healthy.
+
+Administrators using a standard rescue command like rescue=all or
+rescue=usebackuproot will silently lose the latest transaction.
+
+> +		case Opt_rescue_usebackup_slot_0:
+> +		case Opt_rescue_usebackup_slot_1:
+> +		case Opt_rescue_usebackup_slot_2:
+> +		case Opt_rescue_usebackup_slot_3:
+> +			btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+> +			ctx->use_backup_slot = result.uint_32 - Opt_rescue_usebackup_slot_0;
+>  			break;
+>  		case Opt_rescue_nologreplay:
+>  			btrfs_set_opt(ctx->mount_opt, NOLOGREPLAY);
+[ ... ]
+> @@ -611,6 +628,7 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+>  			btrfs_set_opt(ctx->mount_opt, IGNOREBADROOTS);
+>  			btrfs_set_opt(ctx->mount_opt, NOLOGREPLAY);
+>  			btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+> +			ctx->use_backup_slot = 1;
+>  			break;
+
+[Severity: Critical]
+Similarly, does setting ctx->use_backup_slot = 1 for rescue=all unconditionally
+force loading an older backup root (slot 1) and skip the main roots entirely?
+
+Administrators using a standard rescue command like rescue=all will silently
+lose the latest transaction, even if it is completely healthy.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788678078.git.wqu@suse.com?part=2
+

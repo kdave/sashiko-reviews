@@ -1,0 +1,143 @@
+From sashiko-bot@kernel.org Sun Sep  6 07:36:04 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: introduce more accurate usebackuproot
+ options
+Date: Sun, 06 Sep 2026 05:35:53 +0000
+Message-Id: <20260906053553.B04971F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] The `rescue=all` mount option sets the `USEBACKUPROOT` flag but fails to initialize `ctx->use_backup_slot`, leaving it at `-1`, which causes an assertion failure or mount failure.
+- [High] The `rescue=usebackuproot_0` option behaves as a silent no-op because `read_backup_root()` has an early return for `priority == 0`, completely ignoring the requested backup root.
+- [Medium] `btrfs_show_options` unconditionally prints `rescue=usebackuproot` even when a different backup slot was selected, breaking mount option tracking and remounting behavior.
+--
+
+commit 0c641a4f1e2fc077b5cc5b7ed86078d3f007b1c1
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce more accurate usebackuproot options
+    
+Previously we had no way to tell btrfs to use which backup slot, but
+always use the newest backup, and retry until all backup roots are
+exhausted.
+
+This doesn't give any control to the end user, even if the end user
+wants to use a specific backup slot.
+
+To address this problem, allow more fine-control on usebackuproot rescue
+option by introducing the following 4 rescue mount options:
+
+- rescue=usebackuproot_0
+- rescue=usebackuproot_1
+- rescue=usebackuproot_2
+- rescue=usebackuproot_3
+
+The number 0 means the newest backup slot, 1/2/3 means the
+second/third/fourth(oldest) backup slot to use.
+
+The existing "rescue=usebackuproot" is just an alias of
+"rescue=usebackuproot_1".
+
+This will allow users to choose which backup root to use.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 422fda467440c..406c46d1fba1c 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -2713,10 +2713,14 @@ static int __cold init_tree_roots(struct btrfs_fs_info *fs_info)
+>  	int ret = 0;
+>  
+>  	if (use_backup) {
+> -		ret = read_backup_root(fs_info, 1);
+> +		ASSERT(fs_info->use_backup_slot >= 0 &&
+> +		       fs_info->use_backup_slot < BTRFS_NUM_BACKUP_ROOTS);
+> +
+> +		ret = read_backup_root(fs_info, fs_info->use_backup_slot);
+
+[Severity: High]
+Does rescue=all cause a crash or mount failure here?
+
+When rescue=all is processed in btrfs_parse_param(), it sets USEBACKUPROOT but
+does not initialize ctx->use_backup_slot:
+
+fs/btrfs/super.c:btrfs_parse_param() {
+...
+        case Opt_rescue_parameter_all:
+            btrfs_set_opt(ctx->mount_opt, IGNOREDATACSUMS);
+            ...
+            btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+            break;
+...
+}
+
+Since fs_info->use_backup_slot remains -1, this will trigger the ASSERT above
+or cause read_backup_root() to fail with -EINVAL when -1 is cast to u8.
+
+[Severity: High]
+Does rescue=usebackuproot_0 silently fail to load the backup root?
+
+When fs_info->use_backup_slot is 0, read_backup_root() returns early without
+copying the backup metadata:
+
+fs/btrfs/disk-io.c:read_backup_root() {
+...
+    if (priority < BTRFS_NUM_BACKUP_ROOTS && backup_index >= 0) {
+        if (priority == 0)
+            return backup_index;
+...
+}
+
+This skips copying the backup root metadata into the working super_copy,
+causing the filesystem to mount using the main superblock roots instead of
+the requested backup.
+
+>  		if (ret < 0) {
+>  			btrfs_err(fs_info,
+> -				  "failed to load backup roots at slot %d", 1);
+> +				  "failed to load backup roots at slot %d",
+> +				  fs_info->use_backup_slot);
+>  			return ret;
+>  		}
+
+[ ... ]
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index 464129b1b0d4c..a9c95cb2ed5cf 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+> @@ -587,8 +596,16 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+>  	case Opt_rescue:
+>  		switch (result.uint_32) {
+>  		case Opt_rescue_usebackuproot:
+> +			ctx->use_backup_slot = 1;
+>  			btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+>  			break;
+> +		case Opt_rescue_usebackup_slot_0:
+> +		case Opt_rescue_usebackup_slot_1:
+> +		case Opt_rescue_usebackup_slot_2:
+> +		case Opt_rescue_usebackup_slot_3:
+> +			btrfs_set_opt(ctx->mount_opt, USEBACKUPROOT);
+> +			ctx->use_backup_slot = result.uint_32 - Opt_rescue_usebackup_slot_0;
+> +			break;
+
+[Severity: Medium]
+Will this specific slot selection be lost during remounts or when checking
+mount options?
+
+Currently, btrfs_show_options() unconditionally prints the rescue=usebackuproot
+alias for any set USEBACKUPROOT flag:
+
+fs/btrfs/super.c:btrfs_show_options() {
+...
+    if (btrfs_test_opt(info, USEBACKUPROOT))
+        print_rescue_option(seq, "usebackuproot", &printed);
+...
+}
+
+This means if a user mounts with rescue=usebackuproot_2, /proc/mounts will
+display rescue=usebackuproot (which strictly maps to slot 1). Tools parsing
+this or performing remounts will mistakenly inherit the default alias behavior
+instead of the actually selected slot.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788671975.git.wqu@suse.com?part=2
+

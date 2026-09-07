@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Fri Sep  4 19:03:53 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zstd: avoid a copy in zstd_decompress_bio()
+Date: Fri, 04 Sep 2026 17:03:43 +0000
+Message-Id: <20260904170343.93AEF1F00A3E@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Pre-existing bug: Stale workspace pointer causes NULL pointer dereference and invalid kunmap_local on early failure.
+--
+
+commit c7064b3b7debf33df5f469dc2219870b94212f06
+Author: Usama Arif <usama.arif@linux.dev>
+
+btrfs: zstd: avoid a copy in zstd_decompress_bio()
+
+zstd_decompress_bio() gives zstd a sectorsize-sized scratch buffer, and
+btrfs_decompress_buf2page() then copies the part overlapping the read bio
+into the destination folios. Every delivered byte is written twice.
+This patch replaces it by writing directly to the page cache by kmapping
+the read bio segments.
+
+> diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+> index 86919293fd546..c5aece6be6093 100644
+> --- a/fs/btrfs/zstd.c
+> +++ b/fs/btrfs/zstd.c
+
+[ ... ]
+
+> @@ -634,14 +682,9 @@ int zstd_decompress_bio(struct list_head *ws, struct compressed_bio *cb)
+>  			ret = -EIO;
+>  			goto done;
+>  		}
+
+[Severity: High]
+This is a pre-existing issue, but can this lead to a kernel panic from a
+stale workspace pointer being dereferenced?
+
+When a ZSTD workspace is used for a compression or decompression operation
+and completes successfully, workspace->in_buf.src is assigned a mapped
+address. At the end of the operation, the address is unmapped, but
+workspace->in_buf.src is never set to NULL before the workspace is returned
+to the pool.
+
+If the same workspace is subsequently allocated for zstd_compress_bio(), the
+local variable in_folio is initialized to NULL. If the very first operation,
+btrfs_compress_filemap_get_folio(), fails (e.g., -ENOMEM or -ENOENT):
+
+fs/btrfs/zstd.c:zstd_compress_bio() {
+    ...
+	/* Map in the first page of input data. */
+	ret = btrfs_compress_filemap_get_folio(mapping, start, &in_folio);
+	if (ret < 0)
+		goto out;
+    ...
+out:
+	if (out_folio)
+		btrfs_free_compr_folio(out_folio);
+	if (workspace->in_buf.src) {
+		kunmap_local(workspace->in_buf.src);
+		folio_put(in_folio);
+	}
+	return ret;
+}
+
+The cleanup code checks if (workspace->in_buf.src). Since it holds the stale,
+non-NULL pointer, the condition evaluates to true. The kernel calls
+kunmap_local() on the stale pointer and folio_put(in_folio) where in_folio
+is NULL, causing an immediate crash.
+
+The same failure to clear workspace->in_buf.src is present in the "done:"
+path of zstd_decompress_bio().
+
+Should workspace->in_buf.src be cleared after it is unmapped?
+
+> -		buf_start = total_out;
+>  		total_out += workspace->out_buf.pos;
+> -		workspace->out_buf.pos = 0;
+> -
+> -		ret = btrfs_decompress_buf2page(workspace->out_buf.dst,
+> -				total_out - buf_start, cb, buf_start);
+> -		if (ret == 0)
+> -			break;
+> +		if (kaddr)
+> +			bio_advance(orig_bio, workspace->out_buf.pos);
+>  
+>  		if (workspace->in_buf.pos >= srclen)
+>  			break;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260904164148.2664280-1-usama.arif@linux.dev?part=1
+

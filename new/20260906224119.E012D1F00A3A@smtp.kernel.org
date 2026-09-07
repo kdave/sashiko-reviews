@@ -1,0 +1,87 @@
+From sashiko-bot@kernel.org Mon Sep  7 00:41:30 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 09/10] btrfs: convert struct btrfs_io_ctl to use folios
+Date: Sun, 06 Sep 2026 22:41:19 +0000
+Message-Id: <20260906224119.E012D1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Missing bounds validation on the read path allows malicious free space cache inodes to trigger a massive out-of-bounds read and kernel panic.
+--
+
+commit 075852a7a25704137083e8019c9bb413c9a94030
+Author: Tal Zussman <tz2294@columbia.edu>
+
+btrfs: convert struct btrfs_io_ctl to use folios
+
+This commit updates struct btrfs_io_ctl to use folios rather than pages.
+It replaces page APIs with folio APIs for memory mapping and management
+operations, removing old page-based calls.
+
+> diff --git a/fs/btrfs/free-space-cache.c b/fs/btrfs/free-space-cache.c
+> index e2af75a205ea5..ab933ee6f19c4 100644
+> --- a/fs/btrfs/free-space-cache.c
+> +++ b/fs/btrfs/free-space-cache.c
+> @@ -378,21 +378,21 @@ static void readahead_cache(struct inode *inode)
+>  static int io_ctl_init(struct btrfs_io_ctl *io_ctl, struct inode *inode,
+>  		       int write)
+>  {
+> -	int num_pages;
+> +	int num_folios;
+>  
+> -	num_pages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+> +	num_folios = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+>  
+>  	/* Make sure we can fit our crcs and generation into the first page */
+> -	if (write && (num_pages * sizeof(u32) + sizeof(u64)) > PAGE_SIZE)
+> +	if (write && (num_folios * sizeof(u32) + sizeof(u64)) > PAGE_SIZE)
+>  		return -ENOSPC;
+
+[Severity: Critical]
+This isn't a bug introduced by this patch, but does this bounds check leave
+the read path vulnerable to a malicious filesystem image?
+
+If write is 0 during mounting or loading, the bounds check for the number
+of folios is entirely bypassed. A maliciously crafted free space cache inode
+could provide an arbitrarily large i_size, resulting in a massive num_folios
+value that will be propagated into the read path.
+
+[ ... ]
+
+> @@ -551,13 +551,13 @@ static int io_ctl_check_crc(struct btrfs_io_ctl *io_ctl, int index)
+>  	u32 crc = ~(u32)0;
+>  	unsigned offset = 0;
+>  
+> -	if (index >= io_ctl->num_pages)
+> +	if (index >= io_ctl->num_folios)
+>  		return -EIO;
+>  
+>  	if (index == 0)
+> -		offset = sizeof(u32) * io_ctl->num_pages;
+> +		offset = sizeof(u32) * io_ctl->num_folios;
+>  
+> -	tmp = page_address(io_ctl->pages[0]);
+> +	tmp = folio_address(io_ctl->folios[0]);
+>  	tmp += index;
+>  	val = *tmp;
+
+[Severity: Critical]
+This is also a pre-existing issue, but can this offset calculation cause
+an integer underflow in the crc check?
+
+If the free space cache inode was maliciously sized and bypassed the bounds
+check in io_ctl_init(), offset will exceed PAGE_SIZE here.
+
+Later in io_ctl_check_crc(), this unchecked offset is used in a subtraction
+for the length parameter:
+
+    crc = crc32c(crc, io_ctl->orig + offset, PAGE_SIZE - offset);
+
+Because offset is larger than PAGE_SIZE, PAGE_SIZE - offset underflows into
+a massive unsigned size_t. This would cause crc32c() to read out of bounds
+until a page fault panics the system.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260906-btrfs-folio-conversions-v1-0-834b9d7b06f5@columbia.edu?part=9
+

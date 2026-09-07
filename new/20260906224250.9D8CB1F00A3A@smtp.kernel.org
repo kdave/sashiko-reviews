@@ -1,0 +1,135 @@
+From sashiko-bot@kernel.org Mon Sep  7 00:43:01 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 10/10] btrfs: rename io_ctl page helpers to folio
+ helpers
+Date: Sun, 06 Sep 2026 22:42:50 +0000
+Message-Id: <20260906224250.9D8CB1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Folio conversion retains page-based indexing (`i++`), causing self-deadlocks and double-unlocks with large folios.
+
+Pre-existing issues:
+- [High] Integer underflow in bounds checks on the read path allows massive out-of-bounds reads via crc32c.
+--
+
+commit 3ce530507fdd6f194bfb9a037d0d2cfdfe01573b
+Author: Tal Zussman <tz2294@columbia.edu>
+
+btrfs: rename io_ctl page helpers to folio helpers
+
+These functions now operate on folios. Rename them and update comments
+accordingly.
+
+> diff --git a/fs/btrfs/free-space-cache.c b/fs/btrfs/free-space-cache.c
+> index ab933ee6f19c4..73cfc1d1a5c1a 100644
+> --- a/fs/btrfs/free-space-cache.c
+> +++ b/fs/btrfs/free-space-cache.c
+
+[ ... ]
+
+> @@ -414,7 +414,7 @@ static void io_ctl_unmap_page(struct btrfs_io_ctl *io_ctl)
+>  	}
+>  }
+>  
+> -static void io_ctl_map_page(struct btrfs_io_ctl *io_ctl, int clear)
+> +static void io_ctl_map_folio(struct btrfs_io_ctl *io_ctl, int clear)
+>  {
+>  	ASSERT(io_ctl->index < io_ctl->num_folios);
+>  	io_ctl->folio = io_ctl->folios[io_ctl->index++];
+
+[Severity: High]
+Does this code handle subpage offsets correctly for large folios? 
+
+When mapping the folio, the base address is calculated without adding the
+subpage offset. If a large folio is used, could this repeatedly overwrite the
+first page of the folio?
+
+> @@ -425,11 +425,11 @@ static void io_ctl_map_page(struct btrfs_io_ctl *io_ctl, int clear)
+>  		clear_page(io_ctl->cur);
+>  }
+>  
+> -static void io_ctl_drop_pages(struct btrfs_io_ctl *io_ctl)
+> +static void io_ctl_drop_folios(struct btrfs_io_ctl *io_ctl)
+>  {
+>  	int i;
+>  
+> -	io_ctl_unmap_page(io_ctl);
+> +	io_ctl_unmap_folio(io_ctl);
+>  
+>  	for (i = 0; i < io_ctl->num_folios; i++) {
+>  		if (io_ctl->folios[i]) {
+
+[Severity: High]
+Can this array contain duplicate large folio pointers? 
+
+If the mapping uses large folios, the same folio might be stored at multiple 
+indices in io_ctl->folios. Since io_ctl_drop_folios() unconditionally calls
+folio_unlock() and folio_put() on every pointer, could this cause 
+double-unlocks and use-after-free conditions on the same folio?
+
+> @@ -439,7 +439,7 @@ static void io_ctl_drop_pages(struct btrfs_io_ctl *io_ctl)
+>  	}
+>  }
+>  
+> -static int io_ctl_prepare_pages(struct btrfs_io_ctl *io_ctl, bool uptodate)
+> +static int io_ctl_prepare_folios(struct btrfs_io_ctl *io_ctl, bool uptodate)
+>  {
+>  	struct folio *folio;
+>  	struct inode *inode = io_ctl->inode;
+> @@ -453,7 +453,7 @@ static int io_ctl_prepare_pages(struct btrfs_io_ctl *io_ctl, bool uptodate)
+>  					    FGP_LOCK | FGP_ACCESSED | FGP_CREAT,
+>  					    mask);
+>  		if (IS_ERR(folio)) {
+> -			io_ctl_drop_pages(io_ctl);
+> +			io_ctl_drop_folios(io_ctl);
+>  			return PTR_ERR(folio);
+>  		}
+
+[Severity: High]
+Is it possible for this loop to self-deadlock when encountering large folios?
+
+The code iterates over page indices, fetching and locking folios using:
+    __filemap_get_folio(..., i, FGP_LOCK | ...)
+
+If the mapping contains a large folio, the next iteration will find the exact 
+same large folio and attempt to lock it again. Because the thread already
+holds the lock from the earlier iteration, won't this result in an immediate
+deadlock?
+
+[ ... ]
+
+> @@ -561,13 +561,13 @@ static int io_ctl_check_crc(struct btrfs_io_ctl *io_ctl, int index)
+>  	tmp += index;
+>  	val = *tmp;
+>  
+> -	io_ctl_map_page(io_ctl, 0);
+> +	io_ctl_map_folio(io_ctl, 0);
+>  	crc = crc32c(crc, io_ctl->orig + offset, PAGE_SIZE - offset);
+
+[Severity: High]
+This is a pre-existing issue, but could this integer math underflow and read
+massive amounts of unmapped memory?
+
+In io_ctl_init(), the bounds check on num_folios is skipped on the read path
+when write == 0:
+
+    if (write && (num_folios * sizeof(u32) + sizeof(u64)) > PAGE_SIZE)
+        return -ENOSPC;
+
+If a maliciously crafted image provides a very large i_size, num_folios can be
+huge. When io_ctl_check_crc() is called for index == 0, offset is calculated
+as sizeof(u32) * io_ctl->num_folios. 
+
+If this offset is greater than PAGE_SIZE, the PAGE_SIZE - offset calculation
+will underflow into a massive size_t value passed to crc32c(). Could this 
+cause an out-of-bounds read and an immediate kernel panic?
+
+>  	btrfs_crc32c_final(crc, (u8 *)&crc);
+>  	if (val != crc) {
+>  		btrfs_err_rl(io_ctl->fs_info,
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260906-btrfs-folio-conversions-v1-0-834b9d7b06f5@columbia.edu?part=10
+
