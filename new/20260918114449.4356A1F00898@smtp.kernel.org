@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:44:59 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 21/21] xfs: enable ro-compat fs-verity flag
+Date: Fri, 18 Sep 2026 11:44:48 +0000
+Message-Id: <20260918114449.4356A1F00898@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] xfs: fsverity enablement failure bricks inode due to un-cleared XFS_DIFLAG2_VERITY
+--
+
+commit 3c41daf7bf4b1b9da289ed99189425637499f418
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: enable ro-compat fs-verity flag
+
+Finalize fs-verity integration in XFS by making kernel fs-verity
+aware with ro-compat flag.
+
+> diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+> index f728e7d1eb325..7190fb069d1a8 100644
+> --- a/fs/xfs/libxfs/xfs_format.h
+> +++ b/fs/xfs/libxfs/xfs_format.h
+> @@ -378,8 +378,9 @@ xfs_sb_has_compat_feature(
+>  #define XFS_SB_FEAT_RO_COMPAT_ALL \
+>  		(XFS_SB_FEAT_RO_COMPAT_FINOBT | \
+>  		 XFS_SB_FEAT_RO_COMPAT_RMAPBT | \
+> -		 XFS_SB_FEAT_RO_COMPAT_REFLINK| \
+> -		 XFS_SB_FEAT_RO_COMPAT_INOBTCNT)
+> +		 XFS_SB_FEAT_RO_COMPAT_REFLINK | \
+> +		 XFS_SB_FEAT_RO_COMPAT_INOBTCNT | \
+> +		 XFS_SB_FEAT_RO_COMPAT_VERITY)
+
+[Severity: High]
+While reviewing the fsverity enablement, I noticed a potential issue in the
+error handling path of xfs_fsverity_end_enable().
+
+If xfs_free_eofblocks() fails, such as due to ENOMEM or quota limits, the error
+path deletes the verity metadata but appears to leave the permanently committed
+XFS_DIFLAG2_VERITY flag set:
+
+fs/xfs/xfs_fsverity.c:xfs_fsverity_end_enable() {
+[ ... ]
+	ip->i_diflags2 |= XFS_DIFLAG2_VERITY;
+
+	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+	xfs_trans_set_sync(tp);
+
+	error = xfs_trans_commit(tp);
+	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+	if (error)
+		goto out;
+
+	inode_set_flags(inode, S_VERITY, S_VERITY);
+
+	/*
+	 * Proactively remove unwritten extents left by COW preallocations and
+	 * write preallocation in the merkle tree holes and past descriptor,
+	 * and any delayed preallocations
+	 */
+	error = xfs_free_eofblocks(ip);
+out:
+	if (error) {
+		int	error2;
+
+		error2 = xfs_fsverity_delete_metadata(ip);
+[ ... ]
+}
+
+Does this leave the on-disk inode permanently marked as an fsverity file while
+the metadata has been deleted?
+
+If so, could this cause subsequent attempts to open the file to fail with
+-ENODATA or -EIO when fsverity_file_open() fails to find the descriptor,
+resulting in localized data loss unless an offline or online repair tool clears
+the flag?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=21
+

@@ -1,0 +1,21 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:27:41 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 01/21] fsverity: report validation errors through
+ fserror to fsnotify
+Date: Fri, 18 Sep 2026 11:27:13 +0000
+Message-Id: <20260918112714.6FE841F00898@smtp.kernel.org>
+
+> Reported verification errors to fsnotify through recently added fserror
+> interface.
+> 
+> Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Acked-by: Eric Biggers <ebiggers@kernel.org>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=1
+
+

@@ -1,0 +1,125 @@
+From sashiko-bot@kernel.org Mon Sep 14 11:08:12 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/4] btrfs: zoned: only change active zone counter on
+ successful (de)activation
+Date: Mon, 14 Sep 2026 09:08:01 +0000
+Message-Id: <20260914090802.1B4471F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Partial failure in `btrfs_zone_activate()` permanently leaks active zones and reserved metadata zones.
+- [High] Error during device I/O in zone finish loops leaves active zone counters permanently leaked.
+- [High] Data race on `zinfo->reserved_active_zones` in `call_zone_finish` due to missing `zone_active_bgs_lock`.
+--
+
+commit 6c532b52f9998e0d1a81c6bbbd26e2d0795db423
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Subject: btrfs: zoned: only change active zone counter on successful (de)activation
+
+This commit fixes a double decrement issue in btrfs_zone_activate() by
+decrementing the reserved_active_zones counter only when
+btrfs_dev_set_active_zone() successfully sets the bit. It also mirrors this
+behavior in call_zone_finish() when clearing the bit.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index c04a9955f2d39..d30fd0ba4b862 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -2400,6 +2409,7 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+>  	u64 physical;
+>  	const bool is_data = (block_group->flags & BTRFS_BLOCK_GROUP_DATA);
+>  	bool ret;
+> +	bool new;
+>  	int i;
+>  
+>  	if (!btrfs_is_zoned(block_group->fs_info))
+> @@ -2453,12 +2463,12 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+>  			goto out_unlock;
+>  		}
+>  
+> -		if (!btrfs_dev_set_active_zone(device, physical)) {
+> +		if (!btrfs_dev_set_active_zone(device, physical, &new)) {
+>  			/* Cannot activate the zone */
+>  			ret = false;
+>  			goto out_unlock;
+
+[Severity: High]
+This isn't a bug introduced by this patch, but if btrfs_dev_set_active_zone()
+fails here for a subsequent stripe in the loop, does this leak the active zones
+and reserved_active_zones that were already set for previous stripes?
+
+The error path returns false and jumps to out_unlock without rolling back
+the state of the successful stripes.
+
+>  		}
+> -		if (!is_data)
+> +		if (!is_data && new)
+>  			zinfo->reserved_active_zones--;
+>  	}
+>  
+
+[ ... ]
+
+> @@ -2505,6 +2515,7 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+>  	struct btrfs_device *device = stripe->dev;
+>  	const u64 physical = stripe->physical;
+>  	struct btrfs_zoned_device_info *zinfo = device->zone_info;
+> +	bool cleared;
+>  	int ret;
+>  
+>  	if (!device->bdev)
+> @@ -2526,9 +2537,9 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+>  			return ret;
+
+[Severity: High]
+This is a pre-existing issue, but if blkdev_zone_mgmt() returns an error
+(which leads to this early return), does it leave the memory representation of
+the zone stuck as active?
+
+When this returns early, do_zone_finish() also breaks its loop:
+
+fs/btrfs/zoned.c:do_zone_finish() {
+    ...
+	for (i = 0; i < map->num_stripes; i++) {
+		ret = call_zone_finish(block_group, &map->stripes[i]);
+		if (ret)
+			break;
+	}
+    ...
+}
+
+Because do_zone_finish() already cleared BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE,
+doesn't this permanently leak the active zone counters and reserved_active_zones
+for the failed stripe and any remaining stripes?
+
+>  	}
+>  
+> -	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
+> +	cleared = btrfs_dev_clear_active_zone(device, physical);
+> +	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA) && cleared)
+>  		zinfo->reserved_active_zones++;
+
+[Severity: High]
+This is a pre-existing issue, but is there a data race on
+zinfo->reserved_active_zones here?
+
+In btrfs_zone_activate(), zinfo->reserved_active_zones is modified while
+holding fs_info->zone_active_bgs_lock. However, call_zone_finish() is
+called from do_zone_finish() which only holds dev_replace->rwsem and does
+not seem to hold fs_info->zone_active_bgs_lock.
+
+Could concurrent zone finish operations or concurrent activation and finish
+operations lead to lost updates to reserved_active_zones?
+
+> -	btrfs_dev_clear_active_zone(device, physical);
+>  
+>  	return 0;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260914085248.347198-1-johannes.thumshirn@wdc.com?part=1
+

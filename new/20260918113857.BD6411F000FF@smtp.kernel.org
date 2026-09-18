@@ -1,0 +1,183 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:39:08 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 11/21] xfs: handle fsverity I/O in write/read path
+Date: Fri, 18 Sep 2026 11:38:57 +0000
+Message-Id: <20260918113857.BD6411F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] xfs: global IOMAP_F_FSVERITY in writeback triggers WARN_ON_ONCE and skips zeroing
+- [High] xfs: missing IOMAP_F_FSVERITY in srcmap causes Merkle tree data corruption during COW
+- [High] xfs: extent merging in writeback drops IOMAP_F_FSVERITY, permanently leaking dirty folios
+--
+
+commit 921462565b838ec412711bced36094baa0229a3e
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+Date:   Fri Sep 18 11:15:23 2026 +0000
+
+    xfs: handle fsverity I/O in write/read path
+
+    For write/writeback set IOMAP_F_FSVERITY flag telling iomap to not
+    update inode size and to not skip folios beyond EOF. Initiate fsverity
+    writeback with IOMAP_F_FSVERITY set to tell iomap should not skip folio
+    that is dirty beyond EOF.
+
+> diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+> index ae91f63455c5d..ba6a9611f6f9d 100644
+> --- a/fs/xfs/libxfs/xfs_bmap.c
+> +++ b/fs/xfs/libxfs/xfs_bmap.c
+[ ... ]
+> @@ -4401,6 +4403,10 @@ xfs_bmapi_convert_one_delalloc(
+>  	 * the extent.  Just return the real extent at this offset.
+>  	 */
+>  	if (!isnullstartblock(bma.got.br_startblock)) {
+> +		if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION) &&
+> +		    XFS_FSB_TO_B(mp, bma.got.br_startoff) >=
+> +			    xfs_fsverity_metadata_offset(ip))
+> +			flags |= IOMAP_F_FSVERITY;
+
+[Severity: High]
+Does checking the potentially merged extent's start offset instead of the
+requested offset cause the flag to be wrongly omitted?
+
+If the file size is exactly aligned to the filesystem block size, the
+Merkle tree begins immediately after the file data without a padding hole.
+When xfs_bmapi_allocate() converts the Merkle tree delalloc extent to a real
+extent, the block allocator might place it contiguously with the existing
+data extent and automatically merge them. This shifts bma.got.br_startoff
+back to 0.
+
+This would cause the check to evaluate to false and IOMAP_F_FSVERITY to not
+be set. Without the verity flag, iomap_writeback_handle_eof() processes the
+Merkle tree folios as invalid past-EOF folios and returns false, completely
+aborting writeback without clearing the dirty state. The Merkle tree folios
+are permanently leaked as dirty memory, preventing filesystem unmount and
+causing data loss of the Merkle tree. 
+
+Could this use the requested offset instead of the potentially merged
+extent's start offset?
+
+>  		xfs_bmbt_to_iomap(ip, iomap, &bma.got, 0, flags,
+>  				xfs_iomap_inode_sequence(ip, flags));
+>  		if (seq)
+[ ... ]
+> @@ -4448,6 +4454,11 @@ xfs_bmapi_convert_one_delalloc(
+>  	XFS_STATS_ADD(mp, xs_xstrat_bytes, XFS_FSB_TO_B(mp, bma.length));
+>  	XFS_STATS_INC(mp, xs_xstrat_quick);
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION) &&
+> +	    XFS_FSB_TO_B(mp, bma.got.br_startoff) >=
+> +		    xfs_fsverity_metadata_offset(ip))
+> +		flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: High]
+Does this check have the same issue with merged extents causing the flag
+to be dropped as mentioned above?
+
+>  	ASSERT(!isnullstartblock(bma.got.br_startblock));
+>  	xfs_bmbt_to_iomap(ip, iomap, &bma.got, 0, flags,
+>  				xfs_iomap_inode_sequence(ip, flags));
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index c30e688cfc9f6..19640e4e3ed12 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+[ ... ]
+> @@ -172,12 +173,16 @@ xfs_map_blocks(
+>  	int			retries = 0;
+>  	int			error = 0;
+>  	unsigned int		*seq;
+> +	unsigned int		iomap_flags = 0;
+>  
+>  	if (xfs_is_shutdown(mp))
+>  		return -EIO;
+>  
+>  	XFS_ERRORTAG_DELAY(mp, XFS_ERRTAG_WB_DELAY_MS);
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: High]
+Does unconditionally setting IOMAP_F_FSVERITY here, without checking if the
+mapped offset is actually within the metadata region, contaminate writeback
+for data folios?
+
+If a large folio is allocated that spans across both the file size and the
+verity metadata offset, the folio covers both data and metadata. During
+writeback of this dirtied folio, iomap_writeback_handle_eof() sees the
+IOMAP_F_FSVERITY flag set unconditionally. Because folio_pos(folio) < isize,
+it triggers a WARN_ON_ONCE and returns early, entirely skipping the
+folio_zero_segment() call required to zero the padding hole between the
+file size and the Merkle tree. This leaks uninitialized pagecache memory to
+disk and causes a kernel DoS via the splat.
+
+>  	/*
+>  	 * COW fork blocks can overlap data fork blocks even if the blocks
+>  	 * aren't shared.  COW I/O always takes precedent, so we must always
+[ ... ]
+> @@ -507,6 +517,22 @@ static const struct iomap_writeback_ops xfs_zoned_writeback_ops = {
+>  	.writeback_submit	= xfs_zoned_writeback_submit,
+>  };
+>  
+> +static int
+> +xfs_iomap_writepages(
+> +	struct xfs_inode		*ip,
+> +	struct iomap_writepage_ctx	*ctx)
+> +{
+> +	/*
+> +	 * Writeback does not work for folios past EOF, let it know that
+> +	 * I/O happens for fsverity metadata and this restriction need
+> +	 * to be skipped
+> +	 */
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		ctx->iomap.flags |= IOMAP_F_FSVERITY;
+
+[Severity: High]
+Can this unconditional assignment also trigger the same kernel splat and
+skip tail-zeroing for large folios spanning EOF?
+
+> +
+> +	return iomap_writepages(ctx);
+> +}
+> +
+>  STATIC int
+>  xfs_vm_writepages(
+[ ... ]
+> diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+> index 7c6238fed61e4..fa11d830dfc09 100644
+> --- a/fs/xfs/xfs_iomap.c
+> +++ b/fs/xfs/xfs_iomap.c
+[ ... ]
+> @@ -1809,9 +1817,12 @@ xfs_buffered_write_iomap_begin(
+>  	if (xfs_is_shutdown(mp))
+>  		return -EIO;
+>  
+> +	if (xfs_iflags_test(ip, XFS_VERITY_CONSTRUCTION))
+> +		iomap_flags |= IOMAP_F_FSVERITY;
+> +
+
+[Severity: High]
+Does this code omit passing the IOMAP_F_FSVERITY flag to the srcmap when
+a COW extent is mapped for a write?
+
+Later in this function (and similarly in xfs_direct_write_iomap_begin()),
+xfs_bmbt_to_iomap() is called to populate the srcmap:
+
+	if (imap.br_startblock != HOLESTARTBLOCK) {
+		seq = xfs_iomap_inode_sequence(ip, 0);
+		error = xfs_bmbt_to_iomap(ip, srcmap, &imap, flags, 0, seq);
+		if (error)
+			goto out_unlock;
+	}
+
+Since 0 is passed instead of iomap_flags, IOMAP_F_FSVERITY is missing
+from the srcmap. If always_cow is enabled on the mount, writes to the Merkle
+tree will allocate in the COW fork. A subsequent partial block write to the
+same block requires a read-modify-write cycle. Because srcmap->flags lacks
+IOMAP_F_FSVERITY, iomap_block_needs_zeroing() incorrectly zeroes the block
+(thinking it's past EOF) instead of reading the existing Merkle tree data
+from disk. This permanently corrupts the fs-verity metadata.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=11
+

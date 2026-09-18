@@ -1,0 +1,120 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:41:11 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 19/21] xfs: check and repair the verity inode flag
+ state
+Date: Fri, 18 Sep 2026 11:40:59 +0000
+Message-Id: <20260918114100.E7FB31F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] xfs: scrub silently removes fs-verity protection on capability mismatch
+- [High] xfs: TOCTOU race in fsverity open triggers kernel panic
+--
+
+commit f41f7f55dbc0aa68b4ef7ee729b6b2e8b291d72f
+Author: Darrick J. Wong <djwong@kernel.org>
+Subject: xfs: check and repair the verity inode flag state
+
+If an inode has the incore verity iflag set, make sure that we can
+actually activate fsverity on that inode.  If activation fails due to
+a fsverity metadata validation error, clear the flag.  The usage model
+for fsverity requires that any program that cares about verity state is
+required to call statx/getflags to check that the flag is set after
+opening the file, so clearing the flag will not compromise that model.
+
+> diff --git a/fs/xfs/scrub/common.c b/fs/xfs/scrub/common.c
+> index e5233e31abb75..02b68bf4c5127 100644
+> --- a/fs/xfs/scrub/common.c
+> +++ b/fs/xfs/scrub/common.c
+[ ... ]
+> @@ -1754,3 +1756,56 @@ xchk_inode_count_blocks(
+> +int
+> +xchk_inode_setup_verity(
+> +	struct xfs_scrub	*sc)
+> +{
+> +	int			error;
+> +
+> +	if (!fsverity_active(VFS_I(sc->ip)))
+> +		return 0;
+> +
+> +	error = fsverity_ensure_verity_info(VFS_I(sc->ip));
+> +	switch (error) {
+> +	case 0:
+> +		/* fsverity is active */
+> +		break;
+> +	case -ENODATA:
+> +	case -EMSGSIZE:
+> +	case -EINVAL:
+> +	case -EFSCORRUPTED:
+> +	case -EFBIG:
+> +	case -ERANGE:
+> +	case -EBADMSG:
+> +		/*
+> +		 * The nonzero errno codes above are the error codes that can
+> +		 * be returned from fsverity on metadata validation errors.
+> +		 */
+> +		return 0;
+
+[Severity: High]
+Does this code silently remove fs-verity protection on capability mismatches?
+
+The switch statement in xchk_inode_setup_verity() returns 0 for compatibility
+mismatch errors like -EINVAL and -EFBIG from fsverity_ensure_verity_info().
+This treats capability/compatibility mismatch errors as metadata corruption,
+allowing xchk_inode_verity_broken() to flag the inode as corrupt because
+fsverity_get_info() failed.
+
+As a result, running xfs_scrub on a valid fsverity file system mounted on a
+platform with different capabilities (e.g., 64K block size mounted on a 4K
+page system, or lacking a specific hash algorithm) will silently and
+permanently strip the file's verity protection.
+
+> +	default:
+> +		/* runtime errors */
+> +		return error;
+> +	}
+> +
+> +	return 0;
+> +}
+[ ... ]
+> diff --git a/fs/xfs/scrub/inode_repair.c b/fs/xfs/scrub/inode_repair.c
+> index abfcab86928e6..b43b39662b687 100644
+> --- a/fs/xfs/scrub/inode_repair.c
+> +++ b/fs/xfs/scrub/inode_repair.c
+[ ... ]
+> @@ -2035,6 +2041,27 @@ xrep_inode_unlinked(
+> +STATIC int
+> +xrep_inode_verity(
+> +	struct xfs_scrub	*sc)
+> +{
+> +	struct inode		*inode = VFS_I(sc->ip);
+> +
+> +	if (xchk_inode_verity_broken(sc->ip)) {
+> +		sc->ip->i_diflags2 &= ~XFS_DIFLAG2_VERITY;
+> +		inode_set_flags(inode, 0, S_VERITY);
+
+[Severity: High]
+Can this code trigger a race condition and a kernel panic?
+
+When xrep_inode_verity() clears S_VERITY from the inode here locklessly, it
+can race with the VFS open path. If Thread A opens an fsverity file and
+fsverity_file_open() locklessly checks IS_VERITY(inode) successfully, Thread B
+could concurrently clear S_VERITY during scrub here.
+
+When Thread A proceeds to xfs_fsverity_get_descriptor(), it will execute
+ASSERT(inode->i_flags & S_VERITY) before taking the XFS ILOCK, causing a
+panic on debug kernels because Thread B just cleared the flag.
+
+Additionally, this is where the security protection is permanently deleted
+from the inode based on the assumption in xchk_inode_setup_verity() regarding
+compatibility mismatch errors.
+
+> +
+> +		xfs_trans_log_inode(sc->tp, sc->ip, XFS_ILOG_CORE);
+> +	}
+> +
+> +	return 0;
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=19
+

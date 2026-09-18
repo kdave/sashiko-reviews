@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Wed Sep 16 10:08:05 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 3/6] btrfs: introduce the skeleton of delayed bbio
+ endio function
+Date: Wed, 16 Sep 2026 08:07:55 +0000
+Message-Id: <20260916080755.74BB31F0089B@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] btrfs: memory reclaim deadlock due to GFP_KERNEL in writeback
+- [High] btrfs: memory reclaim deadlock via non-WQ_MEM_RECLAIM workqueue
+--
+
+commit da91970f98f1147a386b99f7012353bc9fe0737c
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce the skeleton of delayed bbio endio function
+
+This patch introduces the skeleton for delayed bbio endio, queuing delayed 
+bios into a workqueue for compression. It implements the main endio function 
+and a helper to queue workloads, reusing btrfs_bio::pending_ios for lifespan 
+tracking.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -7707,16 +7712,78 @@ struct extent_map *btrfs_create_delayed_em(struct btrfs_inode *inode,
+
+[ ... ]
+
+>  void btrfs_submit_delayed_write(struct btrfs_bio *bbio)
+>  {
+> +	struct delayed_bio_private *dbp;
+> +
+>  	ASSERT(bbio->is_delayed);
+>  
+> +	bbio->end_io = end_bbio_delayed;
+> +	dbp = kzalloc_obj(*dbp);
+
+[Severity: High]
+Can this allocation cause an ABBA deadlock during memory reclaim?
+
+In btrfs_submit_delayed_write(), kzalloc_obj() defaults to using GFP_KERNEL.
+Since this function is called from the folio writeback path (via
+extent_writepage_io() -> submit_one_bio()), allocating with GFP_KERNEL under
+memory pressure can trigger direct reclaim.
+
+Direct reclaim may then attempt to lock the same folios or wait on
+filesystem writeback, resulting in a deadlock.
+
+Should this allocation use GFP_NOFS or be protected with
+memalloc_nofs_save()?
+
+> +	if (!dbp) {
+> +		btrfs_bio_end_io(bbio, errno_to_blk_status(-ENOMEM));
+> +		return;
+> +	}
+> +	dbp->delayed_bbio = bbio;
+> +	bbio->private = dbp;
+
+[ ... ]
+
+> +	INIT_WORK(&dbp->work, run_delayed_bbio);
+> +	schedule_work(&dbp->work);
+
+[Severity: High]
+Could queuing this work to the generic system_percpu_wq lead to a memory
+reclaim deadlock?
+
+The schedule_work() call queues the delayed bio for compression to the
+global system_percpu_wq. This queue is allocated without the WQ_MEM_RECLAIM
+flag, meaning it has no rescuer thread.
+
+Because this happens in the dirty page writeback path, which memory reclaim
+depends on to free pages, severe memory pressure could cause the workqueue
+to stall waiting for memory allocations to spawn workers. Meanwhile, memory
+reclaim would be waiting for this writeback work item to complete, creating
+a circular dependency.
+
+Does Btrfs need to queue these IO workloads to its dedicated WQ_MEM_RECLAIM
+workqueues (e.g., using btrfs_queue_work() with fs_info->delalloc_workers)?
+
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789545179.git.wqu@suse.com?part=3
+

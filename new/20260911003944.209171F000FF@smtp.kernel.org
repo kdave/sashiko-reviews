@@ -1,0 +1,117 @@
+From sashiko-bot@kernel.org Fri Sep 11 02:39:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/3] btrfs: pre-flush reflink source before taking
+ inode locks
+Date: Fri, 11 Sep 2026 00:39:43 +0000
+Message-Id: <20260911003944.209171F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] wait_existing_ordered_extents() unconditionally waits for all ordered extents in the entire source file, severely degrading performance for partial reflink or dedupe operations.
+--
+
+commit 52189096e3a5e99bcbcdbce7fb3d7bdc973c63d5
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: pre-flush reflink source before taking inode locks
+
+This commit introduces an optimistic backward pass to flush dirty pages and
+wait for ordered extents outside the locked region in btrfs_remap_file_range.
+It aims to minimize lock contention for reflink operations on dirty files.
+
+> diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+> index d2a4101912bdb..7bab391f1be4a 100644
+> --- a/fs/btrfs/reflink.c
+> +++ b/fs/btrfs/reflink.c
+> @@ -923,6 +923,46 @@ static bool file_sync_write(const struct file *file)
+>  	return false;
+>  }
+>  
+> +/*
+> + * Do a single backwards pass waiting for ordered extents on the inode.
+> + *
+> + * Backwards is helpful because it avoids picking up concurrent appended OEs
+> + * and the intent of the function is to wait on pre-existing OEs without going
+> + * to the extreme of locking the ordered_tree and snapshotting its contents.
+> + *
+> + * This is only useful as an optimization for waiting for ordered extents outside
+> + * locks. It DOES NOT ensure that the range is free of ordered extents.
+> + *
+> + * Returns -EIO if any waited on OE had the ORDERED_IOERR bit set and 0 otherwise.
+> + */
+> +static int wait_existing_ordered_extents(struct btrfs_inode *inode)
+> +{
+> +	u64 orig_end = i_size_read(&inode->vfs_inode);
+> +	u64 end = orig_end;
+        ^^^^^^^^^^^^^^^^^^^^
+
+[Severity: High]
+Does this initialize the wait loop to start from the very end of the file,
+completely ignoring the target range?
+
+A partial reflink or dedupe on a large file could block until writeback and
+ordered extents for the entire file complete, turning a fast operation into a
+slow one.
+
+> +	int ret = 0;
+> +
+> +	while (true) {
+> +		struct btrfs_ordered_extent *ordered;
+> +
+> +		ordered = btrfs_lookup_first_ordered_extent(inode, end);
+> +		if (!ordered)
+> +			break;
+> +		if (ordered->file_offset > end) {
+> +			btrfs_put_ordered_extent(ordered);
+> +			break;
+> +		}
+> +		btrfs_start_ordered_extent(ordered);
+> +		end = ordered->file_offset;
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+[Severity: High]
+Does this wait for the ordered extent to complete and continue stepping
+backwards until offset 0, failing to break when passing the start of the
+target range?
+
+> +		if (test_bit(BTRFS_ORDERED_IOERR, &ordered->flags))
+> +			ret = -EIO;
+> +		btrfs_put_ordered_extent(ordered);
+> +		if (!end)
+> +			break;
+> +		end--;
+> +	}
+> +	return ret;
+> +}
+> +
+>  loff_t btrfs_remap_file_range(struct file *src_file, loff_t off,
+>  		struct file *dst_file, loff_t destoff, loff_t len,
+>  		unsigned int remap_flags)
+
+[ ... ]
+
+> @@ -938,6 +978,14 @@ loff_t btrfs_remap_file_range(struct file *src_file, loff_t off,
+>  	if (remap_flags & ~(REMAP_FILE_DEDUP | REMAP_FILE_ADVISORY))
+>  		return -EINVAL;
+>  
+> +	ret = filemap_flush(src_inode->vfs_inode.i_mapping);
+> +	if (ret < 0)
+> +		return ret;
+> +
+> +	ret = wait_existing_ordered_extents(src_inode);
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+[Severity: High]
+Does this execute the unconditional full-file I/O wait for all reflink/dedupe
+operations?
+
+This undermines targeted partial dedupe. A typically millisecond operation
+could take seconds or minutes depending on file size and dirty data.
+
+> +	if (ret < 0)
+> +		return ret;
+> +
+>  	if (same_inode) {
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789085863.git.boris@bur.io?part=1
+

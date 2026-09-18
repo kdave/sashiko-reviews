@@ -1,0 +1,22 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:30:35 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 18/21] xfs: advertise fs-verity being available on
+ filesystem
+Date: Fri, 18 Sep 2026 11:30:28 +0000
+Message-Id: <20260918113029.585B61F000FF@smtp.kernel.org>
+
+> From: "Darrick J. Wong" <djwong@kernel.org>
+> 
+> Advertise that this filesystem supports fsverity.
+> 
+> Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Andrey Albershteyn <aalbersh@redhat.com>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=18
+
+

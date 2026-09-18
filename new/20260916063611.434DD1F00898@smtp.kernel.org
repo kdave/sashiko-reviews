@@ -1,0 +1,110 @@
+From sashiko-bot@kernel.org Wed Sep 16 08:36:21 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/2] btrfs: test qgroup limit handling on fsverity
+ rollback
+Date: Wed, 16 Sep 2026 06:36:10 +0000
+Message-Id: <20260916063611.434DD1F00898@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] test: xfstests patch incorrectly submitted to linux kernel repository
+- [High] test: btrfs: undefined _btrfs command causes silent setup failure
+- [High] test: btrfs: incorrect _btrfs_get_subvolid args apply limit to wrong subvol
+- [Medium] test: btrfs: non-POSIX grep alternation operator causes false test passes
+--
+
+commit bfb7b3cdbd2362852b962d3ddee3d0212b7e979e
+Author: Daniel Linjama <daniel@dev.linjama.com>
+
+btrfs: test qgroup limit handling on fsverity rollback
+
+Test that the subvolume and the filesystem stay writable when an fsverity
+enable and its rollback hit the qgroup limit, and that the subvolume is
+still reachable after a remount with no verity or orphan items left behind.
+
+> diff --git a/tests/btrfs/354 b/tests/btrfs/354
+> new file mode 100755
+> index 0000000000000..0ae6e7fe55c2b
+> --- /dev/null
+> +++ b/tests/btrfs/354
+> @@ -0,0 +1,126 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 Daniel Linjama.  All Rights Reserved.
+> +#
+> +# FS QA Test 354
+> +#
+> +# Test that a failed fsverity enable in a subvolume whose qgroup is at its
+> +# limit leaves the filesystem usable.
+> +#
+> +. ./common/preamble
+
+[Severity: High]
+Is this patch misdirected to the Linux kernel repository instead of the
+fstests project?
+
+The script sources files like ./common/preamble that exist in xfstests but
+not in the Linux kernel tree, meaning it cannot execute and acts as dead code
+here.
+
+> +_begin_fstest auto quick qgroup limit verity
+
+[ ... ]
+
+> +prepare()
+> +{
+> +	_scratch_mkfs_verity &>> $seqres.full
+> +	_scratch_mount
+> +	_btrfs quota enable $SCRATCH_MNT
+
+[Severity: High]
+Does this setup fail silently because _btrfs is undefined in the xfstests
+framework?
+
+Because xfstests scripts do not run with set -e by default, the script
+might silently ignore the command not found errors and proceed, leaving an
+invalid test state. Should this use $BTRFS_UTIL_PROG instead?
+
+> +	_qgroup_rescan $SCRATCH_MNT >> $seqres.full 2>&1
+> +	_btrfs subvolume create $subv
+> +	subvolid=$(_btrfs_get_subvolid $SCRATCH_MNT sub)
+
+[Severity: High]
+Does this apply the qgroup limit to the wrong subvolume?
+
+The _btrfs_get_subvolid helper expects a single path argument. By passing
+$SCRATCH_MNT sub, it evaluates the first argument ($SCRATCH_MNT) and returns
+the ID of the root filesystem (5). As a result, the subsequent qgroup limit
+would be incorrectly applied to 0/5 instead of the newly created subvolume.
+
+> +	_btrfs qgroup limit 200M 0/$subvolid $SCRATCH_MNT
+> +}
+
+[ ... ]
+
+> +check_leftover_items()
+> +{
+> +	local dump=$($BTRFS_UTIL_PROG inspect-internal dump-tree -t $subvolid $SCRATCH_DEV)
+> +	local verity_items=$(echo "$dump" | grep -c "($ino VERITY_\(DESC\|MERKLE\)_ITEM")
+
+[Severity: Medium]
+Can this non-POSIX grep alternation operator cause false test passes?
+
+The script uses the \| alternation operator in a basic regular expression,
+which is a GNU extension with undefined behavior in POSIX. 
+
+On systems using non-GNU grep (like busybox or BSD grep), this would fail to
+match the items and result in a count of 0, making the test silently pass
+even if leftover items exist.
+
+> +	local orphans=$(echo "$dump" | grep -c "(ORPHAN ORPHAN_ITEM $ino)")
+> +
+> +	echo "$dump" >> $seqres.full
+> +	[ "$verity_items" -eq 0 ] || \
+> +		echo "$verity_items verity items left behind by the failed enable"
+> +	[ "$orphans" -eq 0 ] || \
+> +		echo "$orphans orphan items left behind by the failed enable"
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260916062356.690137-1-daniel@dev.linjama.com?part=1
+

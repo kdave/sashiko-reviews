@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Mon Sep 14 19:57:27 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix creation of compressed inline extents that
+ don't save space
+Date: Mon, 14 Sep 2026 17:57:16 +0000
+Message-Id: <20260914175716.87C021F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Passing an unvalidated, potentially unbounded `i_size` to `btrfs_compress_bio()` causes a local Denial of Service through unbounded synchronous compression, lockless access to out-of-bounds folios, and critical kernel log spam.
+--
+
+commit 500d3a73df381928584875cdbe50b92912da2f0c
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix creation of compressed inline extents that don't save space
+
+This commit modifies the creation of compressed inline extents to check
+the inode's i_size instead of the blocksize. This prevents the creation of
+compressed inline extents that don't yield any space benefits.
+
+Link: https://lore.kernel.org/linux-btrfs/c97652a5-ac6b-4de6-aa23-3cdebc01d00b@gmail.com/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 2e25e640fa069..887a316cdceb3 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -2328,7 +2328,7 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  		} else if (inode->prop_compress) {
+>  			compress_type = inode->prop_compress;
+>  		}
+> -		cb = btrfs_compress_bio(inode, 0, blocksize, compress_type, compress_level, 0);
+> +		cb = btrfs_compress_bio(inode, 0, i_size, compress_type, compress_level, 0);
+
+[Severity: High]
+Could passing the potentially unbounded i_size to btrfs_compress_bio()
+cause a local denial of service?
+
+If a user creates a large sparse file (for example, using ftruncate() to 4GB)
+and triggers writeback only on the first page, the start == 0 and size
+constraints in btrfs_run_delalloc_range() can still be met, triggering
+run_delalloc_inline(). The massive unvalidated i_size is then passed as the
+length into btrfs_compress_bio().
+
+This can cause the compression loop to locklessly read beyond the locked
+writeback range. If pages are absent, btrfs_compress_filemap_get_folio()
+will emit un-ratelimited btrfs_crit() messages, creating a log flood:
+
+fs/btrfs/compression.c:btrfs_compress_filemap_get_folio() {
+        ...
+        in_folio = filemap_get_folio(mapping, start >> PAGE_SHIFT);
+        if (IS_ERR(in_folio)) {
+                struct btrfs_inode *inode = BTRFS_I(mapping->host);
+
+                btrfs_crit(inode->root->fs_info,
+                "failed to get page cache, root %lld ino %llu...",
+        ...
+}
+
+If the pages are present, the loop will waste massive amounts of CPU time
+compressing up to 4GB of data synchronously.
+
+Additionally, the size limit enforcement in run_delalloc_inline() occurs
+too late:
+
+        if (!can_cow_file_range_inline(inode, 0, i_size, compressed_size)) {
+
+This rejects sizes larger than sectorsize only after the expensive
+compression loop has already taken place.
+
+>  		if (IS_ERR(cb)) {
+>  			cb = NULL;
+>  			/* Just fall back to non-compressed case. */
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/721d8fd2c73095d06cbdbfa714a6dfac9c488953.1789407346.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,68 @@
+From sashiko-bot@kernel.org Wed Sep 16 19:24:14 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: Fix root reference leak in
+ handle_indirect_tree_backref()
+Date: Wed, 16 Sep 2026 17:24:03 +0000
+Message-Id: <20260916172404.439FD1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: backref walk rejects valid max-height trees with -EUCLEAN
+--
+
+commit f06148882079aa567ec7a77ff586317289bf85e4
+Author: Wentao Liang <vulab@iscas.ac.cn>
+
+btrfs: Fix root reference leak in handle_indirect_tree_backref()
+
+This commit addresses a root reference leak in handle_indirect_tree_backref().
+It adds a check to drop the root reference and return -EUCLEAN if the tree
+walk reaches BTRFS_MAX_LEVEL without finding a node in the backref cache or
+the top of the searched path.
+
+> diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+> --- a/fs/btrfs/backref.c
+> +++ b/fs/btrfs/backref.c
+> @@ -3426,6 +3426,12 @@ static int handle_indirect_tree_backref(struct btrfs_trans_handle *trans,
+>  		lower = upper;
+>  		upper = NULL;
+>  	}
+> +	/* We walked up to BTRFS_MAX_LEVEL without reaching the tree root. */
+> +	if (level == BTRFS_MAX_LEVEL) {
+> +		btrfs_put_root(root);
+> +		ret = -EUCLEAN;
+> +		goto out;
+> +	}
+
+[Severity: Medium]
+Does this new condition accidentally reject valid trees that are exactly at
+the maximum possible height?
+
+If a valid tree has its root at exactly level 7, the for loop in
+handle_indirect_tree_backref() iterates up to that level. Because
+path->nodes[7] is populated, the `if (!path->nodes[level])` check is false,
+and the loop successfully processes level 7.
+
+After processing, the loop increments the level to 8, which natively
+terminates the loop because `8 < BTRFS_MAX_LEVEL` is false (as
+BTRFS_MAX_LEVEL is 8). 
+
+At this point, execution hits this newly added condition:
+
+    if (level == BTRFS_MAX_LEVEL) {
+        btrfs_put_root(root);
+        ret = -EUCLEAN;
+        goto out;
+    }
+
+Will this mistakenly drop the root and return -EUCLEAN instead of
+successfully linking the root for these max-height trees? A level-7 tree is
+the maximum valid height defined by the Btrfs format, so it seems this valid
+edge case might be incorrectly treated as corrupted.
+
+>  out:
+>  	btrfs_release_path(path);
+>  	return ret;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260916171319.2086756-1-vulab@iscas.ac.cn?part=1
+

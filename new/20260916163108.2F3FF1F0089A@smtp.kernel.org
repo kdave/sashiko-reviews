@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Wed Sep 16 18:31:38 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: remove reduntant eb generation check in
+ btrfs_buffer_uptodate()
+Date: Wed, 16 Sep 2026 16:31:07 +0000
+Message-Id: <20260916163108.2F3FF1F0089A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] btrfs: btrfs_buffer_uptodate() returns true on generation mismatch
+--
+
+commit aebb9a0f0447514d72087330cf37e64febff3427
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: remove reduntant eb generation check in btrfs_buffer_uptodate()
+
+This commit removes a check in btrfs_buffer_uptodate() comparing the extent
+buffer's generation to parent_transid, under the assumption that it is
+redundant.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index bfd7815a461ec..532581b3db27a 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -125,14 +125,6 @@ int btrfs_buffer_uptodate(struct extent_buffer *eb, u64 parent_transid,
+>  		return 1;
+>  	}
+>  
+> -	if (btrfs_header_generation(eb) != parent_transid) {
+> -		btrfs_err_rl(eb->fs_info,
+> -"parent transid verify failed on logical %llu mirror %u wanted %llu found %llu",
+> -			eb->start, eb->read_mirror,
+> -			parent_transid, btrfs_header_generation(eb));
+> -		clear_extent_buffer_uptodate(eb);
+> -		return 0;
+> -	}
+>  	return 1;
+>  }
+
+[Severity: Critical]
+Does removing this block cause the function to return 1 (success) when the
+generation actually mismatches?
+
+If parent_transid is non-zero and the generation does not match, the previous
+if statement in this function is bypassed:
+
+	if (!parent_transid || btrfs_header_generation(eb) == parent_transid) {
+		...
+		return 1;
+	}
+
+Without the removed error handling block, execution unconditionally falls
+through to the final return statement at the end of the function, which returns
+1.
+
+Will this cause the filesystem to silently trust and parse invalid or outdated
+metadata blocks as valid, bypassing COW guarantees and potentially leading to
+on-disk data corruption or out-of-bounds memory accesses?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/9d46a922c893b72ffcd82c82ee552b661b163be0.1789575886.git.fdmanana@suse.com?part=1
+

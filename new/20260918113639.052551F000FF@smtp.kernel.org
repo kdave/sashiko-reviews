@@ -1,0 +1,132 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:36:50 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 12/21] xfs: use read ioend for fsverity data
+ verification
+Date: Fri, 18 Sep 2026 11:36:38 +0000
+Message-Id: <20260918113639.052551F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] xfs: memory reclaim deadlock and forward progress violation in xfs_end_io_read()
+- [High] xfs: synchronous Merkle tree read stalls bio completion in xfs_end_io_read()
+- [Medium] xfs: memory leak of xfs_parent_args_cache on init error path
+--
+
+commit 798d972634a53a99bff867f7211b6d47638362a9
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+
+xfs: use read ioend for fsverity data verification
+    
+This commit uses read ioends for fsverity verification instead of using
+the same workqueue for fsverity metadata IO. It passes fsverity_info from
+the iomap context down to the ioend, and adds a helper to check if file
+data needs verification.
+
+> diff --git a/fs/xfs/xfs_ioend.c b/fs/xfs/xfs_ioend.c
+> index e70be5b86f0b7..2f46855b052fd 100644
+> --- a/fs/xfs/xfs_ioend.c
+> +++ b/fs/xfs/xfs_ioend.c
+
+[ ... ]
+
+> @@ -117,6 +138,36 @@ xfs_end_io_read(
+>  		}
+>  	}
+>  
+> +	/*
+> +	 * If we have fsverity and block device integrity attached to this bio,
+> +	 * we need to run fsverity verification of data folios from a separate
+> +	 * fsverity workqueue. This is necessary to avoid deadlocking due to
+> +	 * fsverity issuing more reads of fsverity metadata which would be
+> +	 * processed by the same worker in the BIO completion workqueue.
+> +	 *
+> +	 * Without block device integrity, fsverity metadata IO will not use
+> +	 * ioends for completion.
+> +	 */
+> +	if (IS_ENABLED(CONFIG_FS_VERITY) && !error && ioend->io_vi &&
+> +			xfs_fsverity_is_file_data(ip, ioend->io_offset)) {
+> +		if (ioend->io_flags & IOMAP_IOEND_INTEGRITY) {
+> +			fsv_ioend = kmem_cache_zalloc(xfs_fsverity_ioend_cache,
+> +					GFP_KERNEL);
+
+[Severity: High]
+Does this allocation risk a deadlock? xfs_end_io_read() executes in a block IO
+completion context (like task_work or the block layer bio_complete_wq). Using
+GFP_KERNEL here allows direct memory reclaim, which can block waiting for
+dirty pages to be written back and their IO completions processed. Waiting
+inside an IO completion worker could create a cyclical deadlock. Should this
+use a mempool with GFP_NOIO or GFP_NOWAIT to ensure forward progress?
+
+> +			if (!fsv_ioend) {
+> +				iomap_finish_ioends(ioend, -ENOMEM);
+> +				return;
+> +			}
+
+[Severity: High]
+Could failing the IO with -ENOMEM break forward progress guarantees under
+memory pressure? It seems that memory allocations in the block IO completion
+path need to be backed by a mempool to avoid spurious IO failures when
+memory is tight.
+
+> +			fsv_ioend->ioend = ioend;
+> +			INIT_WORK(&fsv_ioend->work, xfs_end_fsverity_io_read);
+> +
+> +			fsverity_enqueue_verify_work(&fsv_ioend->work);
+> +			return;
+> +		}
+> +
+> +		fsverity_verify_bio(ioend->io_vi, &ioend->io_bio);
+
+[Severity: High]
+Can this synchronous verification stall bio completion? When
+fsverity_verify_bio() requires Merkle tree blocks that aren't in the page
+cache, it synchronously reads them from disk by calling read_mapping_folio()
+and waits via wait_on_folio_locked_killable().
+
+Since xfs_end_io_read() is executing in a bio completion context, blocking
+here to wait for another disk IO can stall all other async IO completions
+queued behind it. Should this verification always be deferred to a dedicated
+workqueue?
+
+> +		error = blk_status_to_errno(ioend->io_bio.bi_status);
+> +	}
+>  
+>  	iomap_finish_ioends(ioend, error);
+>  }
+
+> diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+> index 5a06132aa3846..f34c9645767d5 100644
+> --- a/fs/xfs/xfs_super.c
+> +++ b/fs/xfs/xfs_super.c
+
+[ ... ]
+
+> @@ -2516,8 +2516,20 @@ xfs_init_caches(void)
+>  	if (!xfs_parent_args_cache)
+>  		goto out_destroy_xmi_cache;
+>  
+> +#ifdef CONFIG_FS_VERITY
+> +	xfs_fsverity_ioend_cache = kmem_cache_create("xfs_fsverity_ioend",
+> +					     sizeof(struct xfs_fsverity_ioend),
+> +					     0, 0, NULL);
+> +	if (!xfs_fsverity_ioend_cache)
+> +		goto out_destroy_fsverity_ioend_cache;
+> +#endif
+> +
+>  	return 0;
+>  
+> +#ifdef CONFIG_FS_VERITY
+> + out_destroy_fsverity_ioend_cache:
+> +	kmem_cache_destroy(xfs_fsverity_ioend_cache);
+> +#endif
+>   out_destroy_xmi_cache:
+
+[Severity: Medium]
+If the allocation of xfs_fsverity_ioend_cache fails, the error path jumps to
+out_destroy_fsverity_ioend_cache. Does this permanently leak the memory
+allocated for xfs_parent_args_cache? The error path seems to fall through
+to out_destroy_xmi_cache, entirely skipping the destruction of the parent
+args cache.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=12
+

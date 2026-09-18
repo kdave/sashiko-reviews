@@ -1,0 +1,19 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:34:42 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 20/21] xfs: introduce health state for corrupted
+ fsverity metadata
+Date: Fri, 18 Sep 2026 11:34:30 +0000
+Message-Id: <20260918113431.E97511F000FF@smtp.kernel.org>
+
+> Report corrupted fsverity descriptor through health system.
+> 
+> Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=20
+
+

@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Mon Sep 14 20:04:27 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: test that we don't create pointless compressed
+ inline extents
+Date: Mon, 14 Sep 2026 18:04:15 +0000
+Message-Id: <20260914180416.1FAA61F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] Missing empty variable check before integer comparison causes a bash syntax error if no inline extent is created.
+- [Medium] Missing error check for `_scratch_mount` leads to host filesystem pollution if the mount fails.
+--
+
+commit 9d96fd91e85b84b2b5905cc543711adfcae31c1a
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: test that we don't create pointless compressed inline extents
+
+This patch adds a new fstest to verify that we avoid creating compressed
+inline extents when the compressed data size is not smaller than the
+uncompressed data size. It exercises a regression introduced in kernel 7.1.
+
+> diff --git a/tests/btrfs/354 b/tests/btrfs/354
+> new file mode 100755
+> index 0000000000000..801dc587d8b78
+> --- /dev/null
+> +++ b/tests/btrfs/354
+> @@ -0,0 +1,44 @@
+
+[ ... ]
+
+> +algo_list=($(_btrfs_compression_algos))
+> +for algo in ${algo_list[@]}; do
+> +	_scratch_mkfs >>$seqres.full 2>&1 || _fail "mkfs failed"
+> +	_scratch_mount "-o compress=$algo"
+
+[Severity: Medium]
+Should the return value of _scratch_mount be checked here?
+
+If the mount fails (for example, if the compression algorithm returned
+by _btrfs_compression_algos is not supported by the current kernel),
+the script will continue executing. Because the exit code is ignored,
+the script blindly proceeds and writes the test file directly to the
+host filesystem instead of the scratch device, which can lead to
+test environment pollution.
+
+> +
+> +	echo 'a file with test content' > $SCRATCH_MNT/foobar
+> +	_scratch_unmount
+> +	_check_scratch_fs
+> +
+> +	extent_size=$($BTRFS_UTIL_PROG inspect-internal dump-tree -t 5 $SCRATCH_DEV | \
+> +	      grep 'inline extent' | \
+> +	      $AWK_PROG '{ for (i = 1; i < NF; i++) if ($i ~ /^size$/) print $(i + 1) }')
+> +	ram_size=$($BTRFS_UTIL_PROG inspect-internal dump-tree -t 5 $SCRATCH_DEV | \
+> +		   grep 'inline extent' | \
+> +		   $AWK_PROG '{ for (i = 1; i < NF; i++) if ($i ~ /^ram_bytes$/) print $(i + 1) }')
+> +
+> +	if [ "$extent_size" -gt "$ram_size" ]; then
+
+[Severity: Medium]
+Could this integer comparison result in a bash syntax error if the grep
+commands above find no matches?
+
+If the mount fails, or if the test environment is configured to disable
+inline extents (e.g. using max_inline=0 mount options), the grep command
+will match nothing. The variables extent_size and ram_size will then be
+empty strings. 
+
+This causes bash to evaluate [ "" -gt "" ], which results in a syntax
+error (integer expression expected) and causes the test to fail
+ungracefully.
+
+> +		echo "inline extent size ($extent_size) greater than ram_size ($ram_size) for algo $algo"
+> +	fi
+> +done
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/83e3a8678c5eafb1cfcf10741a53b6e586cd72d8.1789408399.git.fdmanana@suse.com?part=1
+

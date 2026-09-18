@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Fri Sep 11 09:55:45 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: introduce a new ioctl to force updating the
+ device name
+Date: Fri, 11 Sep 2026 07:55:34 +0000
+Message-Id: <20260911075534.7369F1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] BTRFS_IOC_RENAME_DEV silently fails (returns 0) when attempting to rename a mounted single-device filesystem to a different or duplicate block device, instead of returning an error.
+- [Medium] Latent RCU lockdep splat in device_list_add() exposed by making previously dead code reachable, dereferencing device->name without holding rcu_read_lock().
+--
+
+commit dcffba989b7a6e5b0398cd092ac4f7e4c77c3b75
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce a new ioctl to force updating the device name
+
+This patch introduces a new ioctl, BTRFS_IOC_RENAME_DEV, allowing users to
+force updating a device name instead of btrfs attempting to handle all
+namespace/path resolution scenarios internally.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -2298,6 +2298,12 @@ static long btrfs_control_ioctl(struct file *file, unsigned int cmd,
+>  			device->fs_devices->total_devices);
+>  		mutex_unlock(&uuid_mutex);
+>  		break;
+> +	case BTRFS_IOC_RENAME_DEV:
+> +		mutex_lock(&uuid_mutex);
+> +		device = btrfs_scan_one_device(vol->name, BTRFS_SCAN_DEV_RENAME);
+> +		ret = PTR_ERR_OR_ZERO(device);
+
+[Severity: Medium]
+Does this ioctl silently fail for single-device filesystems?
+
+When btrfs_scan_one_device() is called for a single-device filesystem,
+btrfs_skip_registration() skips registration and causes the function to
+return NULL. Since PTR_ERR_OR_ZERO(NULL) evaluates to 0, this appears to
+return success to userspace without actually renaming the device.
+
+> +		mutex_unlock(&uuid_mutex);
+> +		break;
+>  	case BTRFS_IOC_GET_SUPPORTED_FEATURES:
+>  		ret = btrfs_ioctl_get_supported_features((void __user*)arg);
+>  		break;
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+[ ... ]
+> @@ -869,7 +869,7 @@ static noinline struct btrfs_device *device_list_add(const char *path,
+>  				MAJOR(path_devt), MINOR(path_devt),
+>  				current->comm, task_pid_nr(current));
+>  
+> -	} else if (!device->name || device->devt != path_devt) {
+> +	} else if (!device->name || device->devt != path_devt || force_rename) {
+>  		const char *old_name;
+
+[Severity: Medium]
+By allowing force_rename to enter this branch even when
+device->devt == path_devt, is it possible to hit a latent RCU lockdep splat?
+
+If device->bdev is true and device->devt == path_devt, we bypass the
+return -EEXIST check further down and evaluate btrfs_info():
+
+    btrfs_info(NULL,
+        "devid %llu device path %s changed to %s scanned by %s (%d)",
+        devid, btrfs_dev_name(device),
+        path, current->comm, task_pid_nr(current));
+
+Since btrfs_dev_name(device) calls rcu_dereference(device->name) and we
+are not holding rcu_read_lock() here, won't this trigger a PROVE_RCU
+warning? The lock is only taken a few lines later:
+
+    rcu_read_lock();
+    old_name = rcu_dereference(device->name);
+    rcu_read_unlock();
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/5e65d9ba5927b4b6985ce819e9e49d082c6e9b45.1789112424.git.wqu@suse.com?part=1
+

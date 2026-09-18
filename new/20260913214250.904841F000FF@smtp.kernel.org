@@ -1,0 +1,147 @@
+From sashiko-bot@kernel.org Sun Sep 13 23:43:00 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 02/16] btrfs: remove the v1 space cache writeout from
+ the transaction commit
+Date: Sun, 13 Sep 2026 21:42:50 +0000
+Message-Id: <20260913214250.904841F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Removal of `cache_write_mutex` exposes a TOCTOU race condition between `btrfs_start_dirty_block_groups()` and `btrfs_remove_block_group()`, leading to a transaction abort.
+--
+
+commit 3086fa7f33a154f56a12b739739c37283f806e38
+Author: Tal Zussman <tz2294@columbia.edu>
+
+btrfs: remove the v1 space cache writeout from the transaction commit
+
+This commit removes the v1 space cache writeout from the transaction commit
+logic. It drops cache_write_mutex, related IO lists, and the -ENOENT retry
+loop in btrfs_write_dirty_block_groups().
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index ee182369254c0..a04dd8244c814 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -1194,36 +1194,15 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+>  		goto out;
+>  	}
+>  
+> -	/*
+> -	 * get the inode first so any iput calls done for the io_list
+> -	 * aren't the final iput (no unlinks allowed now)
+> -	 */
+>  	inode = lookup_free_space_inode(block_group, path);
+>  
+> -	mutex_lock(&trans->transaction->cache_write_mutex);
+> -	/*
+> -	 * Make sure our free space cache IO is done before removing the
+> -	 * free space inode
+> -	 */
+>  	spin_lock(&trans->transaction->dirty_bgs_lock);
+
+[ ... ]
+
+>  	if (!list_empty(&block_group->dirty_list)) {
+>  		list_del_init(&block_group->dirty_list);
+>  		remove_rsv = true;
+>  		btrfs_put_block_group(block_group);
+>  	}
+>  	spin_unlock(&trans->transaction->dirty_bgs_lock);
+> -	mutex_unlock(&trans->transaction->cache_write_mutex);
+>  
+>  	ret = btrfs_remove_free_space_inode(trans, inode, block_group);
+
+[Severity: Critical]
+Does the removal of cache_write_mutex expose a TOCTOU race condition between
+btrfs_remove_block_group() and btrfs_start_dirty_block_groups()?
+
+If btrfs_start_dirty_block_groups() has already popped the block group off
+the dirty list, this check will pass and btrfs_remove_block_group() will
+skip removing it from the list and proceed to delete the block group item
+from the extent tree.
+
+[ ... ]
+
+> @@ -3608,34 +3394,13 @@ int btrfs_start_dirty_block_groups(struct btrfs_trans_handle *trans)
+>  		}
+>  	}
+>  
+> -	/*
+> -	 * cache_write_mutex is here only to save us from balance or automatic
+> -	 * removal of empty block groups deleting this block group while we are
+> -	 * writing out the cache
+> -	 */
+> -	mutex_lock(&trans->transaction->cache_write_mutex);
+>  	while (!list_empty(&dirty)) {
+
+[ ... ]
+
+>  		/*
+>  		 * Since we're not running in the commit critical section
+>  		 * we need the dirty_bgs_lock to protect from update_block_group
+>  		 */
+>  		spin_lock(&cur_trans->dirty_bgs_lock);
+>  		list_del_init(&cache->dirty_list);
+>  		spin_unlock(&cur_trans->dirty_bgs_lock);
+>  
+> +		ret = update_block_group_item(trans, path, cache);
+
+[Severity: Critical]
+Without cache_write_mutex, is there any synchronization preventing
+btrfs_remove_block_group() from deleting the block group item while this code
+is executing? The dirty list lock was dropped just before calling
+update_block_group_item(), exposing it to concurrent removal.
+
+> +		/*
+> +		 * Our block group might still be attached to the list of new
+> +		 * block groups in the transaction handle of some other task
+> +		 * (struct btrfs_trans_handle->new_bgs). This means its block
+> +		 * group item isn't yet in the extent tree. If this happens
+> +		 * ignore the error, as we will try again later in the critical
+> +		 * section of the transaction commit.
+> +		 */
+> +		if (ret == -ENOENT) {
+> +			ret = 0;
+> +			spin_lock(&cur_trans->dirty_bgs_lock);
+> +			if (list_empty(&cache->dirty_list)) {
+> +				list_add_tail(&cache->dirty_list,
+> +					      &cur_trans->dirty_bgs);
+
+[Severity: Critical]
+If a concurrent removal caused the -ENOENT, will this code misinterpret the
+error as a pending new block group? It appears the deleted block group is
+erroneously re-added to the dirty list to be processed during the commit
+critical section.
+
+[ ... ]
+
+> @@ -3747,121 +3475,34 @@ int btrfs_write_dirty_block_groups(struct btrfs_trans_handle *trans)
+>  	struct btrfs_block_group *cache;
+>  	struct btrfs_transaction *cur_trans = trans->transaction;
+
+[ ... ]
+
+>  	spin_lock(&cur_trans->dirty_bgs_lock);
+>  	while (!list_empty(&cur_trans->dirty_bgs)) {
+>  		cache = list_first_entry(&cur_trans->dirty_bgs,
+>  					 struct btrfs_block_group,
+>  					 dirty_list);
+>  		list_del_init(&cache->dirty_list);
+>  		spin_unlock(&cur_trans->dirty_bgs_lock);
+>  
+>  		if (!ret)
+>  			ret = btrfs_run_delayed_refs(trans, U64_MAX);
+>  		if (!ret) {
+>  			ret = update_block_group_item(trans, path, cache);
+> +			if (ret)
+>  				btrfs_abort_transaction(trans, ret);
+>  		}
+
+[Severity: Critical]
+Since the wait/retry logic for -ENOENT was also removed by this patch, will
+the erroneously re-added block group fail again with -ENOENT here and trigger
+a transaction abort, crashing the filesystem?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260913-btrfs-remove-v1-space-cache-v2-0-186767a7e106@columbia.edu?part=2
+

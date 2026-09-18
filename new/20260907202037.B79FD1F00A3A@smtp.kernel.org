@@ -1,0 +1,95 @@
+From sashiko-bot@kernel.org Mon Sep  7 22:20:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 3/6] btrfs: add per-inode compression levels in
+ xattrs
+Date: Mon, 07 Sep 2026 20:20:37 +0000
+Message-Id: <20260907202037.B79FD1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] Memory allocation failure in prop_compression_apply triggers ASSERT failure and kernel panic.
+
+Pre-existing issues:
+- [High] Concurrent lockless read-modify-write on inode->flags causes silent data loss.
+--
+
+commit 5f573147dd65e78dae4ec8e8900944d7264dc451
+Author: koraynilay <koray.fra@gmail.com>
+Subject: btrfs: add per-inode compression levels in xattrs
+
+Adds support for specifying compression algo:level using the btrfs property
+set command. Adds a signed 8 bit prop_compress_level to btrfs_inode and
+updates prop_compression_apply() to use kmemdup_nul() for parsing the xattr.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+> @@ -343,23 +347,45 @@ static int prop_compression_apply(struct btrfs_inode *inode, const char *value,
+>  		return 0;
+>  	}
+>  
+> -	if (!strncmp("lzo", value, 3)) {
+> +	value_str = kmemdup_nul(value, len, GFP_KERNEL);
+> +	if (!value_str)
+> +		return -ENOMEM;
+
+[Severity: High]
+Does this memory allocation failure trigger the ASSERT() in btrfs_set_prop()?
+
+Looking at btrfs_set_prop(), it calls prop_compression_validate() followed by
+prop_compression_apply(). The caller btrfs_set_prop() assumes the apply step
+cannot fail after a successful validation:
+
+fs/btrfs/props.c:btrfs_set_prop() {
+    ...
+    ret = handler->apply(inode, value, value_len);
+    /* We validated before, so it should not fail here. */
+    ASSERT(ret == 0);
+    ...
+}
+
+If kmemdup_nul() fails due to memory pressure and returns -ENOMEM, won't this
+cause the assertion to fail and crash the kernel? Additionally, can allocating
+with GFP_KERNEL while holding an active Btrfs transaction handle lead to
+direct reclaim deadlocks?
+
+[ ... ]
+> +	/* Parse level if the algorithm supports it */
+> +	if (level_pos > 0) {
+> +		const char *level_str = value_str + level_pos;
+> +
+> +		/* and if user specified it */
+> +		if (level_str[0] == ':') {
+> +			ret = btrfs_compress_str2level(type, level_str, &level);
+> +			if (ret < 0)
+> +				goto out;
+> +		}
+>  	}
+>  
+>  	inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  	inode->flags |= BTRFS_INODE_COMPRESS;
+
+[Severity: High]
+This is a pre-existing issue, but does this lockless read-modify-write of
+inode->flags race with the background compression worker?
+
+If a user modifies xattrs causing prop_compression_apply() to update
+inode->flags from process context, can this race with the background worker
+thread in compress_file_range() processing an in-flight writeback?
+
+fs/btrfs/inode.c:compress_file_range() {
+    ...
+mark_incompressible:
+    if (!btrfs_test_opt(fs_info, FORCE_COMPRESS) && !inode->prop_compress)
+        inode->flags |= BTRFS_INODE_NOCOMPRESS;
+    ...
+}
+
+Could this concurrent modification overwrite other inode flags
+(like IMMUTABLE or APPEND) in memory, leading to silent data loss when
+the corrupted flags are later persisted to disk?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260907200518.428277-1-koray.fra@gmail.com?part=3
+

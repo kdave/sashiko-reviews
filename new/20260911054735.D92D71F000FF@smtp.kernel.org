@@ -1,0 +1,96 @@
+From sashiko-bot@kernel.org Fri Sep 11 07:47:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: fix the wrong direction for
+ BTRFS_IOC_DEVICES_READY
+Date: Fri, 11 Sep 2026 05:47:35 +0000
+Message-Id: <20260911054735.D92D71F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [Critical] Changing BTRFS_IOC_DEVICES_READY from _IOR to _IOW alters the ioctl command number, breaking backward compatibility with existing userspace binaries.
+
+Pre-existing issues:
+- [High] btrfs_control_ioctl unconditionally reads 4096 bytes from userspace via memdup_user before checking the ioctl command, which can cause spurious -EFAULTs or -EINVALs for BTRFS_IOC_GET_SUPPORTED_FEATURES.
+--
+
+commit 050b81c2d1b79ef00f749ada6aa3e838f3878843
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: fix the wrong direction for BTRFS_IOC_DEVICES_READY
+
+This commit changes the ioctl direction for BTRFS_IOC_DEVICES_READY from
+_IOR to _IOW. This ensures it matches userspace expectations, as userspace
+is writing the btrfs_ioctl_vol_args structure.
+
+> diff --git a/include/uapi/linux/btrfs.h b/include/uapi/linux/btrfs.h
+> index 0a13baf3d8d14..b5e488a5cf755 100644
+> --- a/include/uapi/linux/btrfs.h
+> +++ b/include/uapi/linux/btrfs.h
+> @@ -1211,7 +1211,7 @@ struct btrfs_ioctl_get_csums_args {
+>  #define BTRFS_IOC_SET_RECEIVED_SUBVOL _IOWR(BTRFS_IOCTL_MAGIC, 37, \
+>  				struct btrfs_ioctl_received_subvol_args)
+>  #define BTRFS_IOC_SEND _IOW(BTRFS_IOCTL_MAGIC, 38, struct btrfs_ioctl_send_args)
+> -#define BTRFS_IOC_DEVICES_READY _IOR(BTRFS_IOCTL_MAGIC, 39, \
+> +#define BTRFS_IOC_DEVICES_READY _IOW(BTRFS_IOCTL_MAGIC, 39, \
+>  				     struct btrfs_ioctl_vol_args)
+
+[Severity: Critical]
+Does changing this ioctl command from _IOR to _IOW alter the integer value of
+the command, creating an incompatible ABI?
+
+Older userspace tools, such as btrfs-progs invoked by udev rules, will still
+send the legacy _IOR version of BTRFS_IOC_DEVICES_READY.
+
+Looking at btrfs_control_ioctl() in fs/btrfs/super.c, there is no fallback
+case to gracefully handle the legacy _IOR variant:
+
+fs/btrfs/super.c:btrfs_control_ioctl() {
+	...
+	switch (cmd) {
+	...
+	case BTRFS_IOC_DEVICES_READY:
+		mutex_lock(&uuid_mutex);
+	...
+}
+
+Without a fallback handler for the old command number, older binaries will
+be rejected with -ENOTTY. Could this prevent multi-device volumes from
+assembling automatically on boot?
+
+[Severity: High]
+This is a pre-existing issue, but does btrfs_control_ioctl() unconditionally
+read 4096 bytes from userspace before checking the ioctl command?
+
+fs/btrfs/super.c:btrfs_control_ioctl() {
+	...
+	vol = memdup_user((void __user *)arg, sizeof(*vol));
+	if (IS_ERR(vol))
+		return PTR_ERR(vol);
+	ret = btrfs_check_ioctl_vol_args_path(vol);
+	if (ret < 0)
+		goto out;
+
+	switch (cmd) {
+	...
+	case BTRFS_IOC_GET_SUPPORTED_FEATURES:
+		ret = btrfs_ioctl_get_supported_features((void __user*)arg);
+		break;
+	...
+}
+
+BTRFS_IOC_GET_SUPPORTED_FEATURES expects a much smaller memory structure
+(72 bytes).
+
+If a privileged user calls BTRFS_IOC_GET_SUPPORTED_FEATURES with a 72-byte
+buffer, could the unconditional 4096-byte read (sizeof(*vol)) cause a
+spurious -EFAULT if the buffer is near the end of a mapped page? Furthermore,
+if the read succeeds but the trailing uninitialized memory lacks a null byte,
+could btrfs_check_ioctl_vol_args_path() incorrectly return -EINVAL?
+
+>  #define BTRFS_IOC_QUOTA_CTL _IOWR(BTRFS_IOCTL_MAGIC, 40, \
+>  			       struct btrfs_ioctl_quota_ctl_args)
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789104905.git.wqu@suse.com?part=1
+

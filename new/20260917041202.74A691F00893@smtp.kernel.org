@@ -1,0 +1,57 @@
+From sashiko-bot@kernel.org Thu Sep 17 06:12:12 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 01/17] btrfs: stop enabling the v1 space cache from
+ the on-disk state
+Date: Thu, 17 Sep 2026 04:12:02 +0000
+Message-Id: <20260917041202.74A691F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: FREE_SPACE_TREE option leaks on invalid RO remounts
+--
+
+commit 6751f883b4d1cad106e74cd1b62922302a1c3544
+Author: Tal Zussman <tz2294@columbia.edu>
+
+btrfs: stop enabling the v1 space cache from the on-disk state
+
+This commit prevents the v1 space cache from being automatically enabled
+based on the on-disk state. Remounts of read-only filesystems with an old
+cache no longer start a transaction, and space cache cleanup happens
+unconditionally upon a read-write mount.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index 464129b1b0d4c..77443ded6db39 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+[ ... ]
+> @@ -1535,10 +1529,6 @@ static int btrfs_reconfigure(struct fs_context *fc)
+>  			btrfs_set_opt(fs_info->mount_opt, FREE_SPACE_TREE);
+>  			btrfs_clear_opt(fs_info->mount_opt, SPACE_CACHE);
+>  		}
+> -		if (btrfs_free_space_cache_v1_active(fs_info)) {
+> -			btrfs_clear_opt(fs_info->mount_opt, FREE_SPACE_TREE);
+> -			btrfs_set_opt(fs_info->mount_opt, SPACE_CACHE);
+> -		}
+>  	}
+>  
+>  	ret = 0;
+
+[Severity: Medium]
+Does removing the v1 space cache check here allow the FREE_SPACE_TREE option
+to leak on invalid read-only remounts?
+
+If a user with a filesystem using the v1 space cache attempts a read-only
+remount with "space_cache=v2", the kernel emits a warning that this is only
+supported on a read-write remount and intends to reject it.
+
+However, because the v1_active check that previously reverted the
+FREE_SPACE_TREE option was removed without an unconditional fallback, the
+option appears to silently leak into fs_info->mount_opt in
+btrfs_reconfigure().
+
+If the user later performs a standard read-write remount, could the kernel
+see the leaked option and unexpectedly create the v2 free space tree?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260916-btrfs-remove-v1-space-cache-v3-0-10ebde03b96f@columbia.edu?part=1
+

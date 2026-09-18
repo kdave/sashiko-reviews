@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Wed Sep  9 19:46:03 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: downgrade the reflink source inode lock
+Date: Wed, 09 Sep 2026 17:45:51 +0000
+Message-Id: <20260909174552.58E7B1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] Downgrading the source inode's VFS lock to shared before calling `inode_dio_wait()` allows concurrent direct I/O reads to indefinitely starve the reflink operation, leading to a local Denial of Service.
+--
+
+commit 7dc2fd42d9b9d9dd8fca3327819012872e766eda
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: downgrade the reflink source inode lock
+
+This commit optimizes reflink operations by downgrading the source inode's
+VFS lock from exclusive to shared. It adds a runtime flag to ensure direct
+I/O writes still acquire the lock exclusively when synchronizing with a
+reflink source.
+
+> diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+> index d2a4101912bdb..e33926243030c 100644
+> --- a/fs/btrfs/reflink.c
+> +++ b/fs/btrfs/reflink.c
+
+[ ... ]
+
+> @@ -943,6 +943,16 @@ loff_t btrfs_remap_file_range(struct file *src_file, loff_t off,
+>  	} else {
+>  		lock_two_nondirectories(&src_inode->vfs_inode, &dst_inode->vfs_inode);
+>  		btrfs_double_mmap_lock(src_inode, dst_inode);
+> +
+> +		/*
+> +		 * Reflink is a read operation on the src inode and a write on
+> +		 * the dst, so lock them accordingly. One wrinkle is that direct
+> +		 * writes try to take inode->i_rwsem shared so we must do an
+> +		 * acquire exclusive; set bit; downgrade to shared dance to
+> +		 * synchronize with that one weird writer.
+> +		 */
+> +		set_bit(BTRFS_INODE_REFLINK_SRC, &src_inode->runtime_flags);
+> +		downgrade_write(&src_inode->vfs_inode.i_rwsem);
+
+[Severity: High]
+Could downgrading the source inode's VFS lock to shared here allow
+concurrent direct I/O reads to indefinitely starve the reflink operation?
+
+Shortly after this downgrade, the code calls into the prep routines:
+
+btrfs_remap_file_range()
+  btrfs_remap_file_range_prep()
+    generic_remap_file_range_prep()
+      inode_dio_wait()
+
+Because the source lock is now shared, new incoming direct I/O reads can
+successfully acquire the shared i_rwsem lock and increment i_dio_count.
+If there is a constant stream of DIO reads against the source file,
+inode_dio_wait() might never see i_dio_count reach 0.
+
+Since the reflink thread is holding the exclusive i_mmap_lock on both
+files, and the exclusive i_rwsem on the destination file, could this
+lead to a local Denial of Service by permanently hanging the thread and
+blocking all other operations (like page faults or fsyncs) on both files?
+
+>  	}
+>  
+>  	ret = btrfs_remap_file_range_prep(src_file, off, dst_file, destoff,
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/65fa79581e1d29d6d6fabae71d23e741bff0ddf9.1788974902.git.boris@bur.io?part=1
+

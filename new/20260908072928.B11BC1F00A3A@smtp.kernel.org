@@ -1,0 +1,65 @@
+From sashiko-bot@kernel.org Tue Sep  8 09:29:40 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/3] btrfs: use kvmalloc() for uncompress_inline()
+Date: Tue, 08 Sep 2026 07:29:28 +0000
+Message-Id: <20260908072928.B11BC1F00A3A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [Critical] Memory corruption due to out-of-bounds write in read_inline_extent() for large folios
+--
+
+commit 2663facda2c9e2bfa13e6d35753a6d1ddfbd69e8
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: use kvmalloc() for uncompress_inline()
+
+This commit modifies uncompress_inline() to use kvmalloc() instead of kmalloc()
+when allocating a buffer for compressed inline extents. This prevents memory
+allocation failures when mounting filesystems with large block sizes on systems
+with smaller page sizes (bs > ps) and fragmented memory.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 1917325d15b19..7ae380c76f8b4 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -7133,7 +7133,7 @@ static noinline int uncompress_inline(struct btrfs_path *path,
+[ ... ]
+>  	if (max_size < blocksize)
+>  		folio_zero_range(folio, max_size, blocksize - max_size);
+> -	kfree(tmp);
+> +	kvfree(tmp);
+>  	return ret;
+>  }
+
+[Severity: Critical]
+This is a pre-existing issue, but can read_inline_extent() write out of bounds
+when handling inline extents larger than PAGE_SIZE?
+
+When a filesystem is mounted with bs > ps support (e.g., 64K blocksize on a
+system with 4K pagesize) and reads an uncompressed inline extent larger than
+PAGE_SIZE, copy_size will be greater than PAGE_SIZE.
+
+In fs/btrfs/inode.c:read_inline_extent():
+
+	copy_size = min_t(u64, blocksize,
+			  btrfs_file_extent_ram_bytes(path->nodes[0], fi));
+	kaddr = kmap_local_folio(folio, 0);
+	read_extent_buffer(path->nodes[0], kaddr,
+			   btrfs_file_extent_inline_start(fi), copy_size);
+	kunmap_local(kaddr);
+
+kmap_local_folio() only maps a single page. If copy_size > PAGE_SIZE,
+read_extent_buffer() copies up to blocksize bytes into kaddr, which overflows
+the single mapped page boundary. On systems with CONFIG_HIGHMEM, this accesses
+unmapped memory because adjacent pages in a high-order allocation are not
+mapped, causing memory corruption or faults.
+
+Could read_inline_extent() be updated to iterate through the folio pages for
+large uncompressed extents, similar to how uncompress_inline() was adapted
+for large compressed extents?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1788851649.git.wqu@suse.com?part=2
+

@@ -1,0 +1,130 @@
+From sashiko-bot@kernel.org Tue Sep 15 17:14:54 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: test that we don't create pointless
+ compressed inline extents
+Date: Tue, 15 Sep 2026 15:14:44 +0000
+Message-Id: <20260915151444.7EC061F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] btrfs: fstests script added to wrong repository causes silent fail-open
+- [Medium] btrfs: dump-tree crashes are masked by pipeline
+- [Low] btrfs: brittle quoted argument in _scratch_mount
+- [Low] btrfs: awk variable state leak across inline extent records
+--
+
+commit 2572aada94a37151610907fa52b386edeec7f6b1
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: test that we don't create pointless compressed inline extents
+
+Verify that we don't create compressed inline extents when the compressed
+data size is not smaller than the uncompressed data size.
+
+> diff --git a/tests/btrfs/354 b/tests/btrfs/354
+> new file mode 100755
+> index 0000000000000..1b25ab5de8977
+> --- /dev/null
+> +++ b/tests/btrfs/354
+> @@ -0,0 +1,46 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 354
+> +#
+> +# Verify that we don't create compressed inline extents when the compressed
+> +# data size is not smaller than the uncompressed data size.
+> +#
+> +. ./common/preamble
+
+[Severity: High]
+Since this test script is being added to the Linux kernel repository instead
+of the xfstests repository, will this attempt to source a non-existent
+framework file fail?
+
+Because bash continues execution without set -e, the script will silently
+fail-open here.
+
+> +_begin_fstest auto quick compress
+> +
+> +. ./common/filter
+> +
+> +_fixed_by_kernel_commit xxxxxxxxxxxx \
+> +	"btrfs: fix creation of compressed inline extents that don't save space"
+> +
+> +_require_scratch
+> +_require_btrfs_command inspect-internal dump-tree
+> +
+> +algo_list=($(_btrfs_compression_algos))
+
+[Severity: High]
+Will this command substitution also silently fail due to the missing xfstests
+framework?
+
+This skips the main validation loop entirely, printing 'Silence is golden',
+and exiting with status 0. Does this introduce a broken testing component that
+creates a false sense of security for kernel developers?
+
+> +for algo in ${algo_list[@]}; do
+> +	_scratch_mkfs >>$seqres.full 2>&1 || _fail "mkfs failed"
+> +	_scratch_mount "-o compress=$algo"
+
+[Severity: Low]
+Does this pass the mount options incorrectly by relying on brittle shell
+word-splitting bugs?
+
+Passing the flag and its argument as a single quoted string containing a space
+only mounts successfully today due to legacy unquoted variable expansions ($*)
+inside fstests' _scratch_mount implementation that word-splits the string back
+into two arguments.
+
+If the fstests framework ever tightens its argument parsing, could the test
+fail to mount the scratch device?
+
+> +
+> +	echo 'a file with test content' > $SCRATCH_MNT/foobar
+> +	_scratch_unmount
+> +	_check_scratch_fs
+> +
+> +	$BTRFS_UTIL_PROG inspect-internal dump-tree -t 5 $SCRATCH_DEV | \
+> +		tee -a $seqres.full | \
+> +		$AWK_PROG -v algo="$algo" '
+
+[Severity: Medium]
+Will this pipeline structure discard the exit code of the dump-tree tool?
+
+In standard bash execution (without set -o pipefail), the exit code of the
+pipeline is determined by the last command (awk). If the btrfs utility crashes
+due to a segfault or severe filesystem corruption that aborts tree traversal,
+awk will still gracefully exit with 0.
+
+Could this cause the test to silently succeed instead of raising an alarm?
+
+> +		  /inline extent/ {
+> +			for (i = 1; i < NF; i++) {
+
+[Severity: Low]
+Should extent_size and ram_size be explicitly initialized to 0 here before
+parsing the current record's fields?
+
+The global awk variables extent_size and ram_size are updated conditionally
+but never reset to 0 at the start of each /inline extent/ processing block.
+
+If the btrfs-progs output format drops fields or changes to span multiple
+lines in the future, could the awk script compare a compressed size from one
+extent against the decompressed size of a completely different extent, leading
+to false positives or false negatives?
+
+> +			      if ($i ~ /^size$/)
+> +				 extent_size = $(i + 1)
+> +			      if ($i ~ /^ram_bytes$/)
+> +			         ram_size = $(i + 1)
+> +			}
+> +			if (extent_size > ram_size)
+> +			   printf "inline extent size (%d) greater than ram_size (%d) for algo %s\n", extent_size, ram_size, algo
+> +		  }'
+> +done
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/5acebd19e4e5b9b825497947ef32527cc2103147.1789484528.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Fri Sep 11 05:53:22 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 3/6] btrfs: add per-inode compression levels in
+ xattrs
+Date: Fri, 11 Sep 2026 03:53:12 +0000
+Message-Id: <20260911035312.6997C1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] `inode->flags` is modified without a lock, leading to an SMP read-modify-write race that can permanently clobber critical security flags like `IMMUTABLE`.
+--
+
+commit 702e54a1b688cef98071c621570d975117388a2b
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: add per-inode compression levels in xattrs
+
+This commit adds support for specifying compression algorithms and levels
+using btrfs property set. It introduces a prop_compress_level field to
+btrfs_inode and applies it during compression setup.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index a85a7c561cf8e..2df3eb19ee300 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -942,6 +942,11 @@ static void compress_file_range(struct btrfs_work *work)
+>  		compress_level = inode->defrag_compress_level;
+>  	} else if (inode->prop_compress) {
+>  		compress_type = inode->prop_compress;
+> +		if (inode->prop_compress_level)
+> +			compress_level = inode->prop_compress_level;
+> +		else if (compress_type != fs_info->compress_type)
+> +			compress_level = 0;
+> +		/* else use fs_info->compress_level */
+>  	}
+>  
+>  	/* Compression level is applied here. */
+
+[Severity: High]
+This isn't a bug introduced by this patch, but since this patch modifies
+compress_file_range() in fs/btrfs/inode.c, does this function have a
+read-modify-write race condition?
+
+Further down in compress_file_range(), under the mark_incompressible label:
+
+	if (!btrfs_test_opt(fs_info, FORCE_COMPRESS) && !inode->prop_compress)
+		inode->flags |= BTRFS_INODE_NOCOMPRESS;
+
+This non-atomic bitwise-or operation modifies inode->flags without holding
+inode_lock() or spin_lock(&inode->lock). Background writeback executes
+compress_file_range() asynchronously on a worker thread.
+
+Concurrently, if an unprivileged user writes to a file to trigger background
+writeback, and an administrator runs chattr +i to secure it,
+btrfs_fileattr_set() in fs/btrfs/ioctl.c updates the flags while holding
+inode_lock():
+
+	inode->flags = inode_flags;
+	btrfs_update_inode_mapping_flags(inode);
+	btrfs_sync_inode_flags_to_i_flags(inode);
+	inode_inc_iversion(&inode->vfs_inode);
+	inode_set_ctime_current(&inode->vfs_inode);
+	ret = btrfs_update_inode(trans, inode);
+
+If compress_file_range() reads the flags before chattr updates them, and
+writes them back after chattr stores the new flags, can important security
+flags like the immutable flag be silently overwritten?
+
+It appears that btrfs_fileattr_set() would then sync this state to the virtual
+file system and persist it to disk, resulting in a loss of those security
+flags.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260911033336.957102-1-koray.fra@gmail.com?part=3
+

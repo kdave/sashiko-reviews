@@ -1,0 +1,70 @@
+From sashiko-bot@kernel.org Fri Sep 11 07:48:37 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: introduce a new ioctl to force updating the
+ device name
+Date: Fri, 11 Sep 2026 05:48:26 +0000
+Message-Id: <20260911054826.AA48D1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] PROVE_RCU lockdep splat due to `btrfs_dev_name()` call without `rcu_read_lock()` in newly activated code path.
+- [Low] BTRFS_IOC_RENAME_DEV permits renaming a device to its exact same current path, causing an unnecessary memory allocation, string copy, RCU free, and misleading kernel logs.
+--
+
+commit 6c7f0ad3f13b21620cbe288b3ca219c832c64c04
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce a new ioctl to force updating the device name
+
+This commit introduces a new ioctl BTRFS_IOC_RENAME_DEV to allow userspace
+to explicitly force updating a btrfs device path. By pushing the responsibility
+to the end user, it aims to resolve historical corner cases in btrfs device
+name resolution.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 4ddabadc91885..268bf10ab181f 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+[ ... ]
+> @@ -869,7 +869,7 @@ static noinline struct btrfs_device *device_list_add(const char *path,
+>  				MAJOR(path_devt), MINOR(path_devt),
+>  				current->comm, task_pid_nr(current));
+>  
+> -	} else if (!device->name || device->devt != path_devt) {
+> +	} else if (!device->name || device->devt != path_devt || force_rename) {
+
+[Severity: Low]
+Does BTRFS_IOC_RENAME_DEV permit renaming a device to its exact same
+current path?
+
+When force_rename is true in device_list_add() in fs/btrfs/volumes.c,
+if the ioctl is called with the exact same path the device already uses, it
+seems it will unnecessarily allocate a new string, swap the RCU pointer,
+free the old string, and log a misleading message indicating a rename to
+the same name.
+
+[Severity: High]
+Can this new force_rename path trigger a PROVE_RCU lockdep splat?
+
+By allowing execution to reach the previously unreachable btrfs_info() call
+further down in device_list_add():
+
+fs/btrfs/volumes.c:device_list_add() {
+    ...
+    if (device->bdev) {
+        ...
+        btrfs_info(NULL,
+            "devid %llu device path %s changed to %s scanned by %s (%d)",
+            devid, btrfs_dev_name(device),
+            path, current->comm,
+            task_pid_nr(current));
+    }
+    ...
+}
+
+This calls btrfs_dev_name(device) without holding rcu_read_lock(). Since
+force_rename makes this path reachable via BTRFS_IOC_RENAME_DEV, it exposes
+a violation of RCU locking rules.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789104905.git.wqu@suse.com?part=2
+

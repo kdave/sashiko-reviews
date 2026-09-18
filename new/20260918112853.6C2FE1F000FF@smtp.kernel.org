@@ -1,0 +1,22 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:29:03 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 05/21] fsverity: don't allow setting DAX file
+ attribute on fsverity files
+Date: Fri, 18 Sep 2026 11:28:53 +0000
+Message-Id: <20260918112853.6C2FE1F000FF@smtp.kernel.org>
+
+> When fsverity is enabled on the file, with FS_IOC_ENABLE_VERITY ioctl(),
+> it checks if file has DAX enabled and fails if that's true. However, the
+> opposite case is not checked.
+> 
+> Note, that the only other filesystem supporting DAX and fsverity is
+> ext4, and ext4 does check for this case.
+> 
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=5
+
+

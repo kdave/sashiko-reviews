@@ -1,0 +1,19 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:32:22 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 02/21] fsverity: expose ensure_fsverity_info()
+Date: Fri, 18 Sep 2026 11:32:11 +0000
+Message-Id: <20260918113211.E06991F00893@smtp.kernel.org>
+
+> This function will be used by XFS's scrub to force fsverity activation,
+> therefore, to read fsverity context.
+> 
+> Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+> Acked-by: Eric Biggers <ebiggers@kernel.org>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=2
+
+

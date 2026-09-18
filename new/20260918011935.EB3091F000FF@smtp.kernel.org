@@ -1,0 +1,174 @@
+From sashiko-bot@kernel.org Fri Sep 18 03:19:46 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 RESEND 6/6] btrfs: enable experimental delayed
+ compression support
+Date: Fri, 18 Sep 2026 01:19:35 +0000
+Message-Id: <20260918011935.EB3091F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: metadata reservation deficit for delayed OEs causes -ENOSPC transaction aborts
+- [High] btrfs: premature lock release and state modification without lock in run_delalloc_delayed error path
+- [Medium] btrfs: severe latency spikes during defrag due to waiting on entire requested range
+--
+
+commit 76d50337970fbce0887e8dbaab172b39acf93b6e
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: enable experimental delayed compression support
+
+This commit enables experimental delayed compression support for btrfs.
+It allocates delayed extent maps and ordered extents during run_delalloc
+without reserving data extents, which are then assembled and intercepted
+before submission to run compression and allocate real extents.
+
+> diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+> index 6ec5dd760d429..32801ae4da7ab 100644
+> --- a/fs/btrfs/defrag.c
+> +++ b/fs/btrfs/defrag.c
+[ ... ]
+> @@ -1471,10 +1472,28 @@ int btrfs_defrag_file(struct btrfs_inode *inode, struct file_ra_state *ra,
+>  		 * need to be written back immediately.
+>  		 */
+>  		if (range->flags & BTRFS_DEFRAG_RANGE_START_IO) {
+> -			filemap_flush(inode->vfs_inode.i_mapping);
+> -			if (test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+> -				     &inode->runtime_flags))
+> +			/*
+> +			 * For experimental delayed writeback, we must wait
+> +			 * for the range to be fully written back before
+> +			 * clearing inode->defrag_compress.
+> +			 *
+> +			 * Regular filemap_flush() will only start writeback,
+> +			 * which will only create delayed OEs. But the real
+> +			 * compression is happening later.
+> +			 * This means if we just flush but not wait for writeback,
+> +			 * the inode->defrag_compress clearing can race with
+> +			 * compression, so the requested compression algorithm
+> +			 * is not applied.
+> +			 */
+> +			if (IS_ENABLED(CONFIG_BTRFS_EXPERIMENTAL)) {
+> +				filemap_write_and_wait_range(inode->vfs_inode.i_mapping,
+> +							     start, last_byte);
+
+[Severity: Medium]
+If defrag is cancelled early or hits an error, the cur variable can be less
+than last_byte. Does this cause the thread to synchronously wait for
+writeback on potentially gigabytes of unrelated dirty data that defrag did
+not touch?
+
+Should filemap_write_and_wait_range() use the actual progress bound
+(e.g. cur - 1) instead of the requested upper bound last_byte in
+btrfs_defrag_file()?
+
+> +			} else {
+>  				filemap_flush(inode->vfs_inode.i_mapping);
+> +				if (test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+> +					     &inode->runtime_flags))
+> +					filemap_flush(inode->vfs_inode.i_mapping);
+> +			}
+>  		}
+>  		if (range->compress_type == BTRFS_COMPRESS_LZO)
+>  			btrfs_set_fs_incompat(fs_info, COMPRESS_LZO);
+[ ... ]
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 6566164653363..78ebb3f81d017 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -1659,6 +1659,68 @@ static bool run_delalloc_compressed(struct btrfs_inode *inode,
+>  	return true;
+>  }
+>  
+> +static int run_delalloc_delayed(struct btrfs_inode *inode, struct folio *locked_folio,
+> +				u64 start, u64 end)
+> +{
+> +	struct btrfs_root *root = inode->root;
+> +	struct btrfs_fs_info *fs_info = root->fs_info;
+> +	struct extent_state *cached = NULL;
+> +	u64 cur = start;
+> +	int ret;
+> +
+> +	if (btrfs_is_shutdown(fs_info)) {
+> +		ret = -EIO;
+> +		goto error;
+> +	}
+> +	while (cur < end) {
+> +		struct extent_map *em;
+> +		struct btrfs_ordered_extent *oe;
+> +		u32 cur_len = min_t(u64, end + 1 - cur, BTRFS_MAX_COMPRESSED);
+> +
+> +		btrfs_lock_extent(&inode->io_tree, cur, cur + cur_len - 1, &cached);
+> +		em = btrfs_create_delayed_em(inode, cur, cur_len);
+> +		if (IS_ERR(em)) {
+> +			ret = PTR_ERR(em);
+> +			goto error;
+> +		}
+> +		btrfs_free_extent_map(em);
+> +		oe = btrfs_alloc_delayed_ordered_extent(inode, cur, cur_len);
+> +		if (IS_ERR(oe)) {
+> +			btrfs_drop_extent_map_range(inode, cur, cur + cur_len - 1, false);
+> +			ret = PTR_ERR(oe);
+> +			goto error;
+> +		}
+> +		btrfs_put_ordered_extent(oe);
+> +
+> +		cur += cur_len;
+> +	}
+> +	/*
+> +	 * Force the next fsync to wait for any delayed OE to finish,
+> +	 * as the fast path cannot handle delayed OE correctly.
+> +	 */
+> +	btrfs_set_inode_full_sync(inode);
+> +	extent_clear_unlock_delalloc(inode, start, end, locked_folio, &cached,
+> +				     EXTENT_LOCKED | EXTENT_DELALLOC,
+> +				     PAGE_UNLOCK);
+
+[Severity: High]
+Does clearing EXTENT_DELALLOC here create a metadata reservation deficit?
+
+In fs/btrfs/ordered-data.c, alloc_ordered_extent() explicitly skips
+incrementing the outstanding_extents counter for delayed OEs. But
+extent_clear_unlock_delalloc() unconditionally decrements
+outstanding_extents when clearing EXTENT_DELALLOC.
+
+It seems this would prematurely release the metadata reservation back to
+space_info. When the compression worker later creates the real child OE, it
+increments outstanding_extents but does not reserve space. Can this lead to
+-ENOSPC transaction aborts?
+
+> +	return 0;
+> +error:
+> +	if (start < cur) {
+> +		btrfs_drop_extent_map_range(inode, start, cur - 1, false);
+> +		btrfs_cleanup_ordered_extents(inode, start, cur - start);
+> +		extent_clear_unlock_delalloc(inode, start, cur - 1, locked_folio, &cached,
+> +			EXTENT_LOCKED | EXTENT_DELALLOC,
+> +			PAGE_UNLOCK | PAGE_START_WRITEBACK | PAGE_END_WRITEBACK);
+> +	}
+> +	if (cur < end) {
+> +		extent_clear_unlock_delalloc(inode, cur, end, locked_folio, &cached,
+> +			EXTENT_LOCKED | EXTENT_DELALLOC | EXTENT_DELALLOC_NEW |
+> +			EXTENT_DEFRAG | EXTENT_DO_ACCOUNTING,
+> +			PAGE_UNLOCK | PAGE_START_WRITEBACK | PAGE_END_WRITEBACK);
+
+[Severity: High]
+Can this lead to premature lock release and state modification without holding
+the lock?
+
+This call clears EXTENT_LOCKED and other state bits for the remaining
+unprocessed range [cur, end]. However, the while loop above only acquires the
+extent lock incrementally for [cur, cur + cur_len - 1]. The remaining portion
+[cur + cur_len, end] is unlocked.
+
+Does blindly clearing EXTENT_LOCKED unlock extents that may be legitimately
+locked by concurrent threads? Furthermore, does modifying EXTENT_DELALLOC
+without holding the lock violate io_tree locking rules?
+
+> +		btrfs_qgroup_free_data(inode, NULL, cur, end + 1 - cur, NULL);
+> +	}
+> +	return ret;
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789692182.git.wqu@suse.com?part=6
+

@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Mon Sep 14 21:04:20 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix creation of compressed inline extents
+ that don't save space
+Date: Mon, 14 Sep 2026 19:04:08 +0000
+Message-Id: <20260914190409.59A0A1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] The preemptive `can_cow_file_range_inline` check incorrectly applies compressed size limits to the uncompressed file size, breaking inline compression for valid files.
+- [High] LZO compression unconditionally fails with `-E2BIG` for all inline extents smaller than a sector due to an invalid bitwise shift boundary check.
+--
+
+commit 755d54167eeabb1fd8b64bf42564dc76cea85051
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix creation of compressed inline extents that don't save space
+
+This commit modifies the inline extent creation logic to pass the inode's
+i_size instead of blocksize to btrfs_compress_bio(), avoiding compression
+when the data doesn't shrink. It also adds a preemptive check using
+can_cow_file_range_inline() before attempting compression.
+
+Link: https://lore.kernel.org/linux-btrfs/c97652a5-ac6b-4de6-aa23-3cdebc01d00b@gmail.com/
+
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -2319,7 +2319,8 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  	 */
+>  	btrfs_check_folio_write_protected(locked_folio);
+>  
+> -	if (btrfs_inode_can_compress(inode) &&
+> +	if (can_cow_file_range_inline(inode, 0, i_size, 0) &&
+> +	    btrfs_inode_can_compress(inode) &&
+
+[Severity: High]
+Does this preemptive check unintentionally reject valid compressible files?
+
+Because 0 is passed for the compressed_size argument,
+can_cow_file_range_inline() evaluates data_len using the uncompressed i_size.
+Inside can_cow_file_range_inline(), there are checks that evaluate data_len
+against sectorsize and max_inline:
+
+	/* We do not allow a non-compressed extent to be as large as block size. */
+	if (data_len >= fs_info->sectorsize)
+		return false;
+
+	/* We cannot exceed the user specified max_inline size. */
+	if (data_len > fs_info->max_inline)
+		return false;
+
+When a file is exactly sectorsize (e.g., 4096 bytes) or its uncompressed size
+is larger than max_inline (default 2048) but smaller than sectorsize, this
+will return false preemptively. This appears to break inline compression for
+these files, even if their data would successfully compress to a valid inline
+size.
+
+>  	    inode_need_compress(inode, 0, blocksize, true)) {
+>  		if (inode->defrag_compress > 0 &&
+>  		    inode->defrag_compress < BTRFS_NR_COMPRESS_TYPES) {
+> @@ -2328,7 +2329,7 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  		} else if (inode->prop_compress) {
+>  			compress_type = inode->prop_compress;
+>  		}
+> -		cb = btrfs_compress_bio(inode, 0, blocksize, compress_type, compress_level, 0);
+> +		cb = btrfs_compress_bio(inode, 0, i_size, compress_type, compress_level, 0);
+
+[Severity: High]
+Does passing i_size instead of blocksize break LZO compression for inline
+extents smaller than a sector?
+
+When run_delalloc_inline() passes a length smaller than sectorsize down to
+btrfs_compress_bio(), it propagates to LZO compression in
+copy_compressed_data_to_bio() as max_out.
+
+Looking at the boundary check in fs/btrfs/lzo.c:copy_compressed_data_to_bio():
+
+		/* With the range copied, we're larger than the original range. */
+		if (((*total_out + copy_len) >> sectorsize_bits) >=
+		    max_out >> sectorsize_bits)
+			return -E2BIG;
+
+If i_size (and thus max_out) is less than a sector, max_out >> sectorsize_bits
+evaluates to 0. Since the left side of the inequality is at least 0, this
+check will unconditionally evaluate to true and return -E2BIG. This causes
+LZO inline compression to fail completely for these files.
+
+>  		if (IS_ERR(cb)) {
+>  			cb = NULL;
+>  			/* Just fall back to non-compressed case. */
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/422f0a1a6537835f43f52d58e5c8ff539d85b20b.1789411443.git.fdmanana@suse.com?part=1
+

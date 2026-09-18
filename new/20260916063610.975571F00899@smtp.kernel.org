@@ -1,0 +1,104 @@
+From sashiko-bot@kernel.org Wed Sep 16 08:36:21 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/2] btrfs: test ENOSPC handling on fsverity rollback
+Date: Wed, 16 Sep 2026 06:36:10 +0000
+Message-Id: <20260916063610.975571F00899@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] test: btrfs orphan cleanup destroys leaked items before test validation
+- [Low] test: xfstests script mis-targeted to Linux kernel repository
+--
+
+commit 69ae6d3ee2c09337c423bdda6ce40caad60886a6
+Author: Daniel Linjama <daniel@dev.linjama.com>
+
+btrfs: test ENOSPC handling on fsverity rollback
+
+This commit adds a test to ensure the filesystem stays writable and properly
+cleans up verity and orphan items when an fsverity enable operation and its
+rollback run out of space.
+
+> diff --git a/tests/btrfs/355 b/tests/btrfs/355
+> new file mode 100755
+> index 0000000000000..8127d25d54a05
+> --- /dev/null
+> +++ b/tests/btrfs/355
+> @@ -0,0 +1,117 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 Daniel Linjama.  All Rights Reserved.
+> +#
+> +# FS QA Test 355
+> +#
+> +# Test that a failed fsverity enable on a full filesystem leaves the
+> +# filesystem usable. The -ENOSPC counterpart of btrfs/354.
+> +#
+> +. ./common/preamble
+
+[Severity: Low]
+Is this script intended for the external xfstests repository instead of the
+Linux kernel tree?
+
+The inclusion of common/preamble and the use of _begin_fstest suggest a hard
+dependency on the xfstests framework, which is not present in the kernel tree.
+
+[ ... ]
+
+> +check_rollback()
+> +{
+> +	# Deleting a filler needs no new space, it fails only if the fs went read-only.
+> +	rm -f $SCRATCH_MNT/filler 2>> $seqres.full || \
+> +		echo "filesystem was forced read-only by the failed verity enable"
+> +	if $FSVERITY_PROG measure $target >> $seqres.full 2>&1; then
+> +		echo "verity is enabled on the target after a failed enable"
+> +	fi
+> +}
+> +
+> +check_remount()
+> +{
+> +	_scratch_unmount
+> +	_try_scratch_mount >> $seqres.full 2>&1 || \
+> +		_fail "cannot mount the filesystem after the failed verity enable"
+> +	$XFS_IO_PROG -c "pread -q 0 1m" $target >> $seqres.full 2>&1 || \
+> +		echo "cannot read the target file after the failed verity enable"
+> +	_scratch_unmount
+> +}
+> +
+> +check_leftover_items()
+> +{
+> +	local dump=$($BTRFS_UTIL_PROG inspect-internal dump-tree -t 5 $SCRATCH_DEV)
+> +	local verity_items=$(echo "$dump" | grep -c "($ino VERITY_\(DESC\|MERKLE\)_ITEM")
+> +	local orphans=$(echo "$dump" | grep -c "(ORPHAN ORPHAN_ITEM $ino)")
+> +
+> +	echo "$dump" >> $seqres.full
+> +	[ "$verity_items" -eq 0 ] || \
+> +		echo "$verity_items verity items left behind by the failed enable"
+> +	[ "$orphans" -eq 0 ] || \
+> +		echo "$orphans orphan items left behind by the failed enable"
+> +}
+> +
+> +prepare
+> +create_target
+> +fill_fs
+> +enable_fsverity
+> +check_rollback
+> +check_remount
+> +check_leftover_items
+
+[Severity: Medium]
+Does calling check_remount() before check_leftover_items() inadvertently
+destroy the very leaked items this test tries to detect?
+
+In check_rollback(), the script deletes a 1GB filler file which frees up space
+on the filesystem. When check_remount() subsequently calls _try_scratch_mount,
+Btrfs will automatically run orphan cleanup during the mount.
+
+Since space is now available again, won't the mount-time cleanup successfully
+remove any orphan or verity items left behind by the failed fsverity enable?
+
+If the remount cleans up the leaked items first, check_leftover_items() might
+incorrectly pass even if the kernel bug it is testing for is present.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260916062356.690137-1-daniel@dev.linjama.com?part=2
+

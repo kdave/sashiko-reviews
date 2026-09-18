@@ -1,0 +1,56 @@
+From sashiko-bot@kernel.org Fri Sep 11 05:45:48 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 2/6] btrfs: also validate compression levels in
+ btrfs_compress_is_valid_type()
+Date: Fri, 11 Sep 2026 03:45:37 +0000
+Message-Id: <20260911034538.33EA21F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] Inconsistent validation and UAPI breakage for compression xattrs with trailing newlines.
+--
+
+commit ae78d8c4f61aa2a268f148729b87da66fabd5903
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: also validate compression levels in btrfs_compress_is_valid_type()
+
+This commit updates btrfs_compress_is_valid_type() to use 
+btrfs_match_compress_type() and btrfs_compress_str2level() instead of 
+strncmp() for validation.
+
+> diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+> index 2880ee1f80d1a..de10d96aee8af 100644
+> --- a/fs/btrfs/compression.c
+> +++ b/fs/btrfs/compression.c
+[ ... ]
+> @@ -70,18 +70,30 @@ static struct compressed_bio *alloc_compressed_bio(struct btrfs_inode *inode,
+[ ... ]
+> -		if (!strncmp(btrfs_compress_types[i], str, comp_len))
+> -			return true;
+> +		if (btrfs_match_compress_type(str, comp_type, true)) {
+> +			if (btrfs_compress_str2level(i, str + comp_len, &tmp_level) == 0)
+> +				return true;
+> +		}
+
+[Severity: Medium]
+Does this change introduce a regression for userspace scripts setting the
+btrfs.compression xattr with trailing newlines?
+
+Previously, the simple strncmp() checked only up to comp_len, which
+allowed strings like "zstd\n" (e.g., from echo zstd | setfattr) to be
+accepted.
+
+With this change, btrfs_match_compress_type() strictly rejects any
+trailing characters for base compression types, so "zstd\n" now fails
+with -EINVAL.
+
+However, strings with levels like "zstd:9\n" will silently pass because
+btrfs_compress_str2level() uses kstrtoint(), which explicitly ignores
+trailing newlines.
+
+Could this inconsistent validation break backwards compatibility for legacy
+configuration scripts?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260911033336.957102-1-koray.fra@gmail.com?part=2
+

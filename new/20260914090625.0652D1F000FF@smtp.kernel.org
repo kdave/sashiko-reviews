@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Mon Sep 14 11:06:35 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/4] btrfs: zoned: requeue block group if zone reset
+ bails out
+Date: Mon, 14 Sep 2026 09:06:24 +0000
+Message-Id: <20260914090625.0652D1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] Re-adding the block group to unused_bgs on failure or read-only status resurrects concurrently deleted block groups, causing data corruption (resetting reallocated zones) and kernel panics.
+--
+
+commit a1f59e183bbb3f3d762d72dad9ece9cdd94e86df
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: requeue block group if zone reset bails out
+
+btrfs_reset_unused_block_groups() drops the block-group from
+fs_info->unused_bgs before performing the work that can actually fail,
+the actual submission of a REQ_OP_ZONE_RESET. Every failed operation
+after this leaves the block-group dangling. Instead of bailing out,
+re-add this block-group to fs_info->unused_bgs list.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index fbf391bbebea8..a649646d0a151 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -3201,7 +3201,7 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		if (bg->ro) {
+>  			spin_unlock(&bg->lock);
+>  			spin_unlock(&space_info->lock);
+> -			continue;
+> +			goto requeue;
+>  		}
+
+[Severity: Critical]
+Does this code incorrectly resurrect a deleted block group if it was
+concurrently relocated and deleted?
+
+If a concurrent balance or reclaim operation relocates and deletes the
+block group while btrfs_reset_unused_block_groups() has dropped the list
+lock, the block group will have bg->ro set.
+
+By taking the requeue path here, the fully deleted block group gets added
+back to the retry_list instead of being safely discarded.
+
+[ ... ]
+
+> @@ -3230,12 +3230,30 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		btrfs_return_free_space(space_info, reclaimed);
+>  		spin_unlock(&space_info->lock);
+>  
+> +		btrfs_put_block_group(bg);
+> +
+>  		if (num_bytes <= reclaimed)
+>  			break;
+>  		num_bytes -= reclaimed;
+> +		continue;
+> +
+> +requeue:
+> +		spin_lock(&fs_info->unused_bgs_lock);
+> +		list_add_tail(&bg->bg_list, &retry_list);
+> +		spin_unlock(&fs_info->unused_bgs_lock);
+
+[Severity: Critical]
+Can adding this block group back to the unused list via retry_list lead to
+data corruption or kernel panics?
+
+Since the physical space might have been freed and reallocated to a new
+chunk by the concurrent deletion, a subsequent run of
+btrfs_reset_unused_block_groups() could pick this logically deleted block
+group again.
+
+Issuing REQ_OP_ZONE_RESET to its old physical sectors would destroy the
+new chunk's data. Alternatively, btrfs_delete_unused_bgs() could try to
+delete it again and crash at an ASSERT(map != NULL) since the chunk map
+is already deleted.
+
+Can we ensure that concurrently deleted block groups are safely discarded
+instead of requeued?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260914085248.347198-1-johannes.thumshirn@wdc.com?part=3
+

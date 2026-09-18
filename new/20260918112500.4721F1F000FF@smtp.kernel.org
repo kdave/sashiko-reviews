@@ -1,0 +1,19 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:25:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 03/21] fsverity: pass digest size and hash of the
+ all-zeroes block to ->write
+Date: Fri, 18 Sep 2026 11:24:59 +0000
+Message-Id: <20260918112500.4721F1F000FF@smtp.kernel.org>
+
+> Let filesystem iterate over hashes in the block and check if these are
+> hashes of zeroed data blocks. XFS will use this to decide if it want to
+> store tree block full of these hashes.
+> 
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=3
+
+

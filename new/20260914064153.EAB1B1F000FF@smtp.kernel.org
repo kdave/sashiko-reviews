@@ -1,0 +1,129 @@
+From sashiko-bot@kernel.org Mon Sep 14 08:42:04 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: don't force the filesystem read-only on
+ EDQUOT/ENOSPC verity rollback
+Date: Mon, 14 Sep 2026 06:41:53 +0000
+Message-Id: <20260914064153.EAB1B1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] The patch fails to handle -EDQUOT/-ENOSPC during the second phase of verity rollback, meaning the filesystem will still be incorrectly forced read-only under the exact conditions the patch attempts to fix.
+- [High] Intentionally leaving verity orphans on -EDQUOT/-ENOSPC causes permanent mount or subvolume lookup failures.
+--
+
+commit 7510deb1b439ae64e4681db106f6d21cb44e2a97
+Author: Daniel Linjama <daniel@dev.linjama.com>
+
+btrfs: don't force the filesystem read-only on EDQUOT/ENOSPC verity rollback
+
+This commit attempts to prevent forcing the filesystem read-only when
+rolling back fsverity enable hits a quota or space limit. It skips
+btrfs_handle_fs_error() for -EDQUOT and -ENOSPC during verity item
+deletion, leaving the orphan item in place for cleanup on the next mount.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index d432fec21c15b..0f8aa2f64b0df 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+[ ... ]
+> @@ -450,9 +452,21 @@ static int rollback_verity(struct btrfs_inode *inode)
+>  	clear_bit(BTRFS_INODE_VERITY_IN_PROGRESS, &inode->runtime_flags);
+>  	ret = btrfs_drop_verity_items(inode);
+>  	if (ret) {
+> -		btrfs_handle_fs_error(root->fs_info, ret,
+> -				"failed to drop verity items in rollback %llu",
+> -				inode->vfs_inode.i_ino);
+> +		/*
+> +		 * -EDQUOT and -ENOSPC mean we could not reserve metadata to
+> +		 * delete the verity items. That is not a consistency problem,
+> +		 * so don't turn the filesystem read-only. Leave the items and
+> +		 * the orphan in place, orphan cleanup on the next mount will
+> +		 * remove them.
+> +		 */
+> +		if (ret != -EDQUOT && ret != -ENOSPC)
+> +			btrfs_handle_fs_error(root->fs_info, ret,
+> +					      "failed to drop verity items in rollback %llu",
+> +					      inode->vfs_inode.i_ino);
+> +		else
+> +			btrfs_warn(root->fs_info,
+> +				   "failed to drop verity items in rollback %llu: %pe",
+> +				   inode->vfs_inode.i_ino, ERR_PTR(ret));
+
+[Severity: High]
+This isn't a bug introduced by this patch, but will leaving this orphan item
+cause the filesystem to permanently fail to mount read-write?
+
+If btrfs_drop_verity_items() fails with -EDQUOT here, the patch relies on
+btrfs_orphan_cleanup() to handle the leftover orphan items during the next
+mount.
+
+During the next mount, btrfs_orphan_cleanup() in fs/btrfs/inode.c will
+call btrfs_drop_verity_items() again:
+
+fs/btrfs/inode.c:btrfs_orphan_cleanup() {
+    ...
+    if (inode) {
+        ret = btrfs_drop_verity_items(inode);
+        iput(&inode->vfs_inode);
+        inode = NULL;
+        if (ret)
+            goto out;
+    }
+    ...
+}
+
+Since the qgroup limit is persistent across reboots, this drop will
+likely fail with -EDQUOT again.
+
+This error propagates to btrfs_start_pre_rw_mount() in fs/btrfs/disk-io.c:
+
+fs/btrfs/disk-io.c:btrfs_start_pre_rw_mount() {
+    ...
+    if ((ret = btrfs_orphan_cleanup(fs_info->fs_root)) ||
+        (ret = btrfs_orphan_cleanup(fs_info->tree_root))) {
+        up_read(&fs_info->cleanup_work_sem);
+        return ret;
+    }
+    ...
+}
+
+Could this cause the RW mount to abort entirely, resulting in a persistent
+Denial of Service where the filesystem is unmountable for writes?
+
+>  		goto out;
+>  	}
+
+[Severity: High]
+This is a pre-existing issue, but does the error path immediately following
+this defeat the purpose of the patch?
+
+If btrfs_drop_verity_items() succeeds (or returns 0), the code attempts
+to start a transaction to delete the orphan item and update the inode:
+
+fs/btrfs/verity.c:rollback_verity() {
+...
+	trans = btrfs_start_transaction(root, 2);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		trans = NULL;
+		btrfs_handle_fs_error(root->fs_info, ret,
+			"failed to start transaction in verity rollback %llu",
+			inode->vfs_inode.i_ino);
+		goto out;
+	}
+...
+}
+
+Under the same quota or space limits that motivated this patch, reserving
+2 units of metadata in btrfs_start_transaction() is highly likely to fail
+with -EDQUOT or -ENOSPC.
+
+If it fails, it hits the unpatched btrfs_handle_fs_error() call.
+
+Would this unconditionally force the entire filesystem read-only, triggering
+the exact issue this patch attempts to prevent?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260914062459.3889313-1-daniel@dev.linjama.com?part=1
+

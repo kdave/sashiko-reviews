@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Fri Sep 11 05:38:44 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 1/6] btrfs: export btrfs_match_compress_type(), move
+ it to compression.h
+Date: Fri, 11 Sep 2026 03:38:34 +0000
+Message-Id: <20260911033834.935B71F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] The function documentation comment for btrfs_match_compress_type incorrectly describes the return condition.
+--
+
+commit 9c9b93747e5d996cb992818c619a2c0ac504a37c
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: export btrfs_match_compress_type(), move it to compression.h
+
+This commit exports btrfs_match_compress_type() from a static function
+in super.c to compression.c and exposes it in compression.h. This allows
+it to be used in other files as validation for compression algorithm names.
+
+> diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+> index 20169d0289619..2880ee1f80d1a 100644
+> --- a/fs/btrfs/compression.c
+> +++ b/fs/btrfs/compression.c
+
+[ ... ]
+
+> +/**
+> + * btrfs_match_compress_type - Check if the string matches the compression type
+> + * @string:         The string to check
+> + * @type:           The compression type string (name) to match against (e.g. "zstd")
+> + * @may_have_level: If true, the string may have a level suffix (e.g., ":1")
+> + *
+> + * Return: %true if the string matches the type and, if %may_have_level is %true,
+> + * has a level suffix, %false otherwise.
+> + */
+
+[Severity: Low]
+Is this documentation accurate regarding the may_have_level parameter?
+
+The comment states the function returns true if the string matches the
+type and, if may_have_level is true, has a level suffix. This implies a level
+suffix is mandatory when may_have_level is true.
+
+However, looking at the code below, the function also returns true for
+exact matches without a suffix (string[len] == '\0') regardless of the
+may_have_level flag.
+
+Could the kernel-doc be updated to clarify that the suffix is optional even
+when may_have_level is true?
+
+> +bool btrfs_match_compress_type(const char *string, const char *type, bool may_have_level)
+> +{
+> +	const int len = strlen(type);
+> +
+> +	return (strncmp(string, type, len) == 0) &&
+> +		((may_have_level && string[len] == ':') || string[len] == '\0');
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260911033336.957102-1-koray.fra@gmail.com?part=1
+

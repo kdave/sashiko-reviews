@@ -1,0 +1,21 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:32:06 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 17/21] xfs: add fs-verity ioctls
+Date: Fri, 18 Sep 2026 11:31:55 +0000
+Message-Id: <20260918113156.2CA921F000FF@smtp.kernel.org>
+
+> Add fs-verity ioctls to enable, dump metadata (descriptor and Merkle
+> tree pages) and obtain file's digest.
+> 
+> [djwong: remove unnecessary casting]
+> 
+> Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=17
+
+

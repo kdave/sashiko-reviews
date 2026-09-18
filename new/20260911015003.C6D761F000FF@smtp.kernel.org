@@ -1,0 +1,91 @@
+From sashiko-bot@kernel.org Fri Sep 11 03:50:19 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: introduce a new ioctl to force updating the
+ device name
+Date: Fri, 11 Sep 2026 01:50:03 +0000
+Message-Id: <20260911015003.C6D761F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+
+New issues:
+- [High] BTRFS_IOC_RENAME_DEV is defined with the _IOR macro instead of _IOW, incorrectly specifying the ioctl data transfer direction.
+
+Pre-existing issues:
+- [Critical] btrfs_scan_one_device() returns a raw, unprotected btrfs_device pointer which is dereferenced by callers without sufficient synchronization, leading to a Use-After-Free if btrfs_rm_device() runs concurrently.
+--
+
+commit a9800979be28d0f0f9ae131f9153562c4a8806eb
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce a new ioctl to force updating the device name
+
+This commit introduces BTRFS_IOC_RENAME_DEV to allow users to forcefully
+update a device name without relying on the automatic device scan behavior.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index 6ddb7b3521662..631aa9bae852b 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+
+[ ... ]
+
+> @@ -2250,7 +2250,7 @@ static long btrfs_control_ioctl(struct file *file, unsigned int cmd,
+>  		 * Scanning outside of mount can return NULL which would turn
+>  		 * into 0 error code.
+>  		 */
+> -		device = btrfs_scan_one_device(vol->name, false);
+> +		device = btrfs_scan_one_device(vol->name, 0);
+>  		if (IS_ERR_OR_NULL(device)) {
+>  			mutex_unlock(&uuid_mutex);
+>  			ret = PTR_ERR_OR_ZERO(device);
+> @@ -2260,6 +2260,12 @@ static long btrfs_control_ioctl(struct file *file, unsigned int cmd,
+>  			device->fs_devices->total_devices);
+
+[Severity: Critical]
+This is a pre-existing issue, but I noticed a potential use-after-free
+risk here. btrfs_scan_one_device() returns a raw btrfs_device pointer,
+which is then dereferenced to access device->fs_devices->num_devices
+while only holding the uuid_mutex. 
+
+Could a concurrent btrfs_rm_device() execution free this device before we
+access it? btrfs_rm_device() uses device_list_mutex and synchronize_rcu()
+for safe removal, but we don't seem to be holding rcu_read_lock() or the
+device_list_mutex here, meaning the device could potentially be freed while
+we check its totals.
+
+>  		mutex_unlock(&uuid_mutex);
+>  		break;
+> +	case BTRFS_IOC_RENAME_DEV:
+> +		mutex_lock(&uuid_mutex);
+> +		device = btrfs_scan_one_device(vol->name, BTRFS_SCAN_DEV_RENAME);
+> +		ret = PTR_ERR_OR_ZERO(device);
+> +		mutex_unlock(&uuid_mutex);
+> +		break;
+
+[ ... ]
+
+> diff --git a/include/uapi/linux/btrfs.h b/include/uapi/linux/btrfs.h
+> index 0a13baf3d8d14..7c0af7f74dfd1 100644
+> --- a/include/uapi/linux/btrfs.h
+> +++ b/include/uapi/linux/btrfs.h
+> @@ -1226,6 +1226,8 @@ struct btrfs_ioctl_get_csums_args {
+>  #define BTRFS_IOC_QUOTA_RESCAN_STATUS _IOR(BTRFS_IOCTL_MAGIC, 45, \
+>  			       struct btrfs_ioctl_quota_rescan_args)
+>  #define BTRFS_IOC_QUOTA_RESCAN_WAIT _IO(BTRFS_IOCTL_MAGIC, 46)
+> +#define BTRFS_IOC_RENAME_DEV _IOR(BTRFS_IOCTL_MAGIC, 47, \
+> +				  struct btrfs_ioctl_vol_args)
+
+[Severity: High]
+Does this UAPI macro define the wrong data transfer direction?
+
+The ioctl accepts a struct btrfs_ioctl_vol_args from userspace, which
+implies it should use _IOW (user writes to kernel). By using _IOR (kernel
+writes to user), tools like strace, seccomp filters, or emulators (like
+qemu-user) may fail to copy the input buffer into the guest kernel,
+breaking the ioctl under emulation.
+
+>  #define BTRFS_IOC_GET_FSLABEL 	FS_IOC_GETFSLABEL
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/85742cbddd2728bfff7f39ebe14689ffef14a31d.1789090296.git.wqu@suse.com?part=1
+

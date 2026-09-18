@@ -1,0 +1,84 @@
+From sashiko-bot@kernel.org Wed Sep 16 04:53:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: clear free space tree creation state on
+ rebuild failure
+Date: Wed, 16 Sep 2026 02:53:22 +0000
+Message-Id: <20260916025322.970281F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: clearing BTRFS_FS_CREATING_FREE_SPACE_TREE early causes metadata corruption
+--
+
+commit 0ab19a413fe895a5cef899fa43cdeaf5561b7787
+Author: Guanghui Yang <3497809730@qq.com>
+
+btrfs: clear free space tree creation state on rebuild failure
+
+This commit clears the BTRFS_FS_CREATING_FREE_SPACE_TREE flag on failure
+paths during free space tree rebuilding. This prevents the flag from
+remaining set on live filesystems if a transaction restart fails.
+
+> diff --git a/fs/btrfs/free-space-tree.c b/fs/btrfs/free-space-tree.c
+> index 1b3d82ae3de80..b7a4a6ade30f0 100644
+> --- a/fs/btrfs/free-space-tree.c
+> +++ b/fs/btrfs/free-space-tree.c
+
+[ ... ]
+
+> @@ -1371,14 +1371,16 @@ int btrfs_rebuild_free_space_tree(struct btrfs_fs_info *fs_info)
+>  		if (unlikely(ret)) {
+>  			btrfs_abort_transaction(trans, ret);
+>  			btrfs_end_transaction(trans);
+> -			return ret;
+> +			goto out_clear;
+>  		}
+>  next:
+>  		if (btrfs_should_end_transaction(trans)) {
+>  			btrfs_end_transaction(trans);
+>  			trans = btrfs_start_transaction(free_space_root, 1);
+> -			if (IS_ERR(trans))
+> -				return PTR_ERR(trans);
+> +			if (IS_ERR(trans)) {
+> +				ret = PTR_ERR(trans);
+> +				goto out_clear;
+> +			}
+>  		}
+>  		node = rb_next(node);
+>  	}
+
+[ ... ]
+
+> @@ -1390,6 +1392,10 @@ int btrfs_rebuild_free_space_tree(struct btrfs_fs_info *fs_info)
+>  	ret = btrfs_commit_transaction(trans);
+>  	clear_bit(BTRFS_FS_FREE_SPACE_TREE_UNTRUSTED, &fs_info->flags);
+>  	return ret;
+> +
+> +out_clear:
+> +	clear_bit(BTRFS_FS_CREATING_FREE_SPACE_TREE, &fs_info->flags);
+> +	return ret;
+>  }
+
+[Severity: High]
+Can this early flag clearing cause metadata corruption?
+
+Looking at btrfs_rebuild_free_space_tree(), if btrfs_start_transaction()
+fails (e.g., due to ENOMEM) during the block group iteration, the code jumps
+to out_clear and clears BTRFS_FS_CREATING_FREE_SPACE_TREE. This returns an
+error without aborting the transaction.
+
+When this failure occurs on mount or remount, the error propagates up and
+eventually triggers close_ctree() which commits the un-aborted dirty
+transaction.
+
+During the commit, btrfs_run_delayed_refs() processes the delayed refs
+generated during the partial rebuild (e.g., from metadata allocations).
+Since BTRFS_FS_CREATING_FREE_SPACE_TREE is now cleared, it does not exit
+early, and instead calls btrfs_add_to_free_space_tree().
+
+Because the FREE_SPACE_TREE compat flag is still set, does this result in
+modifying the inconsistent, partially rebuilt free space tree, potentially
+triggering an ASSERT() or causing silent metadata corruption?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/tencent_705010B6315454003C478AE79E1F215E6E08@qq.com?part=1
+

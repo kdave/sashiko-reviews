@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Thu Sep 17 13:09:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix off by one super block end offset
+ calculation in write_dev_supers()
+Date: Thu, 17 Sep 2026 11:09:22 +0000
+Message-Id: <20260917110922.D052D1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: missing superblock I/O wait on device boundary
+--
+
+commit 92a72b90ab73dfe022ec482fb5c5512c54557fb1
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix off by one super block end offset calculation in write_dev_supers()
+
+This commit prevents skipping a superblock mirror write when its end offset
+exactly matches the device's commit total bytes. It does this by changing
+a >= comparison to > in write_dev_supers().
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index bfd7815a461ec..5730841ab56b6 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -3887,8 +3887,7 @@ static int write_dev_supers(struct btrfs_device *device,
+>  			atomic_inc(&device->sb_write_errors);
+>  			continue;
+>  		}
+> -		if (bytenr + BTRFS_SUPER_INFO_SIZE >=
+> -		    device->commit_total_bytes)
+> +		if (bytenr + BTRFS_SUPER_INFO_SIZE > device->commit_total_bytes)
+>  			break;
+
+[Severity: High]
+Since this changes the boundary condition to include superblocks that exactly
+match the device size, does wait_dev_supers() need the same fix?
+
+Looking at wait_dev_supers() in fs/btrfs/disk-io.c:
+
+	for (i = 0; i < max_mirrors; i++) {
+		...
+		if (bytenr + BTRFS_SUPER_INFO_SIZE >=
+		    device->commit_total_bytes)
+			break;
+
+		folio = filemap_get_folio(device->bdev->bd_mapping,
+					  bytenr >> PAGE_SHIFT);
+		...
+		folio_wait_locked(folio);
+		folio_put(folio);
+	}
+
+If the device size perfectly matches the end offset of a superblock mirror,
+write_dev_supers() will now correctly issue the write. However, because
+wait_dev_supers() still uses the >= operator, won't it break out early and
+skip the folio_wait_locked() completion tracking?
+
+Does skipping this wait break the filesystem write barrier guarantees,
+allowing the transaction commit to complete before the write is confirmed
+on disk?
+
+>  
+>  		btrfs_set_super_bytenr(sb, bytenr_orig);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/c5e7ed76826ca4504f5b0bb7de9f5f2e45365143.1789642741.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Thu Sep 10 04:14:21 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: simplify heuristic_collect_sample() to
+ handle large folios better
+Date: Thu, 10 Sep 2026 02:14:09 +0000
+Message-Id: <20260910021410.0AB481F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] `kmap_local_folio()` maps only a single page, leading to out-of-bounds access when iterating across large folios.
+--
+
+commit ea68ff5808dc5a76c8b451ec9b47450f217d1ccd
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: simplify heuristic_collect_sample() to handle large folios better
+
+This commit simplifies the heuristic sampling function by operating on a
+per-folio basis. It updates the loop to process the sample copying inside
+the folio in one go, mapping the folio once at offset 0.
+
+> diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+> index 0134b92537020..ad90e14032dbb 100644
+> --- a/fs/btrfs/compression.c
+> +++ b/fs/btrfs/compression.c
+
+[ ... ]
+
+> @@ -1508,33 +1506,27 @@ static void heuristic_collect_sample(struct inode *inode, u64 start, u64 end,
+>  	if (end + 1 - start > BTRFS_MAX_UNCOMPRESSED)
+>  		end = start + BTRFS_MAX_UNCOMPRESSED - 1;
+>  
+> -	index = start >> PAGE_SHIFT;
+> -	index_end = end >> PAGE_SHIFT;
+> +	while (cur < end) {
+> +		struct folio *folio;
+> +		void *in_data;
+> +		u64 next_pos;
+>  
+> -	curr_sample_pos = 0;
+> -	while (index <= index_end) {
+> -		folio = filemap_get_folio(inode->i_mapping, index);
+> +		folio = filemap_get_folio(inode->i_mapping, cur >> PAGE_SHIFT);
+> +		/* All folios inside the range should exist and be locked. */
+>  		ASSERT(!IS_ERR(folio));
+> +		next_pos = min_t(u64, end + 1, folio_next_pos(folio));
+> +		in_data = kmap_local_folio(folio, 0);
+> +
+> +		for (; cur < next_pos; cur += SAMPLING_INTERVAL) {
+> +			memcpy(&ws->sample[curr_sample_pos],
+> +			       in_data + offset_in_folio(folio, cur),
+> +			       SAMPLING_READ_SIZE);
+
+[Severity: High]
+Will this cause an out-of-bounds access when iterating across large folios?
+
+The function kmap_local_folio() maps only a single page from the folio.
+When a large folio is used, the inner loop continues advancing cur up to
+next_pos, and the pointer arithmetic adds offset_in_folio(folio, cur) to
+in_data.
+
+If CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP is enabled, accessing beyond PAGE_SIZE
+from the pointer returned by kmap_local_folio() will cause a page fault or
+read from unrelated fixmap slots. Does this mapping need to be re-acquired
+for each page within the folio during the iteration?
+
+>  			curr_sample_pos += SAMPLING_READ_SIZE;
+>  		}
+>  		kunmap_local(in_data);
+>  		folio_put(folio);
+> -
+> -		index++;
+> +		cur = next_pos;
+>  	}
+> -
+>  	ws->sample_size = curr_sample_pos;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789003160.git.wqu@suse.com?part=2
+

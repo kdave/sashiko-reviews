@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Sat Sep 12 20:22:49 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: derive f_fsid with dev_t only when temp_fsid is
+ active
+Date: Sat, 12 Sep 2026 18:22:39 +0000
+Message-Id: <20260912182239.8ECF21F0089F@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+
+Pre-existing issues:
+- [High] Dereferencing `fs_info->fs_devices->latest_dev` and its `bdev` without `rcu_read_lock()` allows a use-after-free during concurrent device replacement.
+--
+
+commit dbf4795b36109d20791086e939e61207b7a72c60
+Author: Anand Jain <asj@kernel.org>
+btrfs: derive f_fsid with dev_t only when temp_fsid is active
+
+This commit limits the mixing of dev_t into f_fsid to cloned filesystems
+where temp_fsid is active. This restores backward compatibility for standard
+mounts so that their statfs f_fsid remains consistent across reboots or
+device reattachments.
+
+Closes: https://lore.kernel.org/linux-btrfs/be0c08f5-2f31-40f5-8a3b-f2f58b3e00ff@intel.com
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index 6ddb7b3521662..14ed0ed823a3c 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+> @@ -1798,8 +1798,12 @@ static int btrfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+>  	f_fsid.val[0] ^= btrfs_root_id(BTRFS_I(d_inode(dentry))->root) >> 32;
+>  	f_fsid.val[1] ^= btrfs_root_id(BTRFS_I(d_inode(dentry))->root);
+>  
+> -	/* Hash dev_t to avoid f_fsid collision with cloned filesystems. */
+> -	if (fs_info->fs_devices->total_devices == 1) {
+> +	/*
+> +	 * Hash dev_t to avoid f_fsid collisions with cloned filesystems.
+> +	 * Only do this when a clone is present so the original filesystem
+> +	 * (mounted first) maintains backward-compatible f_fsid behavior.
+> +	 */
+> +	if (fs_info->fs_devices->temp_fsid) {
+>  		__kernel_fsid_t dev_fsid =
+>  			u64_to_fsid(huge_encode_dev(fs_info->fs_devices->latest_dev->bdev->bd_dev));
+
+[Severity: High]
+This isn't a bug introduced by this patch, but this is a pre-existing issue.
+Can dereferencing fs_info->fs_devices->latest_dev and its bdev here trigger
+a use-after-free during a concurrent device replacement?
+
+It looks like btrfs_statfs() evaluates latest_dev without holding
+rcu_read_lock() or the device_list_mutex. If a concurrent device replace
+operation occurs:
+
+btrfs_dev_replace_finishing()
+   ... updates latest_dev ...
+   btrfs_rm_dev_replace_free_srcdev()
+      synchronize_rcu()
+      ... frees the old device ...
+
+Since btrfs_statfs() does not hold rcu_read_lock(), the synchronize_rcu()
+call will not wait for it. If the thread is preempted right after reading
+the pointer, could statfs resume and dereference the freed device to access
+bdev->bd_dev, triggering a use-after-free and potentially leaking kernel
+memory into the f_fsid returned to userspace?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/16069a6fc651168bfcd2394d6e57ce63a50231ed.1789235482.git.asj@kernel.org?part=1
+

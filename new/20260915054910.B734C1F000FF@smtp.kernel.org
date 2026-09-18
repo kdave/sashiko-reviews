@@ -1,0 +1,127 @@
+From sashiko-bot@kernel.org Tue Sep 15 07:49:20 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: test qgroup limit handling on fsverity
+ rollback
+Date: Tue, 15 Sep 2026 05:49:10 +0000
+Message-Id: <20260915054910.B734C1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 5 potential issue(s) to consider:
+- [Medium] test: fstests script added directly to kernel repository
+- [Medium] test: unresolved _fixed_by_kernel_commit placeholder
+- [Medium] test: missing verification of subvolume writability in check_rollback()
+- [Medium] test: _notrun masks quota enforcement bug in enable_fsverity()
+- [Medium] test: undefined _btrfs command used in prepare()
+--
+
+commit 901164ccaddba5877de1ea9c04597348e923cd33
+Author: Daniel Linjama <daniel@dev.linjama.com>
+
+btrfs: test qgroup limit handling on fsverity rollback
+
+Test that the subvolume and the filesystem stay writable when an fsverity
+enable and its rollback hit the qgroup limit, and that the subvolume is
+still reachable after a remount with no verity or orphan items left behind.
+
+> diff --git a/tests/btrfs/354 b/tests/btrfs/354
+> new file mode 100755
+> index 0000000000000..e3f6716ad8e07
+> --- /dev/null
+> +++ b/tests/btrfs/354
+> @@ -0,0 +1,131 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 Daniel Linjama.  All Rights Reserved.
+> +#
+> +# FS QA Test 354
+> +#
+> +# Test that a failed fsverity enable in a subvolume whose qgroup is at its
+> +# limit leaves the filesystem usable.
+> +#
+> +. ./common/preamble
+
+[Severity: Medium]
+Should this test script be sent to the external xfstests repository instead
+of the Linux kernel tree?
+
+Adding it to the kernel repository creates a root tests/ directory where
+framework dependencies like common/preamble will not exist, preventing the
+test from running.
+
+[ ... ]
+
+> +_require_btrfs_command quota
+> +_require_no_compress
+> +_require_scratch_size $((2 * 1024 * 1024))
+> +_disable_fsverity_signatures
+> +
+> +_fixed_by_kernel_commit xxxxxxxxxxxx \
+> +	"btrfs: handle lack of space when cleaning up verity items"
+
+[Severity: Medium]
+Is the xxxxxxxxxxxx placeholder intentional here?
+
+Without the actual Git commit hash, the test suite may fail to correctly
+track the kernel fix or skip the test on older unpatched kernels.
+
+> +
+> +subv=$SCRATCH_MNT/sub
+> +target=$subv/target
+> +
+> +prepare()
+> +{
+> +	_scratch_mkfs_verity &>> $seqres.full
+> +	_scratch_mount
+> +	$BTRFS_UTIL_PROG quota enable $SCRATCH_MNT >> $seqres.full 2>&1
+> +	_qgroup_rescan $SCRATCH_MNT >> $seqres.full 2>&1
+> +	_btrfs subvolume create $subv
+
+[Severity: Medium]
+Will this fail with a "command not found" error during prepare()?
+
+It appears to use an undefined _btrfs wrapper command instead of the
+standard $BTRFS_UTIL_PROG used in the surrounding lines.
+
+> +	subvolid=$(_btrfs_get_subvolid $SCRATCH_MNT sub)
+> +	$BTRFS_UTIL_PROG qgroup limit 200M 0/$subvolid $SCRATCH_MNT >> $seqres.full 2>&1
+> +}
+
+[ ... ]
+
+> +enable_fsverity()
+> +{
+> +	if _fsv_enable $target >> $seqres.full 2>&1; then
+> +		_notrun "could not exhaust the qgroup limit, verity enable succeeded"
+
+[Severity: Medium]
+Should this be reported as a failure rather than using _notrun to skip the
+test?
+
+If fsverity enable succeeds despite the qgroup quota being completely
+exhausted by fill_qgroup(), this could indicate a severe quota enforcement
+bug in btrfs or a broken test setup. Skipping the test might silently mask
+these issues.
+
+> +	fi
+> +}
+> +
+> +check_rollback()
+> +{
+> +	touch $SCRATCH_MNT/canary 2>> $seqres.full || \
+> +		echo "filesystem was forced read-only by the failed verity enable"
+
+[Severity: Medium]
+Does this actually verify that the subvolume stays writable as promised in
+the commit message?
+
+The script currently only checks the root filesystem by touching a canary
+file. Since the subvolume's quota is full, writing to it directly would
+require freeing space first, which doesn't seem to be done here.
+
+> +	if $FSVERITY_PROG measure $target >> $seqres.full 2>&1; then
+> +		echo "verity is enabled on the target after a failed enable"
+> +	fi
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260915053815.307674-1-daniel@dev.linjama.com?part=1
+

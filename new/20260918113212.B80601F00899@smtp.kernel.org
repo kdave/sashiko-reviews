@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Fri Sep 18 13:32:23 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v16 13/21] xfs: add XFS_BMAPI_UNWRITTEN to unmap
+ unwritten extents in __xfs_bunmapi()
+Date: Fri, 18 Sep 2026 11:32:12 +0000
+Message-Id: <20260918113212.B80601F00899@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] xfs: XFS_BMAPI_UNWRITTEN corrupts data on realtime files
+--
+
+commit 03f3992d52956762d29c7c4c4908adeac76b8662
+Author: Andrey Albershteyn <aalbersh@kernel.org>
+xfs: add XFS_BMAPI_UNWRITTEN to unmap unwritten extents in __xfs_bunmapi()
+
+The __xfs_bunmapi() function is used to remove all extents past EOF. This
+patch adds XFS_BMAPI_UNWRITTEN to remove only unwritten extents, leaving
+written ones in place. This will be used to clean up unwritten extents on
+fsverity inodes.
+
+> diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+> index ba6a9611f6f9d..69364abbfd011 100644
+> --- a/fs/xfs/libxfs/xfs_bmap.c
+> +++ b/fs/xfs/libxfs/xfs_bmap.c
+> @@ -5279,6 +5279,10 @@ __xfs_bunmapi(
+>  		if (del.br_startoff + del.br_blockcount > end + 1)
+>  			del.br_blockcount = end + 1 - del.br_startoff;
+>  
+> +		if ((flags & XFS_BMAPI_UNWRITTEN) &&
+> +				del.br_state != XFS_EXT_UNWRITTEN)
+> +			goto skip;
+> +
+>  		if (!isrt || (flags & XFS_BMAPI_REMAP))
+>  			goto delete;
+>  
+
+[Severity: Critical]
+Does introducing the XFS_BMAPI_UNWRITTEN flag cause data corruption on
+realtime files due to how __xfs_bunmapi() handles unwritten extents?
+
+If a user creates a realtime file, writes data so that EOF is not aligned
+to the realtime extent size, and preallocates space after EOF (creating an
+unwritten extent), subsequent calls to clean up with XFS_BMAPI_UNWRITTEN
+(such as enabling fs-verity) will process the front-misaligned unwritten
+extent.
+
+Because __xfs_bunmapi() falls through to the legacy realtime misalignment
+logic for unwritten extents:
+
+			} else if (del.br_state == XFS_EXT_UNWRITTEN) {
+				struct xfs_bmbt_irec	prev;
+				...
+				/*
+				 * This one is already unwritten.
+				 * It must have a written left neighbor.
+				 * Unwrite the killed part of that one and
+				 * try again.
+				 */
+				...
+				prev.br_state = XFS_EXT_UNWRITTEN;
+				error = xfs_bmap_add_extent_unwritten_real(tp,
+						ip, whichfork, &icur, &cur,
+						&prev, &logflags);
+
+Could this legacy truncation logic forcefully unwrite the written left
+neighbor (the valid user data before EOF) to form a full realtime extent,
+effectively destroying the mapping to valid user data?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260918111539.1003439-1-aalbersh@kernel.org?part=13
+
