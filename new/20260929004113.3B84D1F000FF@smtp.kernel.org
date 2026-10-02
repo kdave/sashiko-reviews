@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Tue Sep 29 02:41:15 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 6/6] btrfs: find_free_extent checks size class unlocked
+Date: Tue, 29 Sep 2026 00:41:12 +0000
+Message-Id: <20260929004113.3B84D1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: unannotated data race when reading bitfield bg->size_class locklessly
+--
+
+commit 69e87f3fc4ca6a1069cef131e66b594cd0d27c79
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: find_free_extent checks size class unlocked
+
+This commit allows skipping block groups with the wrong size class in
+find_free_extent without taking block group locks to iterate past block
+groups quickly.
+
+> diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+> index d96de10348c11..10beb78a5ba38 100644
+> --- a/fs/btrfs/extent-tree.c
+> +++ b/fs/btrfs/extent-tree.c
+> @@ -4338,6 +4338,9 @@ static bool find_free_extent_skip_block_group(struct btrfs_block_group *block_gr
+>  			ffe_ctl->total_free_space = max(ffe_ctl->total_free_space,
+>  							free_space);
+>  			skip = true;
+> +		} else if (!find_free_extent_check_size_class(ffe_ctl, block_group)) {
+
+[Severity: Medium]
+Since this check is evaluated as a fast-path heuristic without holding
+block_group->lock, does this introduce an unannotated data race?
+
+Looking at find_free_extent_check_size_class(), it performs unprotected
+reads of bg->size_class:
+
+fs/btrfs/extent-tree.c:find_free_extent_check_size_class() {
+    ...
+    if (ffe_ctl->loop >= LOOP_UNSET_SIZE_CLASS &&
+        bg->size_class == BTRFS_BG_SZ_NONE)
+        return true;
+    return ffe_ctl->size_class == bg->size_class;
+}
+
+The size_class bitfield in struct btrfs_block_group can be concurrently
+updated by other operations under bg->lock, which triggers KCSAN warnings
+during file allocations.
+
+Because size_class is a bitfield, READ_ONCE() cannot be used since it
+requires taking the address. Does this read need a data_race() annotation,
+or could the bitfield specification (:8) be removed so READ_ONCE() can be
+used safely?
+
+> +			ffe_ctl->size_class_skipped = true;
+> +			skip = true;
+>  		}
+>  	}
+>  	if (!skip)
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790641462.git.boris@bur.io?part=6
+

@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Wed Sep 30 03:18:05 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: raid56: do not verify the content if there is no
+ data checksum
+Date: Wed, 30 Sep 2026 01:17:54 +0000
+Message-Id: <20260930011754.B55991F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] btrfs: out-of-bounds read in verify_one_sector() due to arithmetic typo
+--
+
+commit ec047b98808091fda01ec6c7649473fd0de9c96d
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: raid56: do not verify the content if there is no data checksum
+
+This commit adds a check in verify_one_sector() to skip checksum verification
+if there is no corresponding data checksum. This fixes an I/O error issue seen
+during fsync on degraded RAID56 arrays.
+
+Link: https://lore.kernel.org/linux-btrfs/a72409af-45ef-45df-9970-2e38bcb22ea6@fenski.pl/
+
+> diff --git a/fs/btrfs/raid56.c b/fs/btrfs/raid56.c
+> index 8ec24dbb180f9..38b48e53e11df 100644
+> --- a/fs/btrfs/raid56.c
+> +++ b/fs/btrfs/raid56.c
+> @@ -1889,6 +1889,8 @@ static int verify_one_sector(struct btrfs_raid_bio *rbio,
+>  {
+>  	struct btrfs_fs_info *fs_info = rbio->bioc->fs_info;
+>  	phys_addr_t *paddrs;
+> +	const unsigned int total_sector_nr =
+> +		stripe_nr + rbio->stripe_nsectors + sector_nr;
+
+[Severity: Critical]
+Does this calculation incorrectly use addition instead of multiplication?
+
+The previous code computed the index as
+stripe_nr * rbio->stripe_nsectors + sector_nr.
+
+Using addition here means the sector index can exceed the allocated bounds
+of rbio->csum_bitmap and rbio->csum_buf. This arithmetic typo results in
+incorrect sector indices being used, which could cause sectors to be verified
+against the wrong checksums and lead to silent data corruption.
+
+>  	u8 csum_buf[BTRFS_CSUM_SIZE];
+>  	u8 *csum_expected;
+>  
+> @@ -1898,6 +1900,11 @@ static int verify_one_sector(struct btrfs_raid_bio *rbio,
+>  	/* No way to verify P/Q as they are not covered by data csum. */
+>  	if (stripe_nr >= rbio->nr_data)
+>  		return 0;
+> +
+> +	/* No data checksum for this sector. */
+> +	if (!test_bit(total_sector_nr, rbio->csum_bitmap))
+
+[Severity: Critical]
+Can this perform an out-of-bounds bit test?
+
+Since total_sector_nr is calculated with addition rather than multiplication,
+the resulting index can exceed the bounds of rbio->csum_bitmap and cause an
+out-of-bounds memory read.
+
+> +		return 0;
+> +
+>  	/*
+>  	 * If we're rebuilding a read, we have to use pages from the
+>  	 * bio list if possible.
+> @@ -1908,9 +1915,7 @@ static int verify_one_sector(struct btrfs_raid_bio *rbio,
+>  		paddrs = rbio_stripe_paddrs(rbio, stripe_nr, sector_nr);
+>  	}
+>  
+> -	csum_expected = rbio->csum_buf +
+> -			(stripe_nr * rbio->stripe_nsectors + sector_nr) *
+> -			fs_info->csum_size;
+> +	csum_expected = rbio->csum_buf + total_sector_nr * fs_info->csum_size;
+>  	calculate_block_csum_paddrs(fs_info, paddrs, csum_buf);
+>  	if (unlikely(memcmp(csum_buf, csum_expected, fs_info->csum_size) != 0))
+
+[Severity: Critical]
+Could this result in an out-of-bounds read during memcmp()?
+
+Because total_sector_nr uses the incorrect calculation, the pointer derived
+for csum_expected can point outside of rbio->csum_buf. When memcmp() runs,
+it will read from this out-of-bounds pointer, posing a kernel panic risk.
+
+>  		return -EIO;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/2989cda015c8673ccd463a5225cb985dc9e36825.1790730674.git.wqu@suse.com?part=1
+

@@ -1,0 +1,102 @@
+From sashiko-bot@kernel.org Mon Sep 21 03:12:10 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 2/2] btrfs: remove the trailing zeros from compressed
+ inline extent
+Date: Mon, 21 Sep 2026 01:12:06 +0000
+Message-Id: <20260921011206.DAF6D1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: missing i_size == 0 check in run_delalloc_inline() allows panic
+--
+
+commit 60c931b2c2fb8453ede6717603738ddea6bb0145
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove the trailing zeros from compressed inline extent
+
+This commit changes the behavior of btrfs when generating compressed
+inline extents by using the file range [0, i_size) instead of
+[0, sectorsize). It introduces an early check to reject i_size >=
+blocksize to prevent races with btrfs_setsize() expansion while keeping
+the i_size stable during writeback.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index f4b68205f621e..11526472667f0 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -2314,6 +2314,27 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  	int ret;
+>  
+>  	ASSERT(folio_pos(locked_folio) == 0);
+> +
+> +	/*
+> +	 * It's possible that the i_size is expanded while writeback is running.
+> +	 * There is no special locking to prevent isize being updated.
+> +	 *
+> +	 * But for unaligned i_size, btrfs_setsize() will need to lock the
+> +	 * folio (which is held by us) before updating the isize, so if
+> +	 * i_size < blocksize btrfs_setsize() will wait for us.
+> +	 *
+> +	 * The only problem is when i_size == blocksize and compression is on.
+> +	 * In that case we previously allowed inline as long as the compressed
+> +	 * data is smaller than blocksize.
+> +	 * But since the i_size is already aligned, btrfs_setsize() would not
+> +	 * need to lock the folio, so btrfs_setsize() can race with us.
+> +	 *
+> +	 * Thus here we reject i_size >= blocksize to prevent racing with
+> +	 * btrfs_setsize() expansion.
+> +	 */
+> +	if (i_size >= blocksize)
+> +		return 1;
+> +
+
+[Severity: High]
+Does this check sufficiently protect against i_size truncation down to 0?
+
+The VFS function truncate_setsize() can update inode->i_size to 0 before
+calling truncate_pagecache(). If the background writeback thread has already
+locked folio 0 and passed the initial i_size checks in extent_writepage(),
+truncate_pagecache() will block waiting for the folio lock.
+
+Writeback then proceeds to run_delalloc_inline(), where it re-reads i_size.
+Since i_size is now 0, the check for i_size >= blocksize will pass, allowing
+an i_size of 0 to slip through.
+
+>  	/*
+>  	 * If an mmap writer could modify the folio while we copy it into an
+>  	 * inline extent we might see only part of their modification then
+[ ... ]
+> @@ -2331,12 +2352,7 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  		} else if (inode->prop_compress) {
+>  			compress_type = inode->prop_compress;
+>  		}
+> -		/*
+> -		 * We need to pass blocksize and not i_size, otherwise we can't
+> -		 * create compressed inline extents for data smaller than sector
+> -		 * size with lzo.
+> -		 */
+> -		cb = btrfs_compress_bio(inode, 0, blocksize, compress_type, compress_level, 0);
+> +		cb = btrfs_compress_bio(inode, 0, i_size, compress_type, compress_level, 0);
+
+[Severity: High]
+Can a 0-length request be passed to the compression engine here?
+
+Because i_size was changed to replace the previously safe blocksize parameter,
+and an i_size of 0 can pass the earlier checks, btrfs_compress_bio() can be
+called with a length of 0.
+
+This leads to a kernel panic on builds with CONFIG_BTRFS_ASSERT enabled,
+as the compression engine in lzo_compress_bio() calls ASSERT(len) which fails
+when len is 0. On non-debug builds, it passes a 0-length request to the
+compression engine, creating a malformed 0-byte inline extent.
+
+This appears reachable by a local user performing a write followed by a
+concurrent ftruncate() down to 0 while the system initiates writeback.
+
+>  		if (IS_ERR(cb)) {
+>  			cb = NULL;
+>  			/* Just fall back to non-compressed case. */
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789951424.git.wqu@suse.com?part=2
+

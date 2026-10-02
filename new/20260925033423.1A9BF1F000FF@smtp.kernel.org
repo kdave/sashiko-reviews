@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Fri Sep 25 05:34:34 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 4/6] btrfs: introduce compression for delayed bbio
+Date: Fri, 25 Sep 2026 03:34:22 +0000
+Message-Id: <20260925033423.1A9BF1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: incomplete cleanup in try_submit_compressed() error path leaks data space
+- [High] btrfs: double-free of delalloc metadata on delayed bbio error path
+- [High] btrfs: data race on child_cleanup_bitmap in delayed bbio error path
+--
+
+commit 958692b2bcca20895dfb3d257c8da0b0d1b31502
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: introduce compression for delayed bbio
+
+This patch introduces a compressed write path inside a delayed bbio. It
+modifies the regular compression flow to skip touching folio flags on
+error, call error handling only once, and avoid sequential execution of
+data extent reservation.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 0de121f505629..d301d05f3da1b 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -7714,23 +7714,164 @@ struct extent_map *btrfs_create_delayed_em(struct btrfs_inode *inode,
+[ ... ]
+> +static void clear_cleanup_bitmap(struct btrfs_ordered_extent *parent,
+> +				 u64 file_offset, u32 len)
+> +{
+> +	const u32 sectorbits = parent->inode->root->fs_info->sectorsize_bits;
+> +
+> +	bitmap_clear(parent->child_cleanup_bitmap,
+> +		     (file_offset - parent->file_offset) >> sectorbits,
+> +		     len >> sectorbits);
+
+[Severity: High]
+Does this introduce a data race? Multiple delayed bbios pointing to the
+same shared parent ordered extent can be submitted concurrently to the
+delayed_write_workers workqueue.
+
+If multiple workers hit an error in try_submit_compressed() simultaneously,
+they will both call clear_cleanup_bitmap(). Since bitmap_clear() modifies
+the unsigned long word locklessly, this concurrent read-modify-write could
+overwrite bits and cause the parent ordered extent to incorrectly execute
+cleanup on ranges already handled elsewhere.
+
+> +}
+[ ... ]
+> +static int try_submit_compressed(struct btrfs_bio *parent)
+> +{
+[ ... ]
+> +out_free_reserve:
+> +	btrfs_dec_block_group_reservations(fs_info, ins.objectid);
+> +	btrfs_free_reserved_extent(fs_info, ins.objectid, ins.offset, true);
+> +	btrfs_delalloc_release_metadata(inode, len, true);
+
+[Severity: High]
+Will this cause a double-free of delalloc metadata? The parent
+BTRFS_ORDERED_DELAYED ordered extent encompassing this chunk is still
+alive.
+
+When the parent ordered extent finishes, btrfs_remove_ordered_extent()
+will unconditionally release metadata for the entire parent's length. By
+releasing it here in the error path as well, it appears the metadata
+reservations (like inode->csum_bytes) might be released twice, leading to
+accounting corruption.
+
+> +	btrfs_unlock_extent(&inode->io_tree, fileoff, end, &cached);
+> +	cleanup_compressed_bio(cb);
+> +	/* parent bbio should have OE populated. */
+> +	ASSERT(parent->ordered);
+> +	clear_cleanup_bitmap(parent->ordered, parent->file_offset, len);
+
+[Severity: High]
+Does this error path leak data space reservations and io_tree bits?
+
+By clearing the parent's cleanup bitmap here, btrfs_finish_one_ordered()
+will skip cleaning up the data space and io_tree bits (EXTENT_DELALLOC_NEW)
+for this range. However, this out_free_reserve path doesn't seem to call
+btrfs_delalloc_release_space() either, permanently leaking the reservations.
+
+> +	ASSERT(ret < 0);
+> +	return ret;
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790306139.git.wqu@suse.com?part=4
+

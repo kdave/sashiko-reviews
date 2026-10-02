@@ -1,0 +1,72 @@
+From sashiko-bot@kernel.org Thu Oct  1 06:18:19 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: add a new test case to verify degraded
+ RMW writes
+Date: Thu, 01 Oct 2026 04:18:07 +0000
+Message-Id: <20261001041808.9D6401F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] fstests: test silently fails to degrade array due to undefined var
+- [Low] fstests: patch misdirected to linux kernel instead of fstests
+--
+
+commit 1bb97302cb562b0f5074331dd53069f93c608281
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a new test case to verify degraded RMW writes
+
+This commit adds a regression test for a degraded RMW writes bug.
+The test creates a degraded RAID5/6 btrfs array and runs a fio workload
+to verify that RMW writes don't return false errors when some blocks lack
+checksums.
+
+> diff --git a/tests/btrfs/357 b/tests/btrfs/357
+> new file mode 100755
+> index 0000000000000..f2c0428543d61
+> --- /dev/null
+> +++ b/tests/btrfs/357
+> @@ -0,0 +1,65 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 357
+> +#
+> +# Make sure on degraded RAID5/6, RMW writes won't return false errors
+> +# when some blocks do not have checksums.
+> +#
+> +. ./common/preamble
+
+[Severity: Low]
+Is this patch misdirected to the Linux kernel tree instead of the fstests
+repository?
+
+The script attempts to source a core framework file (. ./common/preamble)
+that does not exist in the Linux tree, which will cause it to fail to run.
+
+[ ... ]
+
+> +_require_fio "$fio_job_file"
+> +
+> +# The target to remove for degraded mount.
+> +dev2="${SCRATCH_DEV_NAME[1]}"
+> +
+> +workload()
+> +{
+> +	local profile=$1
+> +	_scratch_pool_mkfs "-m raid1 -d $profile" >> $seqres.full 2>&1
+> +	$WIPEFS_PROG -fa "$dev2" >> $seqres.full 2>&1
+
+[Severity: Medium]
+Does this test silently fail to degrade the array?
+
+The variable SCRATCH_DEV_NAME is not standard for pools in fstests
+(typically SCRATCH_DEV_POOL is used), so dev2 evaluates to an empty string.
+
+Consequently, wiping the empty device path silently fails due to the
+redirected output in workload(), leaving the array fully healthy and
+preventing the intended testing of the degraded RMW path.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261001041008.39697-1-wqu@suse.com?part=1
+

@@ -1,0 +1,129 @@
+From sashiko-bot@kernel.org Mon Sep 28 07:24:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: write back a folio extent-by-extent instead
+ of block-by-block
+Date: Mon, 28 Sep 2026 05:24:46 +0000
+Message-Id: <20260928052446.E211D1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] btrfs: double completion of ordered extents on error path
+- [High] btrfs: integer underflow in OE truncation on gap
+--
+
+commit 25e0287f6fd96c7fb86fe6c6665dd941bbff2614
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: write back a folio extent-by-extent instead of block-by-block
+
+This commit optimizes folio writeback to use an extent-by-extent submission
+approach rather than a block-by-block iteration. It introduces new helpers
+to iterate through ordered extents beyond EOF and to find the next contiguous
+write range. The write sector submission logic is also open-coded for better
+control over each range.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 05e6a97dc15db..70265ca335bd4 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+[ ... ]
+> +static void truncate_ordered_extents_beyond_eof(struct btrfs_inode *inode,
+> +						u64 file_offset, u32 len)
+>  {
+> +	u64 cur = file_offset;
+> +	const u64 next_off = file_offset + len;
+>  
+> +	while (cur < next_off) {
+> +		struct btrfs_ordered_extent *ordered;
+>  
+> +		ordered = btrfs_lookup_first_ordered_range(inode, cur, next_off - cur);
+> +		if (!ordered)
+> +			break;
+>  
+> +		/*
+> +		 * The whole range [file_offset, file_offset + len) should all have
+> +		 * OE coverage.
+> +		 * Thus every found OE must cover @cur, there should be no gap.
+> +		 */
+> +		ASSERT(in_range(cur, ordered->file_offset, ordered->num_bytes));
+> +		spin_lock(&inode->ordered_tree_lock);
+> +		set_bit(BTRFS_ORDERED_TRUNCATED, &ordered->flags);
+> +		ordered->truncated_len = min(ordered->truncated_len,
+> +					     cur - ordered->file_offset);
+
+[Severity: High]
+Can this cause an integer underflow if there is a gap in ordered extents?
+
+If an ordered extent creation previously failed, btrfs_lookup_first_ordered_range()
+could return an ordered extent that starts strictly after cur. If
+ordered->file_offset > cur, the subtraction cur - ordered->file_offset will
+underflow to a large positive value.
+
+On production builds where the ASSERT is compiled out, min() would then
+leave ordered->truncated_len unmodified instead of correctly truncating it
+to zero. Could this result in metadata corruption by leaving an ordered
+extent beyond EOF?
+
+> +		cur = ordered->file_offset + ordered->num_bytes;
+> +		spin_unlock(&inode->ordered_tree_lock);
+> +		btrfs_put_ordered_extent(ordered);
+>  	}
+> +}
+[ ... ]
+> @@ -1954,27 +1915,26 @@ static noinline_for_stack int extent_writepage_io(struct btrfs_inode *inode,
+[ ... ]
+> +		if (unlikely(!oe)) {
+> +			/*
+> +			 * bio_ctrl may contain a bio crossing several folios.
+> +			 * Submit it immediately so that the bio has a chance
+> +			 * to finish normally, rather than being marked as error.
+> +			 */
+> +			submit_one_bio(bio_ctrl);
+> +
+> +			/*
+> +			 * When submission failed, we should still clear the
+> +			 * folio dirty. Or the folio will be written back again
+> +			 * but without any ordered extent.
+> +			 */
+> +			btrfs_folio_clear_dirty(fs_info, folio, cur, cur_len);
+> +			btrfs_folio_set_writeback(fs_info, folio, cur, cur_len);
+> +			btrfs_folio_clear_writeback(fs_info, folio, cur, cur_len);
+> +
+> +			/*
+> +			 * Since there is no bio submitted to finish the ordered
+> +			 * extent, we have to manually finish this sector.
+> +			 */
+> +			btrfs_mark_ordered_io_finished(inode, cur, cur_len, false);
+> +			btrfs_err_rl(fs_info,
+> +			"no ordered extent for root %lld ino %llu filepos %llu",
+> +				     btrfs_root_id(inode->root), btrfs_ino(inode), cur);
+> +			if (!found_error)
+> +				found_error = -EUCLEAN;
+> +			/* The next block may have valid OE, so only skip one block. */
+> +			cur += blocksize;
+> +			continue;
+> +		}
+
+[Severity: High]
+Does this error path clean up and finish ordered IO for the entire cur_len
+chunk rather than just a single block?
+
+If find_next_write_range() finds a multi-block contiguous dirty range of
+size cur_len, and the first block lacks an ordered extent, the error path
+clears dirty and writeback state and manually finishes ordered IO for the
+entire cur_len chunk.
+
+However, since the loop only advances cur by blocksize, will the remaining
+cur_len - blocksize range be erroneously processed again in the next
+iterations?
+
+Any valid ordered extents in that remaining range would have IO submitted
+and be completed a second time upon IO completion. This could trigger an
+underflow of bytes_left and double-queue the completion work, potentially
+causing workqueue list or ordered tree corruption.
+
+Should this only clean up blocksize instead of cur_len, or should it advance
+cur by cur_len?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790571994.git.wqu@suse.com?part=2
+

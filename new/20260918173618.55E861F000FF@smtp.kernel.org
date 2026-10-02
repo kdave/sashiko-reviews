@@ -1,0 +1,62 @@
+From sashiko-bot@kernel.org Fri Sep 18 19:36:28 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix dangling nodes in tree-mod-log after
+ error in btrfs_tree_mod_log_insert_root()
+Date: Fri, 18 Sep 2026 17:36:17 +0000
+Message-Id: <20260918173618.55E861F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: missing write_unlock in btrfs_tree_mod_log_insert_root error path
+--
+
+commit a2c6646fd90b6d69b1bd57f672f76058a0e60b3d
+Author: Filipe Manana <fdmanana@suse.com>
+
+    btrfs: fix dangling nodes in tree-mod-log after error in btrfs_tree_mod_log_insert_root()
+
+This commit ensures that tree-mod-log nodes are removed from the rbtree
+before they are freed when encountering an error in
+btrfs_tree_mod_log_insert_root().
+
+> diff --git a/fs/btrfs/tree-mod-log.c b/fs/btrfs/tree-mod-log.c
+> index a8094928f4c9b..9536ab0449e01 100644
+> --- a/fs/btrfs/tree-mod-log.c
+> +++ b/fs/btrfs/tree-mod-log.c
+> @@ -483,10 +483,17 @@ int btrfs_tree_mod_log_insert_root(struct extent_buffer *old_root,
+>  		goto out_unlock;
+>  	}
+>  
+> -	if (tm_list)
+> +	if (tm_list) {
+>  		ret = tree_mod_log_free_eb(fs_info, tm_list, nritems);
+> -	if (!ret)
+> -		ret = tree_mod_log_insert(fs_info, tm);
+> +		if (ret)
+> +			goto free_tms;
+
+[Severity: High]
+Can this error path bypass the out_unlock label and leave the lock held?
+
+If tree_mod_dont_log() returns false (which implicitly acquires
+fs_info->tree_mod_log_lock) and tree_mod_log_free_eb() returns an error,
+jumping directly to free_tms bypasses the out_unlock label.
+
+This skips the write_unlock(&fs_info->tree_mod_log_lock) call, which could
+subsequently deadlock the filesystem on the next lock acquisition.
+
+Should this jump instead target out_unlock so the write lock is released?
+
+> +	}
+> +
+> +	ret = tree_mod_log_insert(fs_info, tm);
+> +	if (ret && tm_list) {
+> +		for (i = 0; i < nritems; i++)
+> +			rb_erase(&tm_list[i]->node, &fs_info->tree_mod_log);
+> +	}
+>  
+>  out_unlock:
+>  	write_unlock(&fs_info->tree_mod_log_lock);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/72339bf1ef0db3133efd882eca2ef8644e675981.1789752327.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Tue Sep 29 02:41:57 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 5/6] btrfs: find_free_extent checks full block groups
+ unlocked
+Date: Tue, 29 Sep 2026 00:41:53 +0000
+Message-Id: <20260929004153.DCFA41F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: missing smp_store_release for lockless free_space read
+--
+
+commit f3a0d10260903cb01a54d72716d0046f66582ae3
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: find_free_extent checks full block groups unlocked
+
+This commit attempts to improve performance by allowing find_free_extent to
+skip full block groups without acquiring locks. It reads the block group's
+free space unlocked after checking if caching is finished using an
+smp_load_acquire operation.
+
+> diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+> index 01cab703ef3b4..d96de10348c11 100644
+> --- a/fs/btrfs/extent-tree.c
+> +++ b/fs/btrfs/extent-tree.c
+> @@ -4324,7 +4324,23 @@ static int can_allocate_chunk(struct btrfs_fs_info *fs_info,
+>  static bool find_free_extent_skip_block_group(struct btrfs_block_group *block_group,
+>  					      struct find_free_extent_ctl *ffe_ctl)
+>  {
+> -	if (likely(!block_group->ro && !(block_group->flags & BTRFS_BLOCK_GROUP_REMAPPED)))
+> +	bool skip = block_group->ro || (block_group->flags & BTRFS_BLOCK_GROUP_REMAPPED);
+> +
+> +	/*
+> +	 * caching_thread() sets FINISHED under a a separate block_group->lock
+> +	 * critical section after it is done populating, so smp_load_acquire
+> +	 * guarantees we see the block group as populated by caching.
+> +	 */
+> +	if (!skip && smp_load_acquire(&block_group->cached) == BTRFS_CACHE_FINISHED) {
+> +		u64 free_space = data_race(block_group->free_space_ctl->free_space);
+
+[Severity: Medium]
+Does this lockless read pair correctly with the writer?
+
+Looking at caching_thread() in fs/btrfs/block-group.c, the writer uses a plain
+store for block_group->cached:
+
+fs/btrfs/block-group.c:caching_thread() {
+    ...
+	spin_lock(&block_group->lock);
+	block_group->caching_ctl = NULL;
+	block_group->cached = ret ? BTRFS_CACHE_ERROR : BTRFS_CACHE_FINISHED;
+	spin_unlock(&block_group->lock);
+    ...
+}
+
+Because the writer does not use smp_store_release(), the surrounding spin_lock
+does not prevent the CPU from reordering the store before earlier free_space
+updates.
+
+If the execution is reordered such that cached = FINISHED becomes globally
+visible before the free_space updates, couldn't a concurrent reader using
+smp_load_acquire() see FINISHED but read a stale free_space value and
+incorrectly skip a block group with sufficient space?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790641462.git.boris@bur.io?part=5
+

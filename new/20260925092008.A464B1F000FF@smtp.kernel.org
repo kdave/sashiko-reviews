@@ -1,0 +1,60 @@
+From sashiko-bot@kernel.org Fri Sep 25 11:20:19 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 3/6] btrfs: introduce the skeleton of delayed bbio
+ endio function
+Date: Fri, 25 Sep 2026 09:20:08 +0000
+Message-Id: <20260925092008.A464B1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] btrfs: data loss due to missing mempool for delayed_bio_private allocation
+--
+
+commit 02a172f84ffccbc1a7161bfad060ed236ba8aae8
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce the skeleton of delayed bbio endio function
+
+This commit introduces the skeleton of a delayed bbio endio function and a new
+workqueue, delayed_write_workers, for this workload. It implements the main
+endio function and a helper to queue workloads into the workqueue.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -7709,16 +7714,85 @@ struct extent_map *btrfs_create_delayed_em(struct btrfs_inode *inode,
+[ ... ]
+>  void btrfs_submit_delayed_write(struct btrfs_bio *bbio)
+>  {
+> +	const struct btrfs_fs_info *fs_info = bbio->inode->root->fs_info;
+> +	struct delayed_bio_private *dbp;
+>  
+>  	ASSERT(bbio->is_delayed);
+>  
+> +	bbio->end_io = end_bbio_delayed;
+> +	dbp = kzalloc_obj(*dbp, GFP_NOFS);
+> +	if (!dbp) {
+> +		btrfs_bio_end_io(bbio, errno_to_blk_status(-ENOMEM));
+> +		return;
+> +	}
+
+[Severity: Critical]
+Can this cause data loss under memory pressure? This kzalloc_obj() allocation
+for delayed_bio_private occurs on the writeback path but lacks mempool backing.
+
+If the allocation fails, the writeback path immediately fails the bio with
+-ENOMEM. The error handling clears the folios' writeback state without
+re-dirtying them, which causes the page cache to silently discard the dirty
+data before it reaches disk.
+
+The kernel block layer mandates that allocations required during the writeback
+path must be mempool-backed to ensure forward progress and prevent memory
+pressure from converting into data loss.
+
+> +	dbp->delayed_bbio = bbio;
+> +	bbio->private = dbp;
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790327143.git.wqu@suse.com?part=3
+

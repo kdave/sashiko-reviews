@@ -1,0 +1,103 @@
+From sashiko-bot@kernel.org Fri Oct  2 11:31:43 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] fstests: btrfs: add a new test case to verify
+ degraded RMW writes
+Date: Fri, 02 Oct 2026 09:31:33 +0000
+Message-Id: <20261002093133.AD8E81F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] fstests: btrfs: uninitialized SCRATCH_DEV_NAME array leads to empty device name
+- [High] fstests: btrfs: missing error checks on mount lead to rootfs pollution
+- [Medium] fstests: btrfs: hardcoded 512M filesize risks ENOSPC on small scratch devices
+--
+
+commit 36e0935d0263d407a312819e53dfb8a0a23cdae4
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a new test case to verify degraded RMW writes
+
+This commit adds a regression test to verify degraded RMW writes on
+btrfs raid arrays when some blocks lack checksums. It sets up a 4-disk
+pool, removes one disk, and executes a mixed-checksum workload on the
+degraded mount.
+
+> diff --git a/tests/btrfs/357 b/tests/btrfs/357
+> new file mode 100755
+> index 0000000000000..b68d03b554e92
+> --- /dev/null
+> +++ b/tests/btrfs/357
+> @@ -0,0 +1,65 @@
+[ ... ]
+> +fio_job_file=$tmp.fio
+> +cat > $fio_job_file << EOF
+> +[sync_randwrite]
+> +directory=$SCRATCH_MNT
+> +rw=randwrite
+> +filesize=512M
+
+[Severity: Medium]
+Will this hardcoded 512M allocation fail with enospc on small scratch
+devices?
+
+The test executes fio with a hardcoded filesize of 512M without verifying
+that the underlying scratch pool devices have sufficient capacity. In test
+environments where the scratch device pool contains small partitions (e.g.
+256MB each), a raid6 profile will provide roughly 512MB of raw capacity.
+Metadata overhead will then cause the 512MB allocation to fail with an
+out of space error, resulting in false positive test failures.
+
+Should there be a require scratch size guard here?
+
+> +bs=4K
+> +fsync=8
+> +time_based
+> +fallocate=posix
+> +runtime=15
+> +EOF
+> +
+> +_require_fio "$fio_job_file"
+> +
+> +# The target to remove for degraded mount.
+> +dev2="${SCRATCH_DEV_NAME[1]}"
+
+[Severity: High]
+Does this variable initialization result in an empty string?
+
+SCRATCH_DEV_NAME is not an initialized bash array in standard fstests, as
+the standard variable is SCRATCH_DEV_POOL. As a result, dev2 evaluates to
+an empty string.
+
+> +
+> +workload()
+> +{
+> +	local profile=$1
+> +	_scratch_pool_mkfs "-m raid1 -d $profile" >> $seqres.full 2>&1
+> +	$WIPEFS_PROG -fa "$dev2" >> $seqres.full 2>&1
+
+[Severity: High]
+Are we silently failing to wipe the device because dev2 is empty?
+
+Since dev2 is empty, wipefs is executed with an empty argument and silently
+fails because stderr is redirected. This means no device is actually
+destroyed, and the subsequent degraded mount is fully healthy. The degraded
+RMW condition is never tested, which defeats the primary objective of the
+test and yields a false positive pass.
+
+Additionally, should we check the return values of these setup commands?
+
+If the filesystem creation or wipefs commands fail, the devices are left
+improperly formatted or intact, bypassing the degraded test condition.
+
+> +	_scratch_mount -o degraded
+
+[Severity: High]
+Does missing error handling here lead to host filesystem pollution?
+
+If the scratch mount fails (for example, due to a previous unmount failure),
+the script proceeds and executes the 512MB workload directly into
+the scratch mount directory. This will write to the host's root filesystem,
+polluting the host environment and causing a false positive test pass.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002092135.61719-1-wqu@suse.com?part=1
+

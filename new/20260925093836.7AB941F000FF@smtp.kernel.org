@@ -1,0 +1,83 @@
+From sashiko-bot@kernel.org Fri Sep 25 11:38:47 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 6/6] btrfs: enable experimental delayed compression
+ support
+Date: Fri, 25 Sep 2026 09:38:35 +0000
+Message-Id: <20260925093836.7AB941F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: unbalanced extent lock in run_delalloc_delayed error path
+--
+
+commit e80be047a787a13a0548aee6e9186462c915048e
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: enable experimental delayed compression support
+
+Instead of the existing async submission path, the new delayed bbio will
+handle compressed writes by allocating delayed em/oe at run_delalloc_*()
+time. This delays real bbio assembly and compression to submission time.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index fcf67a2e118df..b3e4c64266090 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -1659,6 +1659,68 @@ static bool run_delalloc_compressed(struct btrfs_inode *inode,
+>  	return true;
+>  }
+>  
+> +static int run_delalloc_delayed(struct btrfs_inode *inode, struct folio *locked_folio,
+> +				u64 start, u64 end)
+> +{
+> +	struct btrfs_root *root = inode->root;
+> +	struct btrfs_fs_info *fs_info = root->fs_info;
+> +	struct extent_state *cached = NULL;
+> +	u64 cur = start;
+> +	int ret;
+> +
+> +	if (btrfs_is_shutdown(fs_info)) {
+> +		ret = -EIO;
+> +		goto error;
+
+[Severity: High]
+If the filesystem is shut down, does this jump to the error path before
+the extent lock is ever acquired?
+
+> +	}
+> +	btrfs_lock_extent(&inode->io_tree, start, end, &cached);
+> +	while (cur < end) {
+
+[ ... ]
+
+> +error:
+> +	if (start < cur) {
+> +		btrfs_drop_extent_map_range(inode, start, cur - 1, false);
+> +		btrfs_cleanup_ordered_extents(inode, start, cur - start);
+> +		extent_clear_unlock_delalloc(inode, start, cur - 1, locked_folio, &cached,
+> +			EXTENT_LOCKED | EXTENT_DELALLOC,
+> +			PAGE_UNLOCK | PAGE_START_WRITEBACK | PAGE_END_WRITEBACK);
+> +	}
+> +	if (cur < end) {
+> +		extent_clear_unlock_delalloc(inode, cur, end, locked_folio, &cached,
+> +			EXTENT_LOCKED | EXTENT_DELALLOC | EXTENT_DELALLOC_NEW |
+> +			EXTENT_DEFRAG | EXTENT_DO_ACCOUNTING,
+> +			PAGE_UNLOCK | PAGE_START_WRITEBACK | PAGE_END_WRITEBACK);
+
+[Severity: High]
+Since the error path unconditionally clears the EXTENT_LOCKED bit, won't
+this force an unlock on the range even if this thread never acquired the
+lock?
+
+If another thread currently owns the lock, could this allow concurrent
+threads to acquire it while the original owner believes it still holds it,
+potentially leading to data corruption or kernel crashes due to concurrent
+extent tree modifications?
+
+> +		btrfs_qgroup_free_data(inode, NULL, cur, end + 1 - cur, NULL);
+> +	}
+> +	return ret;
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790327143.git.wqu@suse.com?part=6
+

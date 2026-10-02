@@ -1,0 +1,57 @@
+From sashiko-bot@kernel.org Sun Sep 20 14:21:05 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: test defrag --nocomp converts compressed
+ extents to uncompressed
+Date: Sun, 20 Sep 2026 12:20:54 +0000
+Message-Id: <20260920122055.2CF581F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] fstests: missing '-o' option in _scratch_cycle_mount
+--
+
+commit 626ef975cc2e00be27cbccc05f177cf4af0906e6
+Author: Dhruva G <goledhruva@gmail.com>
+
+btrfs: test defrag --nocomp converts compressed extents to uncompressed
+
+This commit adds a test to verify that the btrfs filesystem defragment
+--nocomp command rewrites compressed extents as uncompressed ones. It checks
+that the defrag ioctl takes precedence over the mount option and ensures that
+maximum-sized compressed extents are processed.
+
+Link: https://lore.kernel.org/linux-btrfs/d17a93e6-1613-4113-a75a-8ea89efb2bdb@gmail.com/
+
+> diff --git a/tests/btrfs/354 b/tests/btrfs/354
+> new file mode 100755
+> index 0000000000000..8a19b7c39c7f7
+> --- /dev/null
+> +++ b/tests/btrfs/354
+
+[ ... ]
+
+> +grep -q "encoded" $tmp.after && \
+> +	echo "file still has compressed extents after --nocomp defrag"
+> +
+> +# Contents must survive the rewrite, read back from disk and not page cache
+> +_scratch_cycle_mount "compress=zlib"
+
+[Severity: Medium]
+Is there a missing -o flag for the mount options here?
+
+Because _scratch_cycle_mount forwards its arguments to _scratch_mount,
+passing just the string "compress=zlib" without -o causes a mount command
+syntax error. This leaves the scratch device unmounted, causing the
+subsequent checksum validation to read from an empty directory and
+spuriously fail the test.
+
+> +csum_after=$(_md5_checksum "$SCRATCH_MNT/foo")
+> +[ "$csum_before" = "$csum_after" ] || echo "file content changed"
+> +
+> +echo "Silence is golden"
+> +
+> +# success, all done
+> +_exit 0
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/d8930005-39c7-405f-96ac-ea0530e9b2c1@gmail.com?part=1
+

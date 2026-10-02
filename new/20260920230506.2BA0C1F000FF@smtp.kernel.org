@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Mon Sep 21 01:05:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/2] btrfs: remove the trailing zeros from compressed
+ inline extent
+Date: Sun, 20 Sep 2026 23:05:05 +0000
+Message-Id: <20260920230506.2BA0C1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: out-of-bounds folio access and DoS via unvalidated i_size in run_delalloc_inline()
+--
+
+commit f3469831a249b2e95ed5a5ff5bce2359f2c9ca93
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove the trailing zeros from compressed inline extent
+
+This commit restores the previous behavior of passing the file range up to
+the inode size into btrfs_compress_bio() rather than the sector size. This
+avoids trailing zeros in compressed inline extents and improves the
+compression ratio, which was previously impacted by a regression in the lzo
+compression path.
+
+Link: https://lore.kernel.org/linux-btrfs/c97652a5-ac6b-4de6-aa23-3cdebc01d00b@gmail.com/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index f4b68205f621e..89b05bd42d4ef 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -2331,12 +2331,7 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  		} else if (inode->prop_compress) {
+>  			compress_type = inode->prop_compress;
+>  		}
+> -		/*
+> -		 * We need to pass blocksize and not i_size, otherwise we can't
+> -		 * create compressed inline extents for data smaller than sector
+> -		 * size with lzo.
+> -		 */
+> -		cb = btrfs_compress_bio(inode, 0, blocksize, compress_type, compress_level, 0);
+> +		cb = btrfs_compress_bio(inode, 0, i_size, compress_type, compress_level, 0);
+
+[Severity: High]
+Could passing an unvalidated i_size here instead of blocksize lead to out
+of bounds folio accesses or log spam?
+
+The 64-bit i_size is passed as the length for inline extent compression, but
+looking at the signature of btrfs_compress_bio() in fs/btrfs/compression.c:
+
+struct compressed_bio *btrfs_compress_bio(struct btrfs_inode *inode,
+                                          u64 start, u32 len, 
+                                          unsigned int type, ...
+
+The 64-bit size is silently truncated to a u32 length. If a user extends
+the file size to a multiple of 4GB, the length becomes 0, which can trigger
+an ASSERT(len) panic in debug builds.
+
+Furthermore, if the file size is very large (e.g., after a sparse write at
+1GB and a single sector write at offset 0), the compression loop will
+attempt to fetch uninstantiated and unlocked folios past the dirty range.
+This results in the following rate-unlimited log spam in
+btrfs_compress_filemap_get_folio():
+
+btrfs_crit(inode->root->fs_info,
+           "failed to get page cache, root %lld ino %llu file offset %llu",
+           ...
+
+Since an unprivileged user can trigger this via standard POSIX file
+operations (write, fsync), this looks like a potential DoS vector.
+
+Because can_cow_file_range_inline() eventually rejects inline extents
+larger than the sector size anyway, would it be safer to bound the
+compression input length to the locked sector size instead of the
+unbounded i_size?
+
+>  		if (IS_ERR(cb)) {
+>  			cb = NULL;
+>  			/* Just fall back to non-compressed case. */
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789944508.git.wqu@suse.com?part=2
+

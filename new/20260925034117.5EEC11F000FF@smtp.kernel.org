@@ -1,0 +1,95 @@
+From sashiko-bot@kernel.org Fri Sep 25 05:41:28 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 6/6] btrfs: enable experimental delayed compression
+ support
+Date: Fri, 25 Sep 2026 03:41:16 +0000
+Message-Id: <20260925034117.5EEC11F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: defrag compression ignored on zoned filesystems with experimental compression
+--
+
+commit e17bb4d5a5602b337629a7c6828dcc69478b6169
+Author: Qu Wenruo <wqu@suse.com>
+Subject: btrfs: enable experimental delayed compression support
+
+This commit introduces a new delayed bbio mechanism for compressed
+writes, replacing the existing async submission path. It delays data
+extent reservation until workqueue submission to improve concurrency.
+The experimental feature is currently not enabled for zoned filesystems,
+which still fall back to the old compression path.
+
+> diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+> index 6ec5dd760d429..32801ae4da7ab 100644
+> --- a/fs/btrfs/defrag.c
+> +++ b/fs/btrfs/defrag.c
+> @@ -1471,10 +1472,28 @@ int btrfs_defrag_file(struct btrfs_inode *inode, struct file_ra_state *ra,
+>  		 * need to be written back immediately.
+>  		 */
+>  		if (range->flags & BTRFS_DEFRAG_RANGE_START_IO) {
+> -			filemap_flush(inode->vfs_inode.i_mapping);
+> -			if (test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+> -				     &inode->runtime_flags))
+> +			/*
+> +			 * For experimental delayed writeback, we must wait
+> +			 * for the range to be fully written back before
+> +			 * clearing inode->defrag_compress.
+> +			 *
+> +			 * Regular filemap_flush() will only start writeback,
+> +			 * which will only create delayed OEs. But the real
+> +			 * compression is happening later.
+> +			 * This means if we just flush but not wait for writeback,
+> +			 * the inode->defrag_compress clearing can race with
+> +			 * compression, so the requested compression algorithm
+> +			 * is not applied.
+> +			 */
+> +			if (IS_ENABLED(CONFIG_BTRFS_EXPERIMENTAL)) {
+> +				filemap_write_and_wait_range(inode->vfs_inode.i_mapping,
+> +							     start, last_byte);
+> +			} else {
+
+[Severity: Medium]
+Will this fail to wait for writeback if the filesystem is zoned?
+
+Since btrfs_run_delalloc_range() skips the delayed compression for zoned
+filesystems even when CONFIG_BTRFS_EXPERIMENTAL is enabled:
+
+fs/btrfs/inode.c:btrfs_run_delalloc_range() {
+    ...
+    if (btrfs_inode_can_compress(inode) &&
+        inode_need_compress(inode, start, end, false)) {
+        if (IS_ENABLED(CONFIG_BTRFS_EXPERIMENTAL) && !zoned)
+            return run_delalloc_delayed(inode, locked_folio, start, end);
+        else if (run_delalloc_compressed(inode, locked_folio, start, end, wbc))
+            return 1;
+    }
+    ...
+}
+
+If zoned is true, the write goes through run_delalloc_compressed() (the old
+async path).
+
+However, btrfs_defrag_file() only checks IS_ENABLED(CONFIG_BTRFS_EXPERIMENTAL).
+If it calls filemap_write_and_wait_range() on a zoned filesystem, the wait
+returns immediately because the old async path leaves the folio locked and
+does not immediately set PAGECACHE_TAG_WRITEBACK.
+
+This causes btrfs_defrag_file() to clear inode->defrag_compress too early.
+Later, when the async worker compress_file_range() runs, it sees that
+inode->defrag_compress is cleared and silently falls back to uncompressed
+writes, ignoring the defragmentation compression request.
+
+Does this check also need to account for whether the filesystem is zoned?
+
+>  				filemap_flush(inode->vfs_inode.i_mapping);
+> +				if (test_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+> +					     &inode->runtime_flags))
+> +					filemap_flush(inode->vfs_inode.i_mapping);
+> +			}
+>  		}
+>  		if (range->compress_type == BTRFS_COMPRESS_LZO)
+>  			btrfs_set_fs_incompat(fs_info, COMPRESS_LZO);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790306139.git.wqu@suse.com?part=6
+

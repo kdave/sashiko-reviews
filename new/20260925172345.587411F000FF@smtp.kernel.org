@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Fri Sep 25 19:23:55 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] generic: test replacing a xattr with a larger value
+Date: Fri, 25 Sep 2026 17:23:44 +0000
+Message-Id: <20260925172345.587411F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Medium] kselftest: xfstests script mistakenly applied to Linux kernel tree
+- [Medium] kselftest: undefined _fixed_by_fs_commit helper used
+- [Medium] kselftest: missing status=0 assignment causes test failure
+--
+
+commit 1d7b9aafbcc5864d879cba4484a9c8d3c5ab0e63
+Author: Filipe Manana <fdmanana@suse.com>
+
+generic: test replacing a xattr with a larger value
+
+This patch introduces a test to verify that replacing an xattr with a
+larger value works correctly, specifically targeting a btrfs scenario
+where multiple xattrs share the same crc32c hash.
+
+> diff --git a/tests/generic/806 b/tests/generic/806
+> new file mode 100755
+> index 0000000000000..1fcf014542463
+> --- /dev/null
+> +++ b/tests/generic/806
+> @@ -0,0 +1,43 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 806
+> +#
+> +# Test replacing a xattr's value with a larger value.
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick metadata attr
+> +
+> +. ./common/filter
+
+[Severity: Medium]
+Is tests/generic/806 intended for the xfstests repository instead of the
+Linux kernel tree?
+
+These lines source internal xfstests frameworks that do not exist in the Linux
+kernel tree. Applying this to the kernel tree adds orphaned test files that
+provide no functional value since they cannot be executed here.
+
+[ ... ]
+
+> +_require_scratch
+> +_require_attrs
+> +
+> +_fixed_by_fs_commit btrfs xxxxxxxxxxxx \
+> +   "btrfs: fix xattr replace when multiple xattrs are packed in the same item"
+
+[Severity: Medium]
+Will this result in a command not found error?
+
+The standard xfstests helper is _fixed_by_kernel_commit, and it does not
+accept an extra filesystem argument like btrfs. Calling an undefined function
+will pollute stderr and incorrectly fail the test during execution.
+
+[ ... ]
+
+> +# Check the xattrs have the expected values.
+> +echo "xattrs after:"
+> +_getfattr --absolute-names --dump $SCRATCH_MNT/testfile | _filter_scratch
+> +
+> +# success, all done
+> +_exit 0
+
+[Severity: Medium]
+Does this code cause the test suite to incorrectly report a failure even when
+the test passes?
+
+The xfstests framework initializes status=1 (failure) at the start of the test
+and relies on an exit trap. Without explicitly setting status=0 before exiting
+here, the trap will evaluate exit 1, causing the test harness to register a
+failure regardless of the actual test outcome.
+
+Additionally, should this be exit 0 rather than _exit 0?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/7d2caec7b8ecd95ad63fcbbc7e1cc1c84ee50d7f.1790356355.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,143 @@
+From sashiko-bot@kernel.org Fri Oct  2 14:12:15 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: add a test case for deleting partially
+ owned qgroup
+Date: Fri, 02 Oct 2026 12:12:04 +0000
+Message-Id: <20261002121204.CD0CA1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 6 potential issue(s) to consider:
+- [Critical] build: fstests script mistakenly applied to kernel source tree
+- [High] test: silencing stderr hides I/O failure and causes false negative
+- [High] test: undefined _btrfs helper causes execution failure
+- [Medium] test: unredirected btrfs stdout causes golden output mismatch
+- [Medium] test: invalid _exit command and missing status=0 causes failure
+- [Low] test: rely on _require_scratch_qgroup for filesystem formatting
+--
+
+commit fcadfba359cb1267e47791835ac23800eb85a759
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a test case for deleting partially owned qgroup
+
+There is a bug report that, when deleting a partially owned qgroup,
+btrfs will delete the on-disk items but leave the in-memory rb-tree and
+sysfs entries untouched. Introduce a regression test for it to verify
+the behavior.
+
+> diff --git a/tests/btrfs/358 b/tests/btrfs/358
+> new file mode 100755
+> index 0000000000000..642b08083db45
+> --- /dev/null
+> +++ b/tests/btrfs/358
+> @@ -0,0 +1,79 @@
+> +#! /bin/bash
+[ ... ]
+> +# Verify that when deleting a partially owned qgroup (excl != rfer),
+> +# the sysfs and in-memory rb-tree entries are also properly removed.
+> +#
+> +. ./common/preamble
+
+[Severity: Critical]
+Does this patch apply to the correct repository?
+
+The script attempts to source common/preamble, which does not exist in the
+Linux kernel tree. It appears this is an xfstests script being added to a new
+top-level tests/ directory in the kernel tree, rather than being sent to the
+xfstests repository or utilizing the kernel's tools/testing/selftests/
+framework.
+
+> +_begin_fstest auto quick qgroup
+> +
+[ ... ]
+> +_require_btrfs_qgroup_report
+> +
+> +# This implies making a btrfs and enables full qgroup mode.
+> +_require_scratch_qgroup
+
+[Severity: Low]
+Does this test implicitly rely on a requirement helper to format the scratch
+device?
+
+In fstests, requirement helpers are strictly meant for checking feature
+support. If _require_scratch_qgroup is updated in the future to use a dummy
+loop device just for capability checking, this test might fail to run. Should
+this explicitly call _scratch_mkfs instead?
+
+> +_scratch_mount
+> +
+> +fsid=$(_btrfs_get_fsid "$SCRATCH_MNT")
+> +
+[ ... ]
+> +	_notrun "No sysfs qgroups directory"
+> +fi
+> +
+> +_btrfs subvolume create "$SCRATCH_MNT/subv1"
+
+[Severity: High]
+Will this execution fail due to an undefined command?
+
+The standard fstests framework uses $BTRFS_UTIL_PROG rather than a _btrfs
+wrapper function. Executing this will result in a command not found error.
+
+[Severity: Medium]
+Could the output of this command cause a golden output mismatch?
+
+Commands like subvolume create print status messages to stdout by default.
+Because this output is not redirected to /dev/null or $seqres.full, the
+printed text will be compared against 358.out, which expects only
+"Silence is golden". This will cause the test to spuriously fail on both
+patched and unpatched kernels.
+
+> +_pwrite_byte 0x00 0 1M "$SCRATCH_MNT/subv1/data1" &> /dev/null
+
+[Severity: High]
+Could silencing stderr here hide I/O failures and cause a false negative test
+result?
+
+Using &> /dev/null silences both stdout and stderr. If _pwrite_byte fails
+due to ENOSPC or I/O errors, no error will be reported and the file will
+remain empty.
+
+Since the test's core logic relies on populating 1M of shared data so that
+rfer > excl for partial ownership, an empty file would mean rfer == excl.
+Deleting a fully owned qgroup does not trigger the kernel inconsistency
+bug, which would cause the test to erroneously pass on unpatched kernels.
+
+> +_btrfs subvolume snapshot "$SCRATCH_MNT/subv1" "$SCRATCH_MNT/snap1"
+> +snap1id=$(_btrfs_get_subvolid $SCRATCH_MNT snap1)
+> +
+[ ... ]
+> +_btrfs qgroup assign 1/1 2/1 "$SCRATCH_MNT"
+> +_btrfs qgroup assign 0/$snap1id 1/1 "$SCRATCH_MNT"
+> +
+> +# Do a rescan, as the above assign will mark the qgroup inconsistent.
+> +_btrfs quota rescan -w "$SCRATCH_MNT"
+
+[Severity: Medium]
+Similarly to the subvolume create command above, could the output of quota
+rescan cause a golden output mismatch if not redirected?
+
+> +
+> +# Now remove the qgroup relationship between 0/snap1 and 1/1
+[ ... ]
+> +if [ -d "/sys/fs/btrfs/$fsid/qgroups/1_1" ]; then
+> +	echo "Qgroup 1/1 still exists in sysfs qgroups directory"
+> +fi
+> +
+> +echo "Silence is golden"
+> +_scratch_unmount
+> +_exit 0
+
+[Severity: Medium]
+Will this test terminate incorrectly and be reported as a failure?
+
+_exit is not a bash built-in nor a standard fstests helper, which will throw
+a command not found error.
+
+Additionally, because status=0 is not explicitly set before exiting, the
+EXIT trap from common/preamble will execute with the default failure status,
+falsely reporting a test failure.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002115959.7011-1-wqu@suse.com?part=1
+

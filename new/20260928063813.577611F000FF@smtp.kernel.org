@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Mon Sep 28 08:38:23 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/2] btrfs: write back a folio extent-by-extent
+ instead of block-by-block
+Date: Mon, 28 Sep 2026 06:38:12 +0000
+Message-Id: <20260928063813.577611F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: arithmetic underflow in truncate_ordered_extents_beyond_eof()
+--
+
+commit b9c60498b51b057d8bdb671500fe1d798e930820
+Author: Qu Wenruo <wqu@suse.com>
+btrfs: write back a folio extent-by-extent instead of block-by-block
+
+This commit optimizes dirty folio writeback to submit ranges extent-by-extent
+rather than block-by-block. It introduces truncate_ordered_extents_beyond_eof()
+and find_next_write_range() to iterate efficiently over larger ordered extents.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 05e6a97dc15db..8abbcc4217911 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+[ ... ]
+> @@ -1811,99 +1811,60 @@ static struct btrfs_ordered_extent *get_oe_from_bbio(const struct btrfs_bio *bbi
+[ ... ]
+> +static void truncate_ordered_extents_beyond_eof(struct btrfs_inode *inode,
+> +						u64 file_offset, u32 len)
+> +{
+> +	u64 cur = file_offset;
+> +	const u64 next_off = file_offset + len;
+>  
+> +	while (cur < next_off) {
+> +		struct btrfs_ordered_extent *ordered;
+>  
+> +		ordered = btrfs_lookup_first_ordered_range(inode, cur, next_off - cur);
+> +		if (!ordered)
+> +			break;
+>  
+> +		/*
+> +		 * The whole range [file_offset, file_offset + len) should all have
+> +		 * OE coverage.
+> +		 * Thus every found OE must cover @cur, there should be no gap.
+> +		 */
+> +		ASSERT(in_range(cur, ordered->file_offset, ordered->num_bytes));
+> +		spin_lock(&inode->ordered_tree_lock);
+> +		set_bit(BTRFS_ORDERED_TRUNCATED, &ordered->flags);
+> +		ordered->truncated_len = min(ordered->truncated_len,
+> +					     cur - ordered->file_offset);
+
+[Severity: High]
+Could this min() calculation cause an unsigned underflow if there is an
+ordered extent gap?
+
+While there is an ASSERT() above that expects no gaps, if an ordered extent
+failed to be allocated earlier on an error path, btrfs_lookup_first_ordered_range()
+might return an ordered extent where ordered->file_offset > cur.
+
+If that occurs in a production build where ASSERTs are disabled, 
+cur - ordered->file_offset will underflow to a huge unsigned value.
+This bypasses the truncation logic because min() will just leave
+ordered->truncated_len unmodified instead of shrinking it.
+
+When the extent completes without truncation and without I/O submitted for
+the beyond-EOF range, could this insert unwritten disk blocks into the
+filesystem tree and expose stale disk data if the file is extended later?
+
+> +		cur = ordered->file_offset + ordered->num_bytes;
+> +		spin_unlock(&inode->ordered_tree_lock);
+> +		btrfs_put_ordered_extent(ordered);
+>  	}
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790576583.git.wqu@suse.com?part=2
+

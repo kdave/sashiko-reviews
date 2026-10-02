@@ -1,0 +1,132 @@
+From sashiko-bot@kernel.org Fri Sep 25 11:36:25 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 1/6] btrfs: add delayed ordered extent support
+Date: Fri, 25 Sep 2026 09:36:14 +0000
+Message-Id: <20260925093615.2A6A21F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: lockless child_list iteration in finish_delayed_ordered races with add_child_oe
+--
+
+commit ead1dbfc032375e20cc37c3108d786c408de88bb
+Author: Qu Wenruo <wqu@suse.com>
+
+    btrfs: add delayed ordered extent support
+    
+    A delayed ordered extent has the following features:
+    
+    - A new BTRFS_ORDERED_DELAYED flag
+      And this new flag must be set along with the BTRFS_ORDERED_REGULAR flag.
+    
+    - No allocation of any on-disk space
+      As a delayed ordered extent doesn't take any on-disk space yet, it
+      won't release any reserved data/meta space either.
+    
+    - Zero or more real OEs can be added to the parent
+      If a real OE is allocated, it must be inside the parent OE.
+      And such real OE will go through the regular data/meta space
+      reservation path.
+
+[ ... ]
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 2a32072849cbd..e9ed3e31fa880 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -3204,6 +3204,81 @@ static int insert_ordered_extent_file_extent(struct btrfs_trans_handle *trans,
+>  					   update_inode_bytes, oe->qgroup_rsv);
+>  }
+>  
+> +static int finish_delayed_ordered(struct btrfs_ordered_extent *oe)
+> +{
+> +	struct btrfs_inode *inode = oe->inode;
+> +	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+> +	struct btrfs_ordered_extent *child;
+> +	struct btrfs_ordered_extent *tmp;
+> +	struct extent_state *cached = NULL;
+> +	const u32 nr_bits = oe->num_bytes >> fs_info->sectorsize_bits;
+> +	bool io_error = test_bit(BTRFS_ORDERED_IOERR, &oe->flags);
+> +	u32 cur_bit = 0;
+> +	int ret = 0;
+> +	int saved_ret = 0;
+> +
+> +	/* Finish each child OE. */
+> +	list_for_each_entry_safe(child, tmp, &oe->child_list, child_list) {
+
+[Severity: High]
+Does this lockless iteration over the child list race with concurrent
+insertions?
+
+When a delayed ordered extent completes its I/O, finish_delayed_ordered()
+is executed asynchronously. Before the parent OE is removed from the RB tree,
+a new buffered write to the same page can trigger a new writeback.
+
+This new writeback allocates a regular ordered extent, finds the parent OE
+still present in the RB tree, and calls add_child_oe(). This concurrently
+adds an element to the parent's child_list under the ordered_tree_lock,
+while the iteration here modifies the list locklessly.
+
+Can this race corrupt the linked list, leading to kernel panics, infinite
+loops, or memory corruption?
+
+> +		const u32 child_bit = (child->file_offset - oe->file_offset) >>
+> +				      fs_info->sectorsize_bits;
+> +		const u32 child_nr_bits = child->num_bytes >> fs_info->sectorsize_bits;
+> +
+> +		list_del_init(&child->child_list);
+
+[ ... ]
+
+> diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+> index b32d4eabe0abe..aad26972f8b4d 100644
+> --- a/fs/btrfs/ordered-data.c
+> +++ b/fs/btrfs/ordered-data.c
+
+[ ... ]
+
+> +static void add_child_oe(struct btrfs_ordered_extent *parent,
+> +			 struct btrfs_ordered_extent *child)
+> +{
+> +	struct btrfs_inode *inode = parent->inode;
+> +	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+> +	const u32 start_bit = (child->file_offset - parent->file_offset) >>
+> +			      fs_info->sectorsize_bits;
+> +	const u32 nr_bits = child->num_bytes >> fs_info->sectorsize_bits;
+> +
+> +	lockdep_assert_held(&inode->ordered_tree_lock);
+> +	/* Basic flags check for parent and child. */
+> +	ASSERT(test_bit(BTRFS_ORDERED_DELAYED, &parent->flags));
+> +	ASSERT(!test_bit(BTRFS_ORDERED_DELAYED, &child->flags));
+> +
+> +	/* Child should not belong to any parent yet. */
+> +	ASSERT(list_empty(&child->child_list));
+> +
+> +	/* Child should be fully inside parent's range. */
+> +	ASSERT(child->file_offset >= parent->file_offset);
+> +	ASSERT(child->file_offset + child->num_bytes <=
+> +	       parent->file_offset + parent->num_bytes);
+> +
+> +	/*
+> +	 * There should be no existing child in the range, thus
+> +	 * all cleanup bits should be set.
+> +	 */
+> +	ASSERT(bitmap_test_range_all_set(parent->child_cleanup_bitmap,
+> +					 start_bit, nr_bits));
+> +
+> +	list_add_tail(&child->child_list, &parent->child_list);
+
+[Severity: High]
+Does this list insertion race with the lockless iteration in
+finish_delayed_ordered()?
+
+As mentioned above, if finish_delayed_ordered() iterates the child_list
+locklessly while this insertion occurs concurrently under the
+ordered_tree_lock, the linked list could become corrupted.
+
+> +
+> +	bitmap_clear(parent->child_cleanup_bitmap, start_bit, nr_bits);
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790327143.git.wqu@suse.com?part=1
+

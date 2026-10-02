@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Sat Sep 26 12:46:02 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: use helper functions to check if a string has a
+ given prefix
+Date: Sat, 26 Sep 2026 10:45:51 +0000
+Message-Id: <20260926104552.59BC91F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: out-of-bounds read in btrfs_compress_is_valid_type()
+--
+
+commit 7615b44c390f2bc8e44559cba44be4a79420451a
+Author: George Hu <integral@archlinux.org>
+
+btrfs: use helper functions to check if a string has a given prefix
+
+This commit refactors string prefix checking by replacing explicit strncmp
+calls with strstarts() and str_has_prefix(). It simplifies the code but drops
+the explicit length parameter from btrfs_compress_is_valid_type().
+
+> diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+> index ad90e14032dbb..a23a0892d26c0 100644
+> --- a/fs/btrfs/compression.c
+> +++ b/fs/btrfs/compression.c
+[ ... ]
+> @@ -70,19 +70,12 @@ static struct compressed_bio *alloc_compressed_bio(struct btrfs_inode *inode,
+>  	return to_compressed_bio(bbio);
+>  }
+>  
+> -bool btrfs_compress_is_valid_type(const char *str, size_t len)
+> +bool btrfs_compress_is_valid_type(const char *str)
+>  {
+> -	int i;
+> -
+> -	for (i = 1; i < ARRAY_SIZE(btrfs_compress_types); i++) {
+> -		size_t comp_len = strlen(btrfs_compress_types[i]);
+> -
+> -		if (len < comp_len)
+> -			continue;
+> -
+> -		if (!strncmp(btrfs_compress_types[i], str, comp_len))
+> +	for (int i = 1; i < ARRAY_SIZE(btrfs_compress_types); i++)
+> +		if (strstarts(str, btrfs_compress_types[i]))
+
+[Severity: High]
+Will this cause an out-of-bounds read if the input string is not null
+terminated and is shorter than the prefix being checked?
+
+The strstarts() helper expands to strncmp(str, prefix, strlen(prefix)).
+Because it forces the comparison length to equal the prefix length, it
+ignores the actual size of the input buffer.
+
+>  			return true;
+> -	}
+> +
+>  	return false;
+>  }
+>  
+[ ... ]
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index bb77d46376d4b..c33930c588029 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+> @@ -301,7 +301,7 @@ static int prop_compression_validate(const struct btrfs_inode *inode,
+>  	if (!value)
+>  		return 0;
+>  
+> -	if (btrfs_compress_is_valid_type(value, len))
+> +	if (btrfs_compress_is_valid_type(value))
+
+[Severity: High]
+Can this lead to reading past the allocated buffer when handling extended
+attributes from userspace?
+
+In prop_compression_validate(), the length constraint was dropped when
+calling btrfs_compress_is_valid_type(). If a local user calls setxattr()
+for the btrfs.compression attribute with a small value without a null
+terminator (like a single byte "z"), the VFS layer allocates a buffer of
+exactly that size.
+
+Since btrfs_compress_is_valid_type() now uses strstarts() and no longer
+bounds the check by the input length, the comparison can read past the
+end of the dynamically allocated value buffer. This could trigger KASAN
+memory safety splats or a page fault if the allocation boundary aligns
+with the end of a mapped page.
+
+>  		return 0;
+>  
+>  	if ((len == 2 && strncmp("no", value, 2) == 0) ||
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260926103651.41722-1-integral@archlinux.org?part=1
+

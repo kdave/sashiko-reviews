@@ -1,0 +1,87 @@
+From sashiko-bot@kernel.org Tue Sep 22 22:24:14 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v1] btrfs: add LOGICAL_INO_V2 flag for avoiding the tree
+ modification log
+Date: Tue, 22 Sep 2026 20:24:04 +0000
+Message-Id: <20260922202404.794BC1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: state inconsistency in LOGICAL_INO_V2 commit root walk
+--
+
+commit 0f518ea3c6d5b7616c9604e4f61911f67b7e1dea
+Author: Joanne Koong <joannelkoong@gmail.com>
+
+btrfs: add LOGICAL_INO_V2 flag for avoiding the tree modification log
+
+This commit adds the BTRFS_LOGICAL_INO_ARGS_COMMIT_ROOT flag to the
+LOGICAL_INO_V2 ioctl, allowing userspace to resolve backrefs against the
+commit roots instead of the current trees. This avoids enabling the tree
+modification log, reducing filesystem-wide lock contention and overhead.
+
+> diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+> index 1be632c742bdd..364ec3ad7d8a9 100644
+> --- a/fs/btrfs/backref.c
+> +++ b/fs/btrfs/backref.c
+> @@ -2549,7 +2549,8 @@ static int build_ino_list(u64 inum, u64 offset, u64 num_bytes, u64 root, void *c
+>  }
+>  
+>  int iterate_inodes_from_logical(u64 logical, struct btrfs_fs_info *fs_info,
+> -				void *ctx, bool ignore_offset)
+> +				void *ctx, bool ignore_offset,
+> +				bool search_commit_root)
+>  {
+>  	struct btrfs_backref_walk_ctx walk_ctx = { 0 };
+>  	int ret;
+>  	u64 flags = 0;
+>  	struct btrfs_key found_key;
+>  	struct btrfs_path *path;
+> 
+>  	path = btrfs_alloc_path();
+>  	if (!path)
+>  		return -ENOMEM;
+> 
+>  	ret = extent_from_logical(fs_info, logical, path, &found_key, &flags);
+
+[Severity: Medium]
+Will this lead to a state inconsistency when the target extent is modified
+in the current transaction?
+
+The path is zero-initialized via btrfs_alloc_path(), which means
+path->search_commit_root is false. Consequently, extent_from_logical() will
+query the active tree for the extent boundaries, even when userspace requests
+the commit root view via the BTRFS_LOGICAL_INO_ARGS_COMMIT_ROOT flag.
+
+>  	btrfs_free_path(path);
+>  	if (ret < 0)
+>  		return ret;
+
+[ ... ]
+
+> @@ -2575,7 +2576,8 @@ int iterate_inodes_from_logical(u64 logical, struct btrfs_fs_info *fs_info,
+>  		walk_ctx.extent_item_pos = logical - found_key.objectid;
+>  	walk_ctx.fs_info = fs_info;
+>  
+> -	return iterate_extent_inodes(&walk_ctx, false, build_ino_list, ctx);
+> +	return iterate_extent_inodes(&walk_ctx, search_commit_root,
+> +				     build_ino_list, ctx);
+>  }
+
+[Severity: Medium]
+Does this create a structural mismatch between the initial extent lookup
+and the subsequent backref walk?
+
+The backref walk is instructed to use the commit root via the passed
+search_commit_root flag. Because the prior extent_from_logical() call
+retrieved its coordinates from the active tree, if the extent boundaries
+have changed or been relocated during the active transaction, the backref
+walk could silently fail or return incorrect results (such as missing inodes
+or spurious ENOENT) due to the coordinate mismatch.
+
+Would it be better to conditionally set path->search_commit_root =
+search_commit_root before calling extent_from_logical() to ensure both lookups
+query the same view of the filesystem?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260922201258.874070-1-joannelkoong@gmail.com?part=1
+

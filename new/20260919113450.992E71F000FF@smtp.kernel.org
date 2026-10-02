@@ -1,0 +1,59 @@
+From sashiko-bot@kernel.org Sat Sep 19 13:35:01 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: remove the trailing zeros from compressed
+ inline extent
+Date: Sat, 19 Sep 2026 11:34:50 +0000
+Message-Id: <20260919113450.992E71F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: out-of-bounds page cache access and crash in inline compression due to unvalidated i_size
+--
+
+commit 2af8d1d197fd53004a46cadef082499aae1996ef
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove the trailing zeros from compressed inline extent
+
+This commit changes the compression input range for inlined extents from
+[0, sectorsize) back to [0, i_size) to reduce the extra space usage caused
+by a previous refactoring. It relies on a separate fix in the lzo path to
+properly handle inlined extents without trailing zeros.
+
+Link: https://lore.kernel.org/linux-btrfs/c97652a5-ac6b-4de6-aa23-3cdebc01d00b@gmail.com/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index f4b68205f621e..89b05bd42d4ef 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -2331,12 +2331,7 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  		} else if (inode->prop_compress) {
+>  			compress_type = inode->prop_compress;
+>  		}
+> -		/*
+> -		 * We need to pass blocksize and not i_size, otherwise we can't
+> -		 * create compressed inline extents for data smaller than sector
+> -		 * size with lzo.
+> -		 */
+> -		cb = btrfs_compress_bio(inode, 0, blocksize, compress_type, compress_level, 0);
+> +		cb = btrfs_compress_bio(inode, 0, i_size, compress_type, compress_level, 0);
+
+[Severity: High]
+Since i_size is read locklessly earlier in run_delalloc_inline() via
+i_size_read(), can it change concurrently before being passed here?
+
+If a concurrent truncate-to-zero sets i_size to 0, it appears this could
+pass len = 0 to btrfs_compress_bio(), which then triggers an ASSERT(len)
+panic in lzo_compress_bio().
+
+Additionally, if i_size increases concurrently or for holes in sparse files,
+could passing an unvalidated i_size cause out-of-bounds page cache accesses
+and unbounded CPU waste on uncompressed data?
+
+It looks like btrfs_compress_filemap_get_folio() might attempt to read
+non-existent folios beyond the first sector, logging "failed to get page
+cache" via btrfs_crit(). Could this be used by local users to trivially spam
+the kernel log?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1789816636.git.wqu@suse.com?part=2
+

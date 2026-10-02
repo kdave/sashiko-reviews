@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Fri Sep 25 19:26:01 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] generic: test replacing a xattr with a larger value
+Date: Fri, 25 Sep 2026 17:25:51 +0000
+Message-Id: <20260925172551.A64061F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] test: undefined _fixed_by_fs_commit helper and missing FSTYP guard
+- [Medium] test: invalid _exit command causes script execution failure
+--
+
+commit 3aa6945ba02632ef911aa5ea36ebd79279d5509a
+Author: Filipe Manana <fdmanana@suse.com>
+
+generic: test replacing a xattr with a larger value
+
+This commit introduces a new generic xfstests script to verify that replacing a
+xattr's value with a larger one works correctly. It specifically exercises a
+btrfs edge case where two xattrs share the same crc32c name hash and are
+packed into the same btrfs item.
+
+> diff --git a/tests/generic/806 b/tests/generic/806
+> new file mode 100755
+> index 0000000000000..1fcf014542463
+> --- /dev/null
+> +++ b/tests/generic/806
+
+[ ... ]
+
+> +_require_scratch
+> +_require_attrs
+> +
+> +_fixed_by_fs_commit btrfs xxxxxxxxxxxx \
+> +   "btrfs: fix xattr replace when multiple xattrs are packed in the same item"
+
+[Severity: Medium]
+Is _fixed_by_fs_commit an intended helper? The standard xfstests helper is
+_fixed_by_kernel_commit, and it doesn't take a subsystem name as the first
+argument.
+
+Also, because this is a generic test in tests/generic/, unconditionally
+requiring a btrfs-specific commit will cause the test to be incorrectly
+skipped on other filesystems like ext4 or XFS if the running kernel lacks
+the btrfs commit. Does this check need to be conditionally applied only for
+btrfs using an FSTYP guard?
+
+if [ "$FSTYP" = "btrfs" ]; then
+    _fixed_by_kernel_commit xxxxxxxxxxxx \
+        "btrfs: fix xattr replace when multiple xattrs are packed..."
+fi
+
+[ ... ]
+
+> +# Check the xattrs have the expected values.
+> +echo "xattrs after:"
+> +_getfattr --absolute-names --dump $SCRATCH_MNT/testfile | _filter_scratch
+> +
+> +# success, all done
+> +_exit 0
+
+[Severity: Medium]
+Does the _exit command exist in the test framework or bash? _exit is neither
+a standard bash builtin nor a recognized xfstests helper.
+
+When execution reaches this termination point, bash will emit a command not
+found error to stderr. This will cause the test to fail on every run because
+the unexpected stderr output will not match the golden output file (806.out),
+and the script will terminate with a non-zero exit status.
+
+Should this use a standard termination pattern, like status=0; exit or
+simply exit 0?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20260925171636.vNcfRXeDsryytCbbtbCJ8jWv7CT7of4d09HNkkGMMls@z?part=1
+

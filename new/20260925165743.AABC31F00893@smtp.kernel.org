@@ -1,0 +1,54 @@
+From sashiko-bot@kernel.org Fri Sep 25 18:57:53 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] generic: test replacing a xattr with a larger value
+Date: Fri, 25 Sep 2026 16:57:43 +0000
+Message-Id: <20260925165743.AABC31F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] fstests: undefined fixed_by_fs_commit helper causes unconditional test failure
+--
+
+commit c4c2f0983696a93c5f0cc0d2a9f0fc354d1a8f5e
+Author: Filipe Manana <fdmanana@suse.com>
+
+generic: test replacing a xattr with a larger value
+
+This commit adds a generic fstest to verify that replacing a xattr with a
+larger value works correctly, specifically exercising a scenario where multiple
+xattrs share the same crc32c hash.
+
+> diff --git a/tests/generic/806 b/tests/generic/806
+> new file mode 100755
+> index 0000000000000..6d74f4459ffa7
+> --- /dev/null
+> +++ b/tests/generic/806
+
+[ ... ]
+
+> +_require_scratch
+> +_require_attrs
+> +
+> +fixed_by_fs_commit btrfs xxxxxxxxxxxx \
+> +   "btrfs: fix xattr replace when multiple xattrs are packed in the same item"
+
+[Severity: Medium]
+Is this intended to be _fixed_by_kernel_commit? 
+
+The fixed_by_fs_commit function call is missing the standard '_' prefix used
+for fstests helpers, which causes bash to emit a "command not found" error to
+stderr. This stderr output will cause the test to fail unconditionally due to
+a golden output mismatch.
+
+Additionally, if the intent was to use _fixed_by_kernel_commit, it appears to
+be incorrectly passing "btrfs" as its first argument instead of the commit
+hash. Since this is a generic test, should this call be wrapped in a check for
+$FSTYP == "btrfs" to prevent unrelated filesystems from incorrectly tracking
+this btrfs-specific commit dependency?
+
+> +
+> +_scratch_mkfs >>$seqres.full 2>&1 || _fail "mkfs failed"
+> +_scratch_mount
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/8916aea263bc59af6cfb1accacc2eaf78aaffe89.1790354960.git.fdmanana@suse.com?part=1
+
