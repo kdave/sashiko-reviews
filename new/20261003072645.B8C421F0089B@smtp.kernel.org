@@ -1,0 +1,85 @@
+From sashiko-bot@kernel.org Sat Oct  3 09:26:56 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] fstests: btrfs: add a test case for deleting
+ partially owned qgroup
+Date: Sat, 03 Oct 2026 07:26:45 +0000
+Message-Id: <20261003072645.B8C421F0089B@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] fstests: missing output redirection for btrfs commands breaks golden output
+--
+
+commit e492c56f56cc791e9c03874d480a4cc431e1bd1f
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a test case for deleting partially owned qgroup
+
+This commit introduces a new test case to verify that when deleting a
+partially owned qgroup, both the on-disk items and the in-memory rb-tree
+and sysfs entries are properly removed.
+
+> diff --git a/tests/btrfs/358 b/tests/btrfs/358
+> new file mode 100755
+> index 0000000000000..3e9f2783bc216
+> --- /dev/null
+> +++ b/tests/btrfs/358
+
+[ ... ]
+
+> +fsid=$(_btrfs_get_fsid "$SCRATCH_MNT")
+> +
+> +# We require /sys/fs/btrfs/<fsid>/qgroups/ directory
+> +if [ ! -d "/sys/fs/btrfs/$fsid/qgroups/0_5" ]; then
+> +	_notrun "No sysfs qgroups directory"
+> +fi
+> +
+> +_btrfs subvolume create "$SCRATCH_MNT/subv1"
+
+[Severity: Medium]
+Will this break the golden output? The _btrfs subvolume create command prints
+status messages like "Create subvolume..." to stdout by default, but
+358.out only expects "QA output created by 358" and "Silence is golden".
+Should this be redirected to $seqres.full or /dev/null?
+
+> +_pwrite_byte 0x00 0 1M "$SCRATCH_MNT/subv1/data1" >> $seqres.full
+> +_btrfs subvolume snapshot "$SCRATCH_MNT/subv1" "$SCRATCH_MNT/snap1"
+
+[Severity: Medium]
+Similarly, does this snapshot command need output redirection to prevent it
+from polluting stdout with "Create a snapshot of..." and causing an
+unconditional test failure?
+
+> +snap1id=$(_btrfs_get_subvolid "$SCRATCH_MNT" snap1)
+> +
+> +# Create the following qgroup layout and rescan.
+> +#                    2/1
+> +#                     |
+> +#                    1/1
+> +#                     |
+> +#  0/subv1           0/snap1
+> +#
+> +# Since snap1 is a snapshot of subv1, both will have 1M shared data
+> +# plus nodesize as exclusive metadata.
+> +# This means neither of them is fully exclusive (rfer > excl).
+> +_btrfs qgroup create 1/1 "$SCRATCH_MNT"
+> +_btrfs qgroup create 2/1 "$SCRATCH_MNT"
+> +_btrfs qgroup assign 1/1 2/1 "$SCRATCH_MNT"
+
+[Severity: Medium]
+Depending on the btrfs-progs version, this qgroup assign command may output
+"quota rescan started" to stdout. Should this output also be suppressed to
+avoid breaking the golden output comparison?
+
+> +_btrfs qgroup assign 0/$snap1id 1/1 "$SCRATCH_MNT"
+> +
+> +# Do a rescan, as the above assign will mark the qgroup inconsistent.
+> +_btrfs quota rescan -w "$SCRATCH_MNT"
+
+[Severity: Medium]
+Can this quota rescan output messages such as "quota rescan started" or
+"quota rescan is already running" to stdout? If so, does it need to be
+redirected as well?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261003071724.50671-1-wqu@suse.com?part=1
+

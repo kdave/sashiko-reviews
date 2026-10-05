@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:26 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 13/21] xfs: add XFS_BMAPI_UNWRITTEN to
+ unmap unwritten extents in __xfs_bunmapi()
+Date: Sat, 03 Oct 2026 01:34:15 +0000
+Message-Id: <20261003013416.14B861F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] xfs: __xfs_bunmapi data corruption on realtime fsverity files
+--
+
+commit 97b9c0f9cb7278bb7ab6643a57cb0d0f1ac3924b
+Author: Andrey Albershteyn via Linux-f2fs-devel <linux-f2fs-devel@lists.sourceforge.net>
+
+xfs: add XFS_BMAPI_UNWRITTEN to unmap unwritten extents in __xfs_bunmapi()
+
+The __xfs_bunmapi() is used to remove all extents past EOF. Add
+XFS_BMAPI_UNWRITTEN to remove only unwritten extents, while leaving
+written ones in place. This will be used in following patch to clean up
+unwritten extents on fsverity inodes.
+
+> diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+> index 19ca2043c2a8a..49b093ef0321f 100644
+> --- a/fs/xfs/libxfs/xfs_bmap.c
+> +++ b/fs/xfs/libxfs/xfs_bmap.c
+> @@ -5277,6 +5277,10 @@ __xfs_bunmapi(
+>  		if (del.br_startoff + del.br_blockcount > end + 1)
+>  			del.br_blockcount = end + 1 - del.br_startoff;
+>  
+> +		if ((flags & XFS_BMAPI_UNWRITTEN) &&
+> +		    del.br_state != XFS_EXT_UNWRITTEN)
+> +			goto skip;
+> +
+
+[Severity: High]
+Does this check sufficiently protect written extents when operating on
+realtime files?
+
+If an unwritten extent is unaligned within a realtime block, the later
+logic in __xfs_bunmapi() will fetch the contiguous written left neighbor
+and unconditionally convert its tail into an unwritten extent:
+
+fs/xfs/libxfs/xfs_bmap.c:__xfs_bunmapi() {
+    ...
+		mod = xfs_rtb_to_rtxoff(mp, del.br_startblock);
+		if (mod) {
+    ...
+			} else if (del.br_state == XFS_EXT_UNWRITTEN) {
+				struct xfs_bmbt_irec	prev;
+				xfs_fileoff_t		unwrite_start;
+
+				/*
+				 * This one is already unwritten.
+				 * It must have a written left neighbor.
+				 * Unwrite the killed part of that one and
+				 * try again.
+				 */
+				if (!xfs_iext_prev_extent(ifp, &icur, &prev))
+					ASSERT(0);
+				ASSERT(prev.br_state == XFS_EXT_NORM);
+    ...
+				prev.br_state = XFS_EXT_UNWRITTEN;
+				error = xfs_bmap_add_extent_unwritten_real(tp,
+						ip, whichfork, &icur, &cur,
+						&prev, &logflags);
+
+Could this unwrite the left neighbor even when XFS_BMAPI_UNWRITTEN is set,
+destroying the adjacent written data (such as an fsverity Merkle tree)?
+
+>  		if (!isrt || (flags & XFS_BMAPI_REMAP))
+>  			goto delete;
+>
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=13
+

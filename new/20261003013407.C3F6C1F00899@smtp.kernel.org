@@ -1,0 +1,19 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:17 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 03/21] fsverity: pass digest size and
+ hash of the all-zeroes block to ->write
+Date: Sat, 03 Oct 2026 01:34:07 +0000
+Message-Id: <20261003013407.C3F6C1F00899@smtp.kernel.org>
+
+> Let filesystem iterate over hashes in the block and check if these are
+> hashes of zeroed data blocks. XFS will use this to decide if it want to
+> store tree block full of these hashes.
+> 
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=3
+
+

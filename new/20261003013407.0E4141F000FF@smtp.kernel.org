@@ -1,0 +1,24 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:17 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 10/21] xfs: don't report dio_mem_align
+ and dio_offset_align for fsverity files
+Date: Sat, 03 Oct 2026 01:34:06 +0000
+Message-Id: <20261003013407.0E4141F000FF@smtp.kernel.org>
+
+> Sashiko.dev reported that while fsverity files falls back to the
+> buffered IO for Direct I/O, they should not report non-zero values in
+> dio_mem_align and dio_offset_align, meaning it's not supported.
+> 
+> The STATX_DIOALIGN | STATX_DIO_READ_ALIGN flags are used to explicitly
+> report if DIO is supported or not. They can not indicate that fallback
+> to the buffered IO is used in this case. The zero alignment values also
+> mean that DIO is not supported on this file, see statx(2).
+> 
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=10
+
+

@@ -1,0 +1,20 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:19 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 16/21] xfs: initialize fs-verity on file
+ open
+Date: Sat, 03 Oct 2026 01:34:08 +0000
+Message-Id: <20261003013409.6F6A41F0089A@smtp.kernel.org>
+
+> fs-verity will read and attach metadata (not the tree itself) from
+> a disk for those inodes which already have fs-verity enabled.
+> 
+> Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=16
+
+

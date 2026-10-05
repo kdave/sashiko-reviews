@@ -1,0 +1,21 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:26 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v17 06/21] fsverity: hoist statx reporting of fs-verity
+ flag
+Date: Sat, 03 Oct 2026 01:34:12 +0000
+Message-Id: <20261003013412.E62111F000FF@smtp.kernel.org>
+
+> All filesystems, supporting fsverity, report this status by checking
+> inode flag. Also, BTRFS was missing stat->attributes_mask, which is
+> fixed now.
+> 
+> Fixes: 146054090b08 ("btrfs: initial fsverity support")
+> Cc: stable@vger.kernel.org
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=6
+
+

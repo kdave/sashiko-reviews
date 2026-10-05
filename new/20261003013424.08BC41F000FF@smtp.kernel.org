@@ -1,0 +1,81 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:34 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 19/21] xfs: check and repair the verity
+ inode flag state
+Date: Sat, 03 Oct 2026 01:34:23 +0000
+Message-Id: <20261003013424.08BC41F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] xfs: scrub aborts on fsverity validation errors -EINVAL and -EFBIG
+--
+
+commit 856d4488769e21ab11188de2cd348b2c2b9cb631
+Author: Darrick J. Wong <djwong@kernel.org>
+
+xfs: check and repair the verity inode flag state
+
+If an inode has the incore verity iflag set, make sure that we can
+actually activate fsverity on that inode.  If activation fails due to
+a fsverity metadata validation error, clear the flag.
+
+> diff --git a/fs/xfs/scrub/common.c b/fs/xfs/scrub/common.c
+> index e5233e31abb75..ebbef3afb7d6e 100644
+> --- a/fs/xfs/scrub/common.c
+> +++ b/fs/xfs/scrub/common.c
+[ ... ]
+> @@ -1754,3 +1756,54 @@ xchk_inode_count_blocks(
+>  	return xfs_bmap_count_blocks(sc->tp, sc->ip, whichfork, nextents,
+>  			count);
+>  }
+> +
+> +/*
+> + * If this inode has S_VERITY set on it, read the verity info. If the reading
+> + * fails with anything other than ENOMEM, the file is corrupt, which we can
+> + * detect later with fsverity_active.
+> + *
+> + * Callers must hold the IOLOCK and must not hold the ILOCK of sc->ip because
+> + * activation reads inode data.
+> + */
+> +int
+> +xchk_inode_setup_verity(
+> +	struct xfs_scrub	*sc)
+> +{
+> +	int			error;
+> +
+> +	if (!fsverity_active(VFS_I(sc->ip)))
+> +		return 0;
+> +
+> +	error = fsverity_ensure_verity_info(VFS_I(sc->ip));
+> +	switch (error) {
+> +	case 0:
+> +		/* fsverity is active */
+> +		break;
+> +	case -ENODATA:
+> +	case -EMSGSIZE:
+> +	case -EFSCORRUPTED:
+> +	case -ERANGE:
+> +	case -EBADMSG:
+> +		/*
+> +		 * The nonzero errno codes above are the error codes that can
+> +		 * be returned from fsverity on metadata validation errors.
+> +		 */
+> +		return 0;
+> +	default:
+> +		/* runtime errors */
+> +		return error;
+> +	}
+
+[Severity: Medium]
+Should -EINVAL and -EFBIG be included in the allowed validation error codes?
+
+A corrupted fsverity descriptor on disk can trigger
+validate_fsverity_descriptor() to return -EINVAL or
+fsverity_init_merkle_tree_params() to return -EFBIG.
+
+Because they are omitted from this switch statement, they fall through to the
+default case and return the error, aborting the scrub setup instead of
+gracefully marking the inode as broken and continuing the repair pipeline.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=19
+

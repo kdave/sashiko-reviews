@@ -1,0 +1,104 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 12/21] xfs: use read ioend for fsverity
+ data verification
+Date: Sat, 03 Oct 2026 01:34:22 +0000
+Message-Id: <20261003013423.33F4E1F00899@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] xfs: deadlock in per-CPU bio completion due to mempool_alloc() with GFP_NOFS
+--
+
+commit ea1a0b2023bf04b556e0f9d798eb8d673f0e72ca
+Author: Andrey Albershteyn via Linux-f2fs-devel <linux-f2fs-devel@lists.sourceforge.net>
+
+xfs: use read ioend for fsverity data verification
+
+This commit uses read ioends for fsverity verification, moving fsverity
+metadata I/O to a separate workqueue to avoid deadlocks. It passes
+fsverity_info from the iomap context down to the ioend and adds a helper to
+check for file data.
+
+> diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+> index 19640e4e3ed12..a36f840884b49 100644
+> --- a/fs/xfs/xfs_aops.c
+> +++ b/fs/xfs/xfs_aops.c
+[ ... ]
+> @@ -623,11 +624,13 @@ static const struct iomap_read_ops xfs_iomap_read_ops = {
+>  
+>  static inline const struct iomap_read_ops *
+>  xfs_get_iomap_read_ops(
+> -	const struct address_space	*mapping)
+> +	const struct address_space	*mapping,
+> +	loff_t				pos)
+>  {
+>  	struct xfs_inode		*ip = XFS_I(mapping->host);
+>  
+> -	if (bdev_has_integrity_csum(xfs_inode_buftarg(ip)->bt_bdev))
+> +	if (bdev_has_integrity_csum(xfs_inode_buftarg(ip)->bt_bdev) ||
+> +	    xfs_fsverity_is_file_data(ip, pos))
+>  		return &xfs_iomap_read_ops;
+
+[Severity: High]
+Does this logic route fsverity metadata reads through xfs_iomap_read_ops if
+the block device has integrity checksums? 
+
+Using xfs_iomap_read_ops causes xfs_bio_submit_read() to call
+xfs_ioend_submit_read(), which sets BIO_COMPLETE_IN_TASK on the bio. This
+means the completions for these metadata reads will be queued to the per-CPU
+bio completion worker.
+
+>  	return &iomap_bio_read_ops;
+>  }
+
+[ ... ]
+> diff --git a/fs/xfs/xfs_ioend.c b/fs/xfs/xfs_ioend.c
+> index e70be5b86f0b7..f4c1bbc03714f 100644
+> --- a/fs/xfs/xfs_ioend.c
+> +++ b/fs/xfs/xfs_ioend.c
+[ ... ]
+> @@ -117,6 +138,24 @@ xfs_end_io_read(
+>  		}
+>  	}
+>  
+> +	/*
+> +	 * If we have fsverity on this bio, we need to run fsverity verification
+> +	 * of data folios from a separate fsverity workqueue. This is necessary
+> +	 * to avoid deadlocking due to fsverity issuing more reads of fsverity
+> +	 * metadata which would be processed by the same worker in the BIO
+> +	 * completion workqueue.
+> +	 */
+> +	if (IS_ENABLED(CONFIG_FS_VERITY) && !error && ioend->io_vi &&
+> +			xfs_fsverity_is_file_data(ip, ioend->io_offset)) {
+> +		fsv_ioend = mempool_alloc(&xfs_fsverity_ioend_pool,
+> +				GFP_NOFS);
+
+[Severity: High]
+Can this result in an ABBA deadlock under memory pressure?
+
+If the memory pool is empty, mempool_alloc() with GFP_NOFS will sleep and
+block the per-CPU bio completion worker in xfs_end_io_read().
+
+As noted in xfs_get_iomap_read_ops() above, if the block device has integrity
+checksums enabled, fsverity metadata reads will use xfs_iomap_read_ops
+and their completions will also be queued to this same per-CPU bio completion
+worker.
+
+Since this worker could be blocked in mempool_alloc() waiting for the
+fsverity workqueue to finish verifying data, and the fsverity workqueue
+could concurrently be waiting on a metadata read completion that is queued on
+this blocked worker, can this cause a hang?
+
+> +		fsv_ioend->ioend = ioend;
+> +		INIT_WORK(&fsv_ioend->work, xfs_end_fsverity_io_read);
+> +
+> +		fsverity_enqueue_verify_work(&fsv_ioend->work);
+> +		return;
+> +	}
+> +
+>  	iomap_finish_ioends(ioend, error);
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=12
+

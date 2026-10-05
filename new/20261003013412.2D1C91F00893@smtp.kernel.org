@@ -1,0 +1,27 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:23 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 09/21] xfs: disable direct read path for
+ fs-verity files
+Date: Sat, 03 Oct 2026 01:34:11 +0000
+Message-Id: <20261003013412.2D1C91F00893@smtp.kernel.org>
+
+> The direct path is not supported on verity files. Attempts to use direct
+> I/O path on such files should fall back to buffered I/O path.
+> 
+> Add a fall back to buffered I/O at two place, in a common fast path and
+> latter when lock is acquired. The second check prevents TOCTOU issue
+> with reading fsverity_active() status and resetting IOCB_DIRECT flag.
+> 
+> If one thread saw fsverity_active() to be false, and then second thread
+> acquired XFS_IOLOCK_EXCL and enabled fsverity. The first thread will go
+> through the DIO path.
+> 
+> Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=9
+
+

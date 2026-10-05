@@ -1,0 +1,21 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:27 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v17 08/21] xfs: don't allow to enable DAX on fs-verity
+ sealed inode
+Date: Sat, 03 Oct 2026 01:34:14 +0000
+Message-Id: <20261003013415.4B26D1F000FF@smtp.kernel.org>
+
+> fs-verity doesn't support DAX. Forbid filesystem to enable DAX on
+> inodes which already have fs-verity enabled. The opposite is checked
+> when fs-verity is enabled, it won't be enabled if DAX is.
+> 
+> Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=8
+
+

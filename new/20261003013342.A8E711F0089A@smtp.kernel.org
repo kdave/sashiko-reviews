@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:33:52 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: qgroup: fix race between subvolume creation and
+ adding/removing relations
+Date: Sat, 03 Oct 2026 01:33:42 +0000
+Message-Id: <20261003013342.A8E711F0089A@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: sleeping in atomic context in qgroup_auto_inherit()
+--
+
+commit d43b40fbef1b76cbd7ed51b5d2750aff249f3e04
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: qgroup: fix race between subvolume creation and adding/removing relations
+
+This commit addresses a race condition between subvolume creation and qgroup
+relation modifications. It acquires fs_info->qgroup_lock in
+qgroup_auto_inherit() to safely count and copy the qgroup list.
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index bf06962d49f3d..6921410a17b18 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -3256,26 +3256,34 @@ static int qgroup_auto_inherit(struct btrfs_fs_info *fs_info,
+>  	struct btrfs_qgroup_inherit *res;
+>  	size_t struct_sz;
+>  	u64 *qgids;
+> +	int ret = 0;
+>  
+>  	if (*inherit)
+>  		return -EEXIST;
+>  
+> +	spin_lock(&fs_info->qgroup_lock);
+>  	inode_qg = find_qgroup_rb(fs_info, inode_rootid);
+> -	if (!inode_qg)
+> -		return -ENOENT;
+> +	if (!inode_qg) {
+> +		ret = -ENOENT;
+> +		goto out;
+> +	}
+>  
+>  	num_qgroups = list_count_nodes(&inode_qg->groups);
+>  
+>  	if (!num_qgroups)
+> -		return 0;
+> +		goto out;
+>  
+>  	struct_sz = struct_size(res, qgroups, num_qgroups);
+> -	if (struct_sz == SIZE_MAX)
+> -		return -ERANGE;
+> +	if (struct_sz == SIZE_MAX) {
+> +		ret = -ERANGE;
+> +		goto out;
+> +	}
+>  
+>  	res = kzalloc(struct_sz, GFP_NOFS);
+> -	if (!res)
+> -		return -ENOMEM;
+> +	if (!res) {
+> +		ret = -ENOMEM;
+> +		goto out;
+> +	}
+
+[Severity: High]
+Does this allocation sleep while holding the fs_info->qgroup_lock?
+
+The spin_lock() call earlier in qgroup_auto_inherit() initiates an atomic
+context. However, kzalloc() is called here with GFP_NOFS, which includes
+__GFP_DIRECT_RECLAIM and allows the allocator to sleep while waiting for
+memory reclaim.
+
+Since this code path is reachable via standard filesystem operations when
+creating a subvolume with simple quotas enabled, could this regression
+trigger a 'BUG: scheduling while atomic' panic if the allocator blocks?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1790967259.git.fdmanana@suse.com?part=1
+

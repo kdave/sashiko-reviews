@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Mon Oct  5 03:31:33 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 2/2] btrfs: write back a folio extent-by-extent
+ instead of block-by-block
+Date: Mon, 05 Oct 2026 01:31:24 +0000
+Message-Id: <20261005013124.A1F4D1F000FF@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: integer underflow in truncate_ordered_extents_beyond_eof
+--
+
+commit e58c634ced176d3e102c64c7824ef701e9547ecb
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: write back a folio extent-by-extent instead of block-by-block
+
+The current dirty folio writeback is still based on a block-by-block
+iteration. This commit optimizes the folio writeback behavior to do an
+extent-by-extent submission.
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index 05e6a97dc15db..be860e42ef7ae 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+[ ... ]
+> @@ -1811,99 +1811,60 @@ static struct btrfs_ordered_extent *get_oe_from_bbio(const struct btrfs_bio *bbi
+[ ... ]
+> +static void truncate_ordered_extents_beyond_eof(struct btrfs_inode *inode,
+> +						u64 file_offset, u32 len)
+>  {
+[ ... ]
+> +	u64 cur = file_offset;
+> +	const u64 next_off = file_offset + len;
+>  
+> +	while (cur < next_off) {
+> +		struct btrfs_ordered_extent *ordered;
+>  
+> +		ordered = btrfs_lookup_first_ordered_range(inode, cur, next_off - cur);
+> +		if (!ordered)
+> +			break;
+>  
+>  		/*
+> +		 * The whole range [file_offset, file_offset + len) should all have
+> +		 * OE coverage.
+> +		 * Thus every found OE must cover @cur, there should be no gap.
+>  		 */
+> +		ASSERT(in_range(cur, ordered->file_offset, ordered->num_bytes));
+> +		spin_lock(&inode->ordered_tree_lock);
+> +		set_bit(BTRFS_ORDERED_TRUNCATED, &ordered->flags);
+> +		ordered->truncated_len = min(ordered->truncated_len,
+> +					     cur - ordered->file_offset);
+
+[Severity: High]
+What happens to the calculation here if there is a gap in ordered extents?
+
+If btrfs_lookup_first_ordered_range() returns an ordered extent that starts
+after cur, ordered->file_offset would be greater than cur.
+
+Wouldn't cur - ordered->file_offset then underflow to a very large number,
+bypassing the intended truncation and leaving truncated_len unchanged?
+
+Production builds with assertions disabled would silently skip the ASSERT()
+and allow the extent beyond EOF to be fully written and inserted into the
+tree. Could this lead to stale data leaks or metadata corruption if the file
+is later extended?
+
+> +		cur = ordered->file_offset + ordered->num_bytes;
+> +		spin_unlock(&inode->ordered_tree_lock);
+> +		btrfs_put_ordered_extent(ordered);
+>  	}
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1791162950.git.wqu@suse.com?part=2
+

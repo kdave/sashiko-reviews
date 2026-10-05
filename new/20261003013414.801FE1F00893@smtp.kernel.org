@@ -1,0 +1,22 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:24 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 21/21] xfs: enable ro-compat fs-verity
+ flag
+Date: Sat, 03 Oct 2026 01:34:14 +0000
+Message-Id: <20261003013414.801FE1F00893@smtp.kernel.org>
+
+> Finalize fs-verity integration in XFS by making kernel fs-verity
+> aware with ro-compat flag.
+> 
+> Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+> [djwong: add spaces]
+> Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=21
+
+

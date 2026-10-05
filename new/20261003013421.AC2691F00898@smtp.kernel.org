@@ -1,0 +1,28 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:31 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 14/21] xfs: don't remove written extents
+ past EOF on fsverity inodes
+Date: Sat, 03 Oct 2026 01:34:21 +0000
+Message-Id: <20261003013421.AC2691F00898@smtp.kernel.org>
+
+> xfs_free_eofblocks() removes all extents past EOF unless the
+> XFS_DIFLAG_PREALLOC or XFS_DIFLAG_APPEND flags are set. This is
+> undesired for fsverity as it stores metadata beyond EOF. However, while
+> merkle tree is being built, delayed preallocation and unwritten extents
+> are used. After metadata construction is done, fsverity inodes becomes
+> read-only and won't be changed anymore, none of these unwritten extents
+> or preallocations in post EOF region will be used.
+> 
+> Let xfs_free_eofblocks() be called on fsverity inode as usual to remove
+> anything which is not written extent. However, inodes which are
+> undergoing merkle tree construction need to be skipped in case reclaim
+> takes place.
+> 
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=14
+
+

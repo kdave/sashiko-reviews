@@ -1,0 +1,130 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:32 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 15/21] xfs: add fs-verity support
+Date: Sat, 03 Oct 2026 01:34:22 +0000
+Message-Id: <20261003013422.708321F00893@smtp.kernel.org>
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] xfs: AB-BA lock inversion deadlock in xfs_fsverity_delete_metadata
+- [High] xfs: inconsistent on-disk state after fs-verity enablement optimization failure
+- [Medium] xfs: resource leak when fs-verity enablement is aborted
+--
+
+commit e2140f5468115bfa6cf4b74f36f51ee2780f1c23
+Author: Andrey Albershteyn via Linux-f2fs-devel <linux-f2fs-devel@lists.sourceforge.net>
+
+xfs: add fs-verity support
+
+This commit adds integration with fs-verity for XFS. It introduces reading
+and writing the Merkle tree through the iomap interface and stores the
+verity descriptor in the inode data fork past EOF.
+
+> diff --git a/fs/xfs/xfs_fsverity.c b/fs/xfs/xfs_fsverity.c
+> index 976e05257bf90..8cffcafc19aa0 100644
+> --- a/fs/xfs/xfs_fsverity.c
+> +++ b/fs/xfs/xfs_fsverity.c
+
+[ ... ]
+
+> +static int
+> +xfs_fsverity_delete_metadata(
+> +	struct xfs_inode	*ip)
+> +{
+> +	struct xfs_trans	*tp;
+> +	struct xfs_mount	*mp = ip->i_mount;
+> +	int			error;
+> +
+> +	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
+> +	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate, 0, 0, 0, &tp);
+> +	if (error) {
+> +		xfs_iunlock(ip, XFS_MMAPLOCK_EXCL);
+> +		return error;
+> +	}
+> +
+> +	truncate_inode_pages(VFS_I(ip)->i_mapping, XFS_ISIZE(ip));
+
+[Severity: High]
+Could this lock ordering lead to an AB-BA deadlock?
+
+In XFS, folio locks must generally be acquired before transaction allocation
+to prevent deadlocks with memory reclaim or writeback threads that may hold
+the folio lock while waiting for transaction log space.
+
+Here, xfs_trans_alloc() is called before truncate_inode_pages(), which
+acquires the folio locks.
+
+[ ... ]
+
+> +static int
+> +xfs_fsverity_end_enable(
+> +	struct file		*file,
+> +	const void		*desc,
+> +	size_t			desc_size,
+> +	u64			merkle_tree_size)
+> +{
+> +	struct inode		*inode = file_inode(file);
+> +	struct xfs_inode	*ip = XFS_I(inode);
+> +	struct xfs_mount	*mp = ip->i_mount;
+> +	struct xfs_trans	*tp;
+> +	int			error = 0;
+> +	loff_t			range_start = xfs_fsverity_metadata_offset(ip);
+> +
+> +	xfs_assert_ilocked(ip, XFS_IOLOCK_EXCL);
+> +
+> +	/* fs-verity failed, just cleanup */
+> +	if (desc == NULL)
+> +		goto out;
+
+[Severity: Medium]
+Does this abort path leak blocks allocated for the Merkle tree past EOF?
+
+When the core calls xfs_fsverity_end_enable() with desc == NULL to signal
+an abort, this code jumps to the out label.
+
+Because error is initialized to 0 and not updated here, the cleanup block
+at the end of the function (which checks if error is non-zero) is skipped.
+
+[ ... ]
+
+> +	/*
+> +	 * Ensure that we've persisted the verity information before we enable
+> +	 * it on the inode and tell the caller we have sealed the inode.
+> +	 */
+> +	ip->i_diflags2 |= XFS_DIFLAG2_VERITY;
+> +
+> +	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+> +	xfs_trans_set_sync(tp);
+> +
+> +	error = xfs_trans_commit(tp);
+> +	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+> +	if (error)
+> +		goto out;
+> +
+> +	inode_set_flags(inode, S_VERITY, S_VERITY);
+> +
+> +	/*
+> +	 * Proactively remove unwritten extents left by COW preallocations and
+> +	 * write preallocation in the merkle tree holes and past descriptor,
+> +	 * and any delayed preallocations
+> +	 */
+> +	error = xfs_free_eofblocks(ip);
+> +out:
+> +	if (error) {
+> +		int	error2;
+> +
+> +		error2 = xfs_fsverity_reset_inode(ip);
+
+[Severity: High]
+Can this sequence result in an inconsistent on-disk state?
+
+If xfs_free_eofblocks() fails, the XFS_DIFLAG2_VERITY flag has already
+been committed to disk in the previous transaction. The code then calls
+xfs_fsverity_reset_inode() to revert the enablement in a new transaction.
+
+If a system crash occurs between the two transactions, or if allocating
+the second transaction fails, the file could be left permanently sealed
+on disk, but unsealed in memory.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=15
+

@@ -1,0 +1,25 @@
+From sashiko-bot@kernel.org Sat Oct  3 03:34:18 2026
+From: sashiko-bot@kernel.org
+Subject: Re: [f2fs-dev] [PATCH v17 04/21] fsverity: hoist pagecache_read
+ from f2fs/ext4 to fsverity
+Date: Sat, 03 Oct 2026 01:34:08 +0000
+Message-Id: <20261003013408.8F32F1F00893@smtp.kernel.org>
+
+> This is the same function to read from pageache. XFS will also need
+> this, so move this to core fsverity.
+> 
+> Note that f2fs and ext4 functions diverged a bit, as ext4 operated over
+> folios and f2fs operated over pages. The common one will operate over
+> folios.
+> 
+> Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+> Reviewed-by: Christoph Hellwig <hch@lst.de>
+> Acked-by: Eric Biggers <ebiggers@kernel.org>
+> Signed-off-by: Andrey Albershteyn <aalbersh@kernel.org>
+
+Sashiko has reviewed this patch and found no issues. It looks great!
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261002223705.2175542-1-aalbersh@kernel.org?part=4
+
+
