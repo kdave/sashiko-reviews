@@ -1,0 +1,89 @@
+From sashiko-bot@kernel.org Sat Oct 10 14:20:09 2026
+Message-ID: <sashiko-outbox-166514@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 02/12] btrfs: zoned: do not account active zones for
+ conventional block groups
+Date: Sat, 10 Oct 2026 12:20:06 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] btrfs: null pointer deref in btrfs_check_active_zone_reservation on degraded mount
+- [High] btrfs: data race on zinfo->reserved_active_zones in call_zone_finish()
+--
+
+commit 6898ab3d16b24b3547bf0fe5d30d6f64a4240740
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: do not account active zones for conventional block groups
+
+This commit excludes conventional zones from active zone reservation accounting.
+It skips reservation checks at mount time and per-stripe zone finishing for
+these block groups.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 710b1d086f55d..81401c7d4cb91 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2633,14 +2633,16 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+[ ... ]
+> -	down_read(&dev_replace->rwsem);
+> -	map = block_group->physical_map;
+> -	for (i = 0; i < map->num_stripes; i++) {
+> -		ret = call_zone_finish(block_group, &map->stripes[i]);
+> -		if (ret)
+> -			break;
+> +	if (!btrfs_zoned_bg_is_conventional(block_group)) {
+> +		down_read(&dev_replace->rwsem);
+> +		map = block_group->physical_map;
+> +		for (i = 0; i < map->num_stripes; i++) {
+> +			ret = call_zone_finish(block_group, &map->stripes[i]);
+
+[Severity: High]
+Does this introduce a data race on zinfo->reserved_active_zones?
+
+When do_zone_finish() calls call_zone_finish(), the latter increments the
+reserved_active_zones counter without holding fs_info->zone_active_bgs_lock or
+any device-level lock:
+
+call_zone_finish() {
+    ...
+    if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
+        zinfo->reserved_active_zones++;
+    ...
+}
+
+Because do_zone_finish() can run concurrently across multiple CPUs via the
+system_dfl_wq workqueue, could concurrent increments (or decrements from
+btrfs_zone_activate) corrupt this counter, leading to active zone limit drift
+and potential starvation?
+
+> +			if (ret)
+> +				break;
+> +		}
+> +		up_read(&dev_replace->rwsem);
+>  	}
+> -	up_read(&dev_replace->rwsem);
+>  
+[ ... ]
+> @@ -3100,6 +3102,8 @@ void btrfs_check_active_zone_reservation(struct btrfs_fs_info *fs_info)
+>  		if (!(block_group->flags &
+>  		      (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)))
+>  			continue;
+> +		if (btrfs_zoned_bg_is_conventional(block_group))
+> +			continue;
+>  
+>  		for (int i = 0; i < map->num_stripes; i++)
+>  			map->stripes[i].dev->zone_info->reserved_active_zones--;
+
+[Severity: High]
+Can this loop cause a NULL pointer dereference on a degraded mount?
+
+When mounting a zoned filesystem in degraded mode, missing devices are
+represented with a NULL bdev and a NULL zone_info.
+
+Because this loop iterates over the stripes without checking if
+map->stripes[i].dev->bdev is valid, will it unconditionally dereference a NULL
+zone_info when processing a stripe belonging to a missing device?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261010120622.3781326-1-johannes.thumshirn@wdc.com?part=2
+

@@ -1,0 +1,76 @@
+From sashiko-bot@kernel.org Sat Oct 10 05:33:09 2026
+Message-ID: <sashiko-outbox-166249@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: add a test case to verify fsverity on
+ compressed files
+Date: Sat, 10 Oct 2026 03:33:05 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] fstests: undefined command _exit causes unconditional test failure
+- [Low] fstests: patch incorrectly targets the Linux kernel tree
+--
+
+commit 77ac5b6b7a951c6ef7a1d5c3f95af1df31a0cd1e
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: add a test case to verify fsverity on compressed files
+
+There is a bug report that with the recently enabled large folios
+support, compressed files on btrfs can give random but reproducible
+warnings about file corruption. This commit adds a new regression test
+case to verify fsverity on compressed files.
+
+> diff --git a/tests/btrfs/359 b/tests/btrfs/359
+> new file mode 100755
+> index 0000000000000..2047d96533701
+> --- /dev/null
+> +++ b/tests/btrfs/359
+> @@ -0,0 +1,45 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 359
+> +#
+> +# Test if btrfs handles fsverity read correctly without corruption warning
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick verity compress
+
+[Severity: Low]
+Does this patch belong in the xfstests-dev repository instead of the Linux
+kernel tree?
+
+The patch adds files to tests/btrfs/ and uses fstests specific infrastructure
+such as _begin_fstest, _require_scratch_verity, and _filter_xfs_io. These
+helpers and directory structures do not exist in the Linux kernel tree (which
+uses tools/testing/selftests/). 
+
+Applying this patch to the kernel tree simply introduces dead, unexecutable
+files.
+
+[ ... ]
+
+> +# Check for any kernel warnings from fs-verity on file corruption.
+> +if _check_dmesg_for "FILE CORRUPTED!"; then
+> +	echo "fs-verity detected corruption"
+> +fi
+> +
+> +_exit 0
+
+[Severity: Medium]
+Does this undefined command cause an unconditional test failure?
+
+_exit is not a valid bash builtin and is not defined in the standard fstests
+common helpers. When execution reaches this line, bash will emit a command not
+found error to stderr.
+
+Because fstests captures standard error and compares it to the expected output
+file (359.out), this unexpected error message will cause the test to
+unconditionally fail regardless of the actual filesystem behavior.
+
+Should this use status=0; exit or exit 0 instead?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261010032508.36935-1-wqu@suse.com?part=1
+

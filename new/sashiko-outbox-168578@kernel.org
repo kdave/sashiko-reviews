@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Mon Oct 12 21:21:25 2026
+Message-ID: <sashiko-outbox-168578@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 RESEND 3/6] btrfs: add per-inode compression levels
+ in xattrs
+Date: Mon, 12 Oct 2026 19:21:23 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] btrfs: lockless multi-variable data race on prop_compress and prop_compress_level
+--
+
+commit 68c3938993afebe0150ae23c7ab4cb000cf4e2ad
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: add per-inode compression levels in xattrs
+
+This commit adds support for per-inode compression levels in btrfs by parsing
+"algo:level" strings from the compression xattr. It introduces a new
+prop_compress_level field in btrfs_inode and updates the writeback and inline
+extent paths to apply the configured level.
+
+[ ... ]
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index a85a7c561cf8e..2df3eb19ee300 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -942,6 +942,11 @@ static void compress_file_range(struct btrfs_work *work)
+>  		compress_level = inode->defrag_compress_level;
+>  	} else if (inode->prop_compress) {
+>  		compress_type = inode->prop_compress;
+> +		if (inode->prop_compress_level)
+> +			compress_level = inode->prop_compress_level;
+
+[Severity: Low]
+Does this code introduce a data race between reading the compression type
+and level here, and updating them concurrently in prop_compression_apply()?
+
+Since compress_file_range() reads inode->prop_compress and
+inode->prop_compress_level locklessly, and prop_compression_apply()
+performs independent non-atomic stores to these adjacent fields, a torn
+read could occur. This could allow the writeback path to see a newly
+updated algorithm type paired with the old compression level.
+
+> +		else if (compress_type != fs_info->compress_type)
+> +			compress_level = 0;
+> +		/* else use fs_info->compress_level */
+>  	}
+>  
+>  	/* Compression level is applied here. */
+
+[ ... ]
+
+> @@ -2338,6 +2343,11 @@ static int run_delalloc_inline(struct btrfs_inode *inode, struct folio *locked_f
+>  			compress_level = inode->defrag_compress_level;
+>  		} else if (inode->prop_compress) {
+>  			compress_type = inode->prop_compress;
+> +			if (inode->prop_compress_level)
+> +				compress_level = inode->prop_compress_level;
+
+[Severity: Low]
+Is it possible for a similar data race to occur here in
+run_delalloc_inline() when reading inode->prop_compress and
+inode->prop_compress_level?
+
+As with compress_file_range(), reading these logically-coupled fields
+without synchronization while prop_compression_apply() modifies them
+could result in a transient mismatched compression configuration during
+writeback.
+
+> +			else if (compress_type != fs_info->compress_type)
+> +				compress_level = 0;
+> +			/* else use fs_info->compress_level */
+>  		}
+>  		cb = btrfs_compress_bio(inode, 0, blocksize, compress_type, compress_level, 0);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012190731.951056-1-koray.fra@gmail.com?part=3
+

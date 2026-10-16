@@ -1,0 +1,72 @@
+From sashiko-bot@kernel.org Wed Oct  7 18:08:48 2026
+Message-ID: <sashiko-outbox-163184@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix use-after-free on quota enable allocation
+ failure
+Date: Wed, 07 Oct 2026 16:08:43 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: use-after-free on transaction object when unlinking quota_root
+--
+
+commit e0745e2c47553440b48dc268844bf8019e308c37
+Author: Yalagada Pavan Kumar <pavankumaryalagada@gmail.com>
+
+btrfs: fix use-after-free on quota enable allocation failure
+
+This commit attempts to fix a use-after-free when btrfs_quota_enable() fails
+to allocate a qgroup structure. It aborts the transaction on allocation
+failure and removes the quota root from the dirty root list before
+releasing it.
+
+Closes: https://syzkaller.appspot.com/bug?extid=947286c775f432b073a8
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index cf8dfd5c692be..d5eaed5eec033 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+[ ... ]
+> @@ -1296,6 +1297,14 @@ int btrfs_quota_enable(struct btrfs_fs_info *fs_info,
+>  		 * sysfs entries.
+>  		 */
+>  		btrfs_free_qgroup_config(fs_info);
+> +
+> +		if (quota_root) {
+> +			spin_lock(&fs_info->trans_lock);
+> +			if (!list_empty(&quota_root->dirty_list))
+> +				list_del_init(&quota_root->dirty_list);
+
+[Severity: High]
+Can this list_del_init() cause a use-after-free on the transaction object?
+
+If an error occurs during btrfs_commit_transaction() called earlier in
+btrfs_quota_enable(), the commit process can abort and free the transaction
+while the quota_root is still linked to it.
+
+Specifically, during btrfs_commit_transaction(), commit_cowonly_roots()
+iterates over fs_info->dirty_cowonly_roots and moves quota_root->dirty_list
+onto trans->transaction->switch_commits.
+
+If update_cowonly_root() returns an error, the commit aborts and jumps to
+cleanup_transaction(). There, the final references to the transaction are
+dropped via btrfs_put_transaction(), freeing the btrfs_transaction struct
+back to the slab.
+
+However, the switch_commits list is not emptied, so quota_root->dirty_list
+is left holding dangling pointers into the freed transaction object.
+
+When the error propagates back to btrfs_quota_enable(), it jumps to the out
+label and executes this newly added list_del_init(&quota_root->dirty_list).
+Because list_del_init() writes to prev->next and next->prev (which are
+inside the freed transaction object), it results in a slab use-after-free.
+
+> +			spin_unlock(&fs_info->trans_lock);
+> +		}
+> +
+>  		btrfs_put_root(quota_root);
+>  	}
+>  	mutex_unlock(&fs_info->qgroup_ioctl_lock);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261007155632.155645-1-pavankumaryalagada@gmail.com?part=1
+

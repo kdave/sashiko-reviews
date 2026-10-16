@@ -1,0 +1,116 @@
+From sashiko-bot@kernel.org Thu Oct  8 00:22:07 2026
+Message-ID: <sashiko-outbox-163410@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: unlink btrfs_root::dirty_list during
+ btrfs_put_root()
+Date: Wed, 07 Oct 2026 22:22:04 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: Use-After-Free and transaction abort (-EUCLEAN) due to delayed dirty_list removal
+- [High] btrfs: list corruption race in btrfs_put_root() on dirty_list
+- [High] btrfs: Write-After-Free on btrfs_transaction in btrfs_put_root() after abort
+--
+
+commit 29d2aee28c65942a672ae80034cc50c6c2e3765e
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: unlink btrfs_root::dirty_list during btrfs_put_root()
+
+During btrfs_quota_enable(), a temporary quota_root is created and inserted.
+If a problem is hit later, quota_root will be released through
+btrfs_put_root(). This patch moves list_del_init(&root->dirty_list) inside
+btrfs_put_root() to fix a use-after-free where dirty_cowonly_roots points
+to the released root.
+
+Link: https://lore.kernel.org/linux-btrfs/6ac5a5e1.9ad129c8.3ce5b3.0010.GAE@google.com/
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 15339de1c1860..4766a127aa53a 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -1839,6 +1839,19 @@ void btrfs_put_root(struct btrfs_root *root)
+>  		return;
+>  
+>  	if (refcount_dec_and_test(&root->refs)) {
+> +		/*
+> +		 * root->dirty_list can be linked into either
+> +		 * fs_info->dirty_cowonly_roots or, during a transaction
+> +		 * commit, cur_trans->switch_commits.
+> +		 *
+> +		 * All callers removing a root from the fs should hold a
+> +		 * trans handle, so no transaction can be committing and the
+> +		 * root can only be on fs_info->dirty_cowonly_roots.
+> +		 */
+
+[Severity: High]
+Is this assumption accurate for all cases? Concurrent ioctls like
+btrfs_ioctl_qgroup_limit() can grab a reference to quota_root and drop it by
+calling btrfs_put_root() after calling btrfs_end_transaction().
+
+Calling btrfs_end_transaction() unblocks btrfs_commit_transaction(), allowing
+commit_cowonly_roots() to execute concurrently with the final btrfs_put_root().
+
+Does delaying the list removal until the final reference is dropped create a
+race with the transaction commit thread?
+
+The commit thread running commit_cowonly_roots() could traverse
+dirty_cowonly_roots locklessly and dereference the root while btrfs_put_root()
+concurrently removes it and calls kfree(), leading to a use-after-free.
+
+Even if the root survives long enough, if btrfs_update_root() inside
+commit_cowonly_roots() searches for the already-deleted root key (from
+btrfs_del_root), could it fail to find it and abort the transaction with
+-EUCLEAN?
+
+> +		spin_lock(&root->fs_info->trans_lock);
+> +		list_del_init(&root->dirty_list);
+> +		spin_unlock(&root->fs_info->trans_lock);
+> +
+
+[Severity: High]
+Could this unconditional list_del_init() concurrently corrupt the commit
+thread's lists?
+
+Because the commit thread running commit_cowonly_roots() iterates over and
+modifies dirty_cowonly_roots and switch_commits without holding trans_lock:
+
+fs/btrfs/transaction.c:commit_cowonly_roots() {
+    ...
+    while (!list_empty(&fs_info->dirty_cowonly_roots)) {
+        ...
+        root = list_first_entry(&fs_info->dirty_cowonly_roots, ...);
+        ...
+        list_move_tail(&root->dirty_list,
+                       &trans->transaction->switch_commits);
+    ...
+}
+
+If btrfs_put_root() executes concurrently (e.g., from
+btrfs_ioctl_qgroup_limit()), can the lockless traversal in
+commit_cowonly_roots() race with this list_del_init(), leading to list
+corruption or an infinite loop?
+
+[Severity: High]
+Could this also lead to a write-after-free if a transaction aborts during
+commit?
+
+If a transaction aborts during commit (e.g., if update_cowonly_root() fails
+inside commit_cowonly_roots()), roots whose dirty_list were already moved to
+trans->transaction->switch_commits remain on that list. 
+
+The btrfs_transaction struct is eventually freed via btrfs_put_transaction()
+without clearing the switch_commits list:
+
+fs/btrfs/transaction.c:btrfs_put_transaction() {
+    ...
+    WARN_ON(!list_empty(&transaction->dev_update_list));
+    kfree(transaction);
+}
+
+When the aborted filesystem is later unmounted and its roots are freed, will
+this list_del_init() attempt to unlink root->dirty_list from the already
+freed btrfs_transaction struct, causing a write-after-free?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cc366881387ac1f041d3b3a5b06eedd666b7c4c0.1791410825.git.wqu@suse.com?part=1
+

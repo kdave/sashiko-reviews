@@ -1,0 +1,71 @@
+From sashiko-bot@kernel.org Mon Oct 12 12:42:57 2026
+Message-ID: <sashiko-outbox-167978@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 17/28] zonefs: don't set SB_RDONLY after I/O errors
+Date: Mon, 12 Oct 2026 10:42:52 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] zonefs: missing ZONEFS_SB_EMERGENCY_RO on read-only mount allows bypassing errors=remount-ro
+--
+
+commit 51c4c88472fcc9d9e49452a7673d858c48222e8e
+Author: Christian Brauner <brauner@kernel.org>
+
+zonefs: don't set SB_RDONLY after I/O errors
+
+This commit changes zonefs to use a new ZONEFS_SB_EMERGENCY_RO state bit
+instead of SB_RDONLY when handling I/O errors. This prevents rwsem deadlocks
+during freeze/thaw cycles by enforcing that the filesystem refuses writes
+until it is unmounted.
+
+Cc: stable@vger.kernel.org
+
+> diff --git a/fs/zonefs/super.c b/fs/zonefs/super.c
+> index ff43d6d1ea30a..367d657febe5f 100644
+> --- a/fs/zonefs/super.c
+> +++ b/fs/zonefs/super.c
+> @@ -247,6 +247,20 @@ static void zonefs_inode_update_mode(struct inode *inode)
+>  	z->z_mode = inode->i_mode;
+>  }
+>  
+> +/*
+> + * Make the file system refuse writes after an error. Don't set SB_RDONLY:
+> + * that needs sb->s_umount and a proper remount, and setting it while the file
+> + * system is frozen makes thaw_super() leave the s_writers rwsems locked.
+> + */
+> +void zonefs_set_emergency_ro(struct super_block *sb)
+> +{
+> +	if (sb_rdonly(sb) ||
+> +	    test_and_set_bit(ZONEFS_SB_EMERGENCY_RO, &ZONEFS_SB(sb)->s_state))
+> +		return;
+
+[Severity: Medium]
+Does skipping the ZONEFS_SB_EMERGENCY_RO bit when the filesystem is already
+read-only allow writes to be re-enabled later?
+
+If an I/O error occurs while the filesystem is mounted read-only, this
+condition returns early without setting the emergency bit.
+
+[ ... ]
+
+> @@ -1369,6 +1385,11 @@ static int zonefs_reconfigure(struct fs_context *fc)
+>  	struct super_block *sb = fc->root->d_sb;
+>  	struct zonefs_sb_info *sbi = sb->s_fs_info;
+>  
+> +	/* An error made the file system read-only until it is unmounted. */
+> +	if (sb_rdonly(sb) && !(fc->sb_flags & SB_RDONLY) &&
+> +	    zonefs_emergency_ro(sb))
+> +		return -EROFS;
+
+[Severity: Medium]
+If a read-only filesystem experiences an I/O error and the administrator
+subsequently remounts the filesystem read-write, zonefs_emergency_ro(sb)
+will evaluate to false because the bit was bypassed in
+zonefs_set_emergency_ro().
+
+Could this allow the remount to succeed and re-enable writes on a faulty
+block device, bypassing the intended policy?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012-work-fs-sb_rdonly-v1-0-60743a3dc326@kernel.org?part=17
+

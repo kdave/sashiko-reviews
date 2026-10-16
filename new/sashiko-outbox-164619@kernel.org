@@ -1,0 +1,60 @@
+From sashiko-bot@kernel.org Fri Oct  9 00:00:33 2026
+Message-ID: <sashiko-outbox-164619@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 2/3] btrfs: prevent use-after-free in
+ btrfs_transaction::switch_commits
+Date: Thu, 08 Oct 2026 22:00:30 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: memory leak of qgroup swapped blocks on transaction abort
+--
+
+commit de5f819a8acebdf5a5641292f8160912d9bb47de
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: prevent use-after-free in btrfs_transaction::switch_commits
+
+This patch prevents a use-after-free by manually unlinking roots from
+switch_commits in btrfs_cleanup_one_transaction() if a transaction is
+aborted during commit.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 15339de1c1860..4d2df76754fc4 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -4895,6 +4895,16 @@ void btrfs_cleanup_one_transaction(struct btrfs_transaction *cur_trans)
+>  		list_del_init(&dev->post_commit_list);
+>  	}
+>  
+> +	spin_lock(&fs_info->trans_lock);
+> +	while (!list_empty(&cur_trans->switch_commits)) {
+> +		struct btrfs_root *root;
+> +
+> +		root = list_first_entry(&cur_trans->switch_commits,
+> +					struct btrfs_root, dirty_list);
+> +		list_del_init(&root->dirty_list);
+
+[Severity: Medium]
+Does this code introduce a regression that leaks qgroup swapped blocks
+during a transaction abort?
+
+If a transaction is aborted while qgroups are enabled and block relocation
+is ongoing, this loop unlinks roots from switch_commits but fails to
+perform the btrfs_qgroup_clean_swapped_blocks() teardown that
+switch_commit_roots() normally guarantees for roots on this list.
+
+When the roots are eventually freed by btrfs_put_root(), the memory
+allocated for struct btrfs_qgroup_swapped_block will leak because
+btrfs_put_root() does not clean them up.
+
+Could we invoke btrfs_qgroup_clean_swapped_blocks(root) before unlinking
+the root here?
+
+> +	}
+> +	spin_unlock(&fs_info->trans_lock);
+> +
+>  	btrfs_destroy_delayed_refs(cur_trans);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1791495862.git.wqu@suse.com?part=2
+

@@ -1,0 +1,88 @@
+From sashiko-bot@kernel.org Sat Oct 10 14:21:39 2026
+Message-ID: <sashiko-outbox-166515@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 01/12] btrfs: zoned: don't activate conventional zones
+ of mixed block groups
+Date: Sat, 10 Oct 2026 12:21:37 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: btrfs_zone_activate() consumes active zones for conventional stripes
+--
+
+commit ea9fe437aa5a6dd28ff99b828d2364fe925c8e75
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't activate conventional zones of mixed block groups
+
+This commit modifies btrfs_load_block_group_zone_info() to prevent conventional
+zones in mixed block groups from incorrectly consuming active zone resources.
+It achieves this by letting conventional zones inherit the activeness of the
+first sequential zone at mount time.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 1cda88332284e..710b1d086f55d 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -1950,6 +1950,23 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	if (num_sequential > 0)
+>  		set_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &cache->runtime_flags);
+>  
+> +	if (num_conventional > 0 && num_sequential > 0) {
+> +		int ref;
+> +
+> +		for (ref = 0; ref < map->num_stripes; ref++) {
+> +			if (zone_info[ref].alloc_offset != WP_CONVENTIONAL &&
+> +			    zone_info[ref].alloc_offset != WP_MISSING_DEV)
+> +				break;
+> +		}
+> +
+> +		if (ref < map->num_stripes) {
+> +			for (i = 0; i < map->num_stripes; i++) {
+> +				if (zone_info[i].alloc_offset == WP_CONVENTIONAL)
+> +					assign_bit(i, active, test_bit(ref, active));
+> +			}
+> +		}
+> +	}
+> +
+>  	if (num_conventional > 0) {
+>  		ret = calculate_alloc_pointer(cache, &last_alloc, new);
+>  		if (ret) {
+
+[Severity: Medium]
+While this patch fixes the active zone consumption for conventional stripes at
+mount time, does the runtime activation path in btrfs_zone_activate() still
+suffer from the same issue?
+
+Looking at btrfs_zone_activate(), it unconditionally iterates over all stripes
+and consumes active zone tokens even for conventional zones:
+
+fs/btrfs/zoned.c:btrfs_zone_activate() {
+	...
+	for (i = 0; i < map->num_stripes; i++) {
+		...
+		if (!btrfs_dev_set_active_zone(device, physical)) {
+			/* Cannot activate the zone */
+			ret = false;
+			goto out_unlock;
+		}
+	...
+}
+
+Consequently, does call_zone_finish() also incorrectly restore these fake
+tokens for conventional stripes when the block group is finished?
+
+fs/btrfs/zoned.c:call_zone_finish() {
+	...
+	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
+		zinfo->reserved_active_zones++;
+	btrfs_dev_clear_active_zone(device, physical);
+	...
+}
+
+Could this artificial reduction of the active zone budget (active_zones_left)
+during the lifetime of a mixed block group prematurely starve other sequential
+zones from activating, potentially leading to I/O failures or ENOSPC?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261010120622.3781326-1-johannes.thumshirn@wdc.com?part=1
+

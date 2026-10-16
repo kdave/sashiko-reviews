@@ -1,0 +1,85 @@
+From sashiko-bot@kernel.org Thu Oct 15 17:07:28 2026
+Message-ID: <sashiko-outbox-173037@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 12/19] btrfs: replace
+ btrfs_set_free_space_cache_v1_active() with a cleanup helper
+Date: Thu, 15 Oct 2026 15:07:24 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: unbounded transaction loop during space cache cleanup
+--
+
+commit 4c75fc61a866b0687dab8279c4fadc2d7f5ee802
+Author: Tal Zussman <tz2294@columbia.edu>
+Date:   Thu Oct 15 14:43:25 2026 +0000
+
+    btrfs: replace btrfs_set_free_space_cache_v1_active() with a cleanup helper
+
+This commit replaces btrfs_set_free_space_cache_v1_active() with a cleanup
+helper btrfs_cleanup_free_space_cache_v1(). It folds the block group loop
+directly into the new helper and removes the active argument.
+
+> diff --git a/fs/btrfs/free-space-cache.c b/fs/btrfs/free-space-cache.c
+> index e82216ebd5d09..4dcbefb0bfed6 100644
+> --- a/fs/btrfs/free-space-cache.c
+> +++ b/fs/btrfs/free-space-cache.c
+
+[ ... ]
+
+> @@ -2901,47 +2901,29 @@ bool btrfs_free_space_cache_v1_active(struct btrfs_fs_info *fs_info)
+>  	return btrfs_super_cache_generation(fs_info->super_copy);
+>  }
+>  
+> -static int cleanup_free_space_cache_v1(struct btrfs_fs_info *fs_info,
+> -				       struct btrfs_trans_handle *trans)
+> +int btrfs_cleanup_free_space_cache_v1(struct btrfs_fs_info *fs_info)
+>  {
+> -	struct btrfs_block_group *block_group;
+> +	struct btrfs_trans_handle *trans;
+>  	struct rb_node *node;
+> +	int ret;
+>  
+>  	btrfs_info(fs_info, "cleaning free space cache v1");
+
+[ ... ]
+
+>  	trans = btrfs_start_transaction(fs_info->tree_root, 0);
+>  	if (IS_ERR(trans))
+>  		return PTR_ERR(trans);
+>  
+> -	if (!active) {
+> -		set_bit(BTRFS_FS_CLEANUP_SPACE_CACHE_V1, &fs_info->flags);
+> -		ret = cleanup_free_space_cache_v1(fs_info, trans);
+> +	set_bit(BTRFS_FS_CLEANUP_SPACE_CACHE_V1, &fs_info->flags);
+> +	for (node = rb_first_cached(&fs_info->block_group_cache_tree); node;
+> +	     node = rb_next(node)) {
+> +		struct btrfs_block_group *block_group;
+> +
+> +		block_group = rb_entry(node, struct btrfs_block_group, cache_node);
+> +		ret = btrfs_remove_free_space_inode(trans, NULL, block_group);
+
+[Severity: High]
+Is it possible for this loop to exhaust the metadata block reserve?
+
+Since btrfs_cleanup_free_space_cache_v1() starts a transaction with 0 reserved
+metadata items, this unbounded loop will iterate over every block group and
+modify tree items via btrfs_remove_free_space_inode() without ending or
+restarting the transaction.
+
+Could this accumulate enough modified tree blocks and delayed operations on
+filesystems with a massive number of block groups to cause an ENOSPC
+transaction abort, failing the mount operation?
+
+Should this loop use btrfs_should_end_transaction() to replenish the metadata
+reserves?
+
+>  		if (unlikely(ret)) {
+>  			btrfs_abort_transaction(trans, ret);
+>  			btrfs_end_transaction(trans);
+>  			goto out;
+>  		}
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261015-btrfs-remove-v1-space-cache-v5-0-6b31347d9998@columbia.edu?part=12
+

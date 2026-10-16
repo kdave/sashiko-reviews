@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Mon Oct 12 12:53:29 2026
+Message-ID: <sashiko-outbox-167994@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 18/28] btrfs: check BTRFS_FS_STATE_RO instead of
+ SB_RDONLY at runtime
+Date: Mon, 12 Oct 2026 10:53:24 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] btrfs: deduplication bypasses btrfs_fs_rdonly() check on errored filesystem
+- [Medium] btrfs: missing btrfs_fs_rdonly() check in btrfs_fallocate
+--
+
+commit 724f453e748b24ef023f98daeae702d1edad4559
+Author: Christian Brauner <brauner@kernel.org>
+Subject: btrfs: check BTRFS_FS_STATE_RO instead of SB_RDONLY at runtime
+
+This commit introduces btrfs_fs_rdonly() to test BTRFS_FS_STATE_RO and
+replaces sb_rdonly() with it across various runtime checks. This ensures
+the filesystem catches modifications during an error state independently of
+the VFS, preparing for the removal of the SB_RDONLY flag from the error
+handler.
+
+> diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+> index d2a4101912bdb..96cc207cdb4e9 100644
+> --- a/fs/btrfs/reflink.c
+> +++ b/fs/btrfs/reflink.c
+> @@ -846,7 +846,8 @@ static int btrfs_remap_file_range_prep(struct file *file_in, loff_t pos_in,
+>  	if (!(remap_flags & REMAP_FILE_DEDUP)) {
+>  		struct btrfs_root *root_out = inode_out->root;
+>  
+> -		if (btrfs_root_readonly(root_out))
+> +		if (btrfs_root_readonly(root_out) ||
+> +		    btrfs_fs_rdonly(root_out->fs_info))
+>  			return -EROFS;
+
+[Severity: Medium]
+Should the btrfs_fs_rdonly() check be placed outside the deduplication
+conditional block?
+
+By placing it inside the check for !(remap_flags & REMAP_FILE_DEDUP),
+deduplication operations bypass this early read-only failure on an errored
+filesystem. Because the VFS no longer rejects writes via mnt_want_write_file()
+due to the SB_RDONLY removal later in the series, the FIDEDUPERANGE ioctl
+will proceed to flush pages, wait for IO, and run generic_remap_file_range_prep().
+
+This allows unprivileged users to force significant IO and CPU work on an
+already broken filesystem, performing the expensive data comparison before
+finally returning -EROFS during btrfs_start_transaction().
+
+[ ... ]
+
+> And check it next to every btrfs_root_readonly() check that guards a
+> modification, e.g. in btrfs_permission(), btrfs_setattr(),
+> btrfs_update_time(), the xattr and ACL handlers, btrfs_fileattr_set()
+> and the clone checks in btrfs_remap_file_range_prep().
+
+[Severity: Medium]
+Is there a need for a similar btrfs_fs_rdonly() check in btrfs_fallocate()
+in fs/btrfs/file.c?
+
+Currently, btrfs_fallocate() on an errored filesystem will bypass VFS checks.
+It will proceed to call btrfs_cont_expand() or btrfs_truncate_block() which
+dirty pages in memory, and wait for IO, before eventually failing later when
+btrfs_start_transaction() checks BTRFS_FS_ERROR.
+
+This could leave unflushable dirty pages in memory for a read-only filesystem,
+potentially causing writeback warnings or unmount issues. This creates an
+inconsistency with other modification paths like btrfs_setattr() which
+correctly check for the read-only or error state early.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012-work-fs-sb_rdonly-v1-0-60743a3dc326@kernel.org?part=18
+

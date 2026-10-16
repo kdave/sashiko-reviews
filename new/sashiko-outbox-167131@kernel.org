@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Sun Oct 11 10:42:26 2026
+Message-ID: <sashiko-outbox-167131@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 1/2] btrfs: prevent use-after-free in
+ btrfs_transaction::switch_commits
+Date: Sun, 11 Oct 2026 08:42:23 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: memory leak of swapped_blocks and dirty_log_pages on early transaction abort
+--
+
+commit b3eb71f6f01e2a85694d411a45beda8fa6f8eb4f
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: prevent use-after-free in btrfs_transaction::switch_commits
+
+This commit prevents a use-after-free during transaction aborts by manually
+deleting all entries from the switch_commits list during cleanup. It also
+releases dirty_log_pages and qgroup swapped blocks for roots on that list,
+which are otherwise only cleaned up during a successful switch_commit_roots().
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 15339de1c1860..c45cda4290d5a 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -4895,6 +4895,16 @@ void btrfs_cleanup_one_transaction(struct btrfs_transaction *cur_trans)
+>  		list_del_init(&dev->post_commit_list);
+>  	}
+>  
+> +	while (!list_empty(&cur_trans->switch_commits)) {
+> +		struct btrfs_root *root;
+> +
+> +		root = list_first_entry(&cur_trans->switch_commits,
+> +					struct btrfs_root, dirty_list);
+> +		list_del_init(&root->dirty_list);
+> +		btrfs_extent_io_tree_release(&root->dirty_log_pages);
+> +		btrfs_qgroup_clean_swapped_blocks(root);
+> +	}
+> +
+
+[Severity: Medium]
+Will this leak swapped_blocks and dirty_log_pages on an early transaction
+abort?
+
+The patch attempts to fix a resource leak by adding this cleanup block, but
+strictly limits the cleanup to roots that reached the switch_commits list.
+
+If the transaction aborts earlier in btrfs_commit_transaction(), for example
+during create_pending_snapshots() or btrfs_run_delayed_items(), it will skip
+commit_fs_roots():
+
+fs/btrfs/transaction.c:btrfs_commit_transaction() {
+        ...
+        ret = create_pending_snapshots(trans);
+        if (unlikely(ret))
+                goto unlock_reloc;
+        ...
+        ret = commit_fs_roots(trans);
+        if (unlikely(ret))
+                goto unlock_reloc;
+        ...
+}
+
+In this scenario, the dirtied subvolume roots are never added to the
+switch_commits list.
+
+Because the cleanup loop in btrfs_cleanup_one_transaction() only traverses
+switch_commits, any root not on that list will bypass
+btrfs_extent_io_tree_release() and btrfs_qgroup_clean_swapped_blocks().
+
+When the root is ultimately destroyed in btrfs_put_root(), the final teardown
+does not clean up these resources:
+
+fs/btrfs/disk-io.c:btrfs_put_root() {
+        ...
+                free_root_extent_buffers(root);
+        ...
+                kfree(root);
+}
+
+Does this leave the swapped_blocks and dirty_log_pages allocated forever
+when the abort happens early in the commit path?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1791706855.git.wqu@suse.com?part=1
+

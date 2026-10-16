@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Mon Oct 12 21:17:39 2026
+Message-ID: <sashiko-outbox-168576@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 RESEND 6/6] btrfs: preserve btrfs.compression when
+ setting inode flags
+Date: Mon, 12 Oct 2026 19:17:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] btrfs: uninitialized read of prop_compress_level in btrfs_fileattr_set
+--
+
+commit f8215e377f2eb0cb0e4d8b0938d4172d8f17b114
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: preserve btrfs.compression when setting inode flags
+
+This commit updates fileattr settings to preserve the newly introduced
+compression level specification by using the btrfs_compress_typelevel2str()
+helper. It also moves the maximum property length definition into a shared
+header.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 54960351fbd17..af685205b7e95 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+[ ... ]
+> @@ -393,22 +393,23 @@ int btrfs_fileattr_set(struct mnt_idmap *idmap,
+>  		inode_flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  
+>  		/*
+> -		 * Keep the algorithm recorded in the compression property,
+> -		 * otherwise changing an unrelated attribute would reset it to
+> -		 * the mount default, since FS_IOC_SETFLAGS callers write back
+> -		 * the whole flag set they got from FS_IOC_GETFLAGS and that
+> -		 * includes FS_COMPR_FL for any inode carrying the property.
+> +		 * If compression is already enabled, we must reconstruct the
+> +		 * full "algo:level" property string and write it back.
+> +		 * Otherwise changing an unrelated attribute would reset it to
+> +		 * the mount default and drop the level, since FS_IOC_SETFLAGS
+> +		 * callers write back the whole flag set they got from
+> +		 * FS_IOC_GETFLAGS, and that includes FS_COMPR_FL.
+>  		 *
+>  		 * Inodes with the compress flag set but no property keep using
+>  		 * the mount default, so they behave as before.
+>  		 */
+> -		if (inode->prop_compress)
+> -			comp_type = inode->prop_compress;
+> -		else if (fs_info->compress_type)
+> -			comp_type = fs_info->compress_type;
+> -		else
+> -			comp_type = BTRFS_COMPRESS_ZLIB;
+> -		comp = btrfs_compress_type2str(comp_type);
+> +		comp = btrfs_compress_typelevel2str(inode->prop_compress,
+> +						    inode->prop_compress_level,
+> +						    comp_buf, sizeof(comp_buf));
+
+[Severity: Low]
+Can this result in an uninitialized value read?
+
+If a user calls FS_IOC_SETFLAGS (e.g., via chattr +c) on a file that lacks a
+compression property, this code will unconditionally read
+inode->prop_compress_level and pass it by value.
+
+During inode allocation, this field is left uninitialized:
+
+fs/btrfs/inode.c:btrfs_alloc_inode() {
+    ...
+    ei->runtime_flags = 0;
+    ei->prop_compress = BTRFS_COMPRESS_NONE;
+    ei->defrag_compress = BTRFS_COMPRESS_NONE;
+
+    ei->delayed_node = NULL;
+    ...
+}
+
+Passing uninitialized slab memory by value triggers KMSAN warnings
+(uninit-value). Even though the value is ultimately ignored when
+prop_compress is NONE, could this undefined behavior break sanitizer builds?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012190731.951056-1-koray.fra@gmail.com?part=6
+

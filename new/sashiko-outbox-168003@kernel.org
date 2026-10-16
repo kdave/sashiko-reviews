@@ -1,0 +1,67 @@
+From sashiko-bot@kernel.org Mon Oct 12 13:05:05 2026
+Message-ID: <sashiko-outbox-168003@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 19/28] btrfs: don't set SB_RDONLY after filesystem
+ errors
+Date: Mon, 12 Oct 2026 11:05:01 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: inconsistent SIGBUS in page_mkwrite during emergency RO state
+--
+
+commit 37c3f7ad9f2e4471edb125849f5c833765177985
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: don't set SB_RDONLY after filesystem errors
+
+This commit changes btrfs error handling to stop setting SB_RDONLY without
+holding s_umount. Instead, it relies on BTRFS_FS_STATE_RO and a new
+BTRFS_FS_STATE_EMERGENCY_RO flag to block modifications, keeping the VFS
+layer under the impression that the filesystem is read-write.
+
+> diff --git a/fs/btrfs/messages.c b/fs/btrfs/messages.c
+> index 9aee0e0d7e85f..99cdd5f5a1111 100644
+> --- a/fs/btrfs/messages.c
+> +++ b/fs/btrfs/messages.c
+> @@ -171,8 +172,16 @@ void __btrfs_handle_fs_error(struct btrfs_fs_info *fs_info, const char *function
+>  
+>  	btrfs_discard_stop(fs_info);
+>  
+> -	/* Handle error by forcing the filesystem readonly. */
+> -	btrfs_set_sb_rdonly(sb);
+> +	/*
+> +	 * Handle error by forcing the filesystem readonly. We don't set
+> +	 * SB_RDONLY because that requires sb->s_umount, and changing it under
+> +	 * freeze_super() and thaw_super() leaves the freeze protection
+> +	 * unbalanced. The fs_error recorded above stops new transactions and
+> +	 * BTRFS_FS_STATE_RO makes btrfs refuse modifications, see
+> +	 * btrfs_fs_rdonly().
+> +	 */
+> +	set_bit(BTRFS_FS_STATE_RO, &fs_info->fs_state);
+> +	set_bit(BTRFS_FS_STATE_EMERGENCY_RO, &fs_info->fs_state);
+
+[Severity: Medium]
+The commit message states: "And stores through shared mappings set up before
+the error get SIGBUS because btrfs_update_time() refuses now."
+
+Does removing btrfs_set_sb_rdonly() here lead to inconsistent fault behavior
+for existing memory-mapped files?
+
+Looking at btrfs_page_mkwrite() in fs/btrfs/file.c, it calls:
+
+        ret = file_update_time(vmf->vma->vm_file);
+        if (ret < 0)
+                goto out;
+
+Without SB_RDONLY set on the VFS superblock, mnt_want_write_file() no longer
+fails immediately with -EROFS. If the inode's timestamps are already current
+(for example, if they were modified very recently), file_update_time() returns
+0 and bypasses the filesystem's ->update_time hook entirely.
+
+Could a store silently succeed in dirtying the memory page under these
+conditions (with data later lost during background writeback), instead of
+getting a SIGBUS as described in the commit message?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012-work-fs-sb_rdonly-v1-0-60743a3dc326@kernel.org?part=19
+

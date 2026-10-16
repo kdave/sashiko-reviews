@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Sat Oct 10 11:14:33 2026
+Message-ID: <sashiko-outbox-166388@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] fstests: generic: add a test case to check fsverity
+ reads
+Date: Sat, 10 Oct 2026 09:14:29 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [Medium] tests: fstests patch mistakenly applied to Linux kernel tree
+- [Medium] fstests: undefined functions _fixed_by_fs_commit() and _exit()
+- [Medium] fstests: undefined helper _check_dmesg_for() used
+--
+
+commit 93c19a40048d28497ac14ae408f5ff0c31f36d6f
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: generic: add a test case to check fsverity reads
+
+This commit introduces a new test case for fsverity reads, specifically
+targeting a bug in btrfs where blocks outside the read range were mistakenly
+verified.
+
+> diff --git a/tests/generic/807 b/tests/generic/807
+> new file mode 100755
+> index 0000000000000..24e22e8c349b2
+> --- /dev/null
+> +++ b/tests/generic/807
+> @@ -0,0 +1,56 @@
+> +#! /bin/bash
+
+[Severity: Medium]
+Is this patch intended for the fstests repository instead of the Linux kernel
+tree?
+
+Applying this patch to the kernel tree introduces a script in a non-existent
+tests/ directory, and the required fstests framework isn't present in the
+kernel source.
+
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 807
+> +#
+> +# Verify that reading a large file with holes won't trigger fsverity warnings
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick verity
+> +
+> +_fixed_by_fs_commit btrfs xxxxxxxxxxxx \
+> +	"btrfs: fix the fsverity callback where unexpected range is verified"
+
+[Severity: Medium]
+Does this code call an undefined function?
+
+The correct fstests helper is _fixed_by_kernel_commit. Calling an undefined
+_fixed_by_fs_commit() will emit a 'command not found' error to standard
+error, which causes the test to fail by mismatching the golden output.
+
+[ ... ]
+
+> +# Read the file, unpatched btrfs will verify blocks outside the read range and
+> +# trigger fs-verity warnings.
+> +# But the read itself should still be fine, as the failed part will be retried.
+> +cat "$SCRATCH_MNT/foobar" > /dev/null
+> +
+> +# Check for any kernel warnings from fs-verity on file corruption.
+> +if _check_dmesg_for "FILE CORRUPTED!"; then
+
+[Severity: Medium]
+Is _check_dmesg_for defined anywhere?
+
+If this function is undefined, bash will print a 'command not found' error to
+stderr. This causes the test output to diverge from the expected golden
+output and spuriously fail.
+
+> +	echo "fs-verity detected corruption"
+> +fi
+> +echo "Silence is golden"
+> +
+> +_exit 0
+
+[Severity: Medium]
+Should this be using the standard bash exit builtin instead?
+
+Calling a non-existent _exit command will generate unexpected stderr output
+and fail the test.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261010090422.59743-1-wqu@suse.com?part=1
+

@@ -1,0 +1,74 @@
+From sashiko-bot@kernel.org Mon Oct 12 01:13:55 2026
+Message-ID: <sashiko-outbox-167507@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] fstests: btrfs: test if btrfs control file rejects
+ unknown ioctls
+Date: Sun, 11 Oct 2026 23:13:52 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] fstests: invalid command '_exit' causes unconditional test failure
+- [Low] fstests: missing _supported_fs btrfs declaration
+--
+
+commit 709132921c819c992dfe7577e5464c02e1b96918
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: btrfs: test if btrfs control file rejects unknown ioctls
+
+This commit introduces a new fstests case to verify that the btrfs
+control file (/dev/btrfs-control) correctly rejects unsupported ioctls.
+It uses the btrfs_ioctl program to issue a get_subvol_info ioctl against
+the control file, expecting an -ENOTTY error.
+
+> diff --git a/tests/btrfs/359 b/tests/btrfs/359
+> new file mode 100755
+> index 0000000000000..46457f570e999
+> --- /dev/null
+> +++ b/tests/btrfs/359
+> @@ -0,0 +1,26 @@
+[ ... ]
+> +# Make sure the btrfs control file (/dev/btrfs-control) properly rejects
+> +# an unsupported ioctl.
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick ioctl
+> +
+
+[Severity: Low]
+Is a _supported_fs btrfs declaration missing here?
+
+Without this declaration, the test will improperly execute during test runs
+for other filesystems (e.g., ext4, xfs) and either fail confusingly or
+falsely pass, polluting test suite results. This is triggered when running
+./check -g auto on a non-btrfs filesystem. Because /dev/btrfs-control
+exists as long as the btrfs module is loaded, the test won't skip itself
+naturally on non-btrfs mounts.
+
+> +_fixed_by_kernel_commit xxxxxxxxxxxx \
+> +	"btrfs: return -ENOTTY for unknown ioctls on the control device"
+> +
+> +_require_test_program btrfs_ioctl
+[ ... ]
+> +path="/dev/btrfs-control"
+> +if [ ! -c "$path" ]; then
+> +	_notrun "No btrfs control file at \"$path\""
+> +fi
+> +
+> +# This should fail with -ENOTTY error.
+> +$here/src/btrfs_ioctl get_subvol_info "$path" >> $seqres.full
+> +
+> +_exit 0
+
+[Severity: Medium]
+Does this code use an undefined command _exit 0 instead of the standard
+fstests termination sequence (status=0; exit)?
+
+The test script will fail with a command not found: _exit error at the
+end of execution. This error will be written to stderr, breaking the
+golden output matching. Furthermore, because the standard fstests status=0
+variable assignment is missing, the EXIT trap will evaluate the default
+status=1 and fail the test unconditionally.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261011230716.16860-1-wqu@suse.com?part=1
+

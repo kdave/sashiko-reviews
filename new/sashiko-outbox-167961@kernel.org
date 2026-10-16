@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Mon Oct 12 12:32:53 2026
+Message-ID: <sashiko-outbox-167961@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 02/28] ecryptfs: fall back to a read-only lower file
+Date: Mon, 12 Oct 2026 10:32:47 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] vfs: truncate() returns -EBADF instead of -EROFS when the lower filesystem enforces read-only access
+--
+
+commit 3ef5a823b2848ace16dfa265a339c30dd189a39c
+Author: Christian Brauner <brauner@kernel.org>
+
+ecryptfs: fall back to a read-only lower file
+
+This commit introduces a fallback in eCryptfs when opening a lower file.
+If opening the file with write permissions returns -EROFS, it will try
+again with O_RDONLY. This allows reading files even when the underlying
+filesystem is read-only.
+
+> diff --git a/fs/ecryptfs/kthread.c b/fs/ecryptfs/kthread.c
+> index ae4cb4e2e1348..ba94b304edf3f 100644
+> --- a/fs/ecryptfs/kthread.c
+> +++ b/fs/ecryptfs/kthread.c
+> @@ -30,6 +30,21 @@ static struct ecryptfs_kthread_ctl {
+>  
+>  static struct task_struct *ecryptfs_kthread;
+>  
+> +/*
+> + * A filesystem can refuse writes while its superblock stays read-write, e.g.
+> + * after an error, and a read-only mount refuses them as well. Reading still
+> + * works so fall back to that.
+> + */
+> +static struct file *ecryptfs_open_lower(const struct path *path, int flags,
+> +					const struct cred *cred)
+> +{
+> +	struct file *file = dentry_open(path, flags, cred);
+> +
+> +	if (PTR_ERR_OR_ZERO(file) == -EROFS && (flags & O_ACCMODE) == O_RDWR)
+> +		file = dentry_open(path, (flags & ~O_ACCMODE) | O_RDONLY, cred);
+        ^^^^
+
+[Severity: Medium]
+Will this fallback cause userspace to receive -EBADF instead of -EROFS
+for truncate operations?
+
+If an unprivileged user calls truncate() on an eCryptfs file backed by a
+read-only lower filesystem:
+
+sys_truncate() -> do_truncate() -> notify_change() -> ecryptfs_setattr()
+    -> __ecryptfs_truncate()
+
+__ecryptfs_truncate() calls ecryptfs_get_lower_file(), which will successfully
+obtain an O_RDONLY file descriptor due to this new fallback logic.
+
+__ecryptfs_truncate() then blindly assumes the file is writable and attempts
+write operations:
+
+fs/ecryptfs/inode.c:__ecryptfs_truncate() {
+    ...
+    rc = ecryptfs_write(inode, zero, ia->ia_size - 1, 1);
+    ...
+}
+
+Because the underlying struct file lacks FMODE_WRITE, kernel_write() inside
+ecryptfs_write() will fail with -EBADF. This leaks an invalid -EBADF error
+code to userspace instead of the expected -EROFS or -EACCES.
+
+> +	return file;
+> +}
+> +
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012-work-fs-sb_rdonly-v1-0-60743a3dc326@kernel.org?part=2
+

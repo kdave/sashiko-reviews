@@ -1,0 +1,59 @@
+From sashiko-bot@kernel.org Mon Oct 12 15:41:43 2026
+Message-ID: <sashiko-outbox-168199@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 2/2] btrfs: Allow error injection on
+ btrfs_data_csum_ok
+Date: Mon, 12 Oct 2026 13:41:40 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: ALLOW_ERROR_INJECTION on btrfs_data_csum_ok bypasses corruption reporting
+--
+
+commit a62219946b12e1ffd6741b8471c77e6268b988e3
+Author: Song Chen <chensong_2000@126.com>
+
+btrfs: Allow error injection on btrfs_data_csum_ok
+
+This commit marks btrfs_data_csum_ok with ALLOW_ERROR_INJECTION. This
+allows testing frameworks to simulate checksum mismatches and validate the
+resulting error handling paths without needing actual hardware faults.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 3c10a0ef00023..6dc16b4cee24c 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -3583,6 +3583,7 @@ bool btrfs_data_csum_ok(struct btrfs_bio *bbio, struct btrfs_device *dev,
+>  		memzero_page(phys_to_page(paddrs[i]), offset_in_page(paddrs[i]), step);
+>  	return false;
+>  }
+> +ALLOW_ERROR_INJECTION(btrfs_data_csum_ok, FALSE);
+>  
+>  /*
+>   * Perform a delayed iput on @inode.
+
+[Severity: Medium]
+Will this ALLOW_ERROR_INJECTION bypass the corruption reporting mechanisms?
+
+When fail_function triggers here, it intercepts execution at the entry of
+btrfs_data_csum_ok() and immediately returns false. This completely skips the
+internal zeroit block where the corruption reporting happens:
+
+zeroit:
+	btrfs_print_data_csum_error(inode, file_offset, csum, csum_expected,
+				    bbio->mirror_num);
+	if (dev)
+		btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_CORRUPTION_ERRS);
+	for (int i = 0; i < nr_steps; i++)
+		memzero_page(phys_to_page(paddrs[i]), offset_in_page(paddrs[i]), step);
+	return false;
+
+Since higher-level callers like repair_one_sector() only log read errors
+and do not increment the corruption stat, doesn't this break the commit's
+stated goal of validating the full error detection and reporting path?
+The primary reporting mechanisms (the printk and the stat increment)
+appear to be skipped.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012212910.54623-1-chensong_2000@126.com?part=2
+

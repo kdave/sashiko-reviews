@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Thu Oct  8 08:39:21 2026
+Message-ID: <sashiko-outbox-163702@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/3] btrfs: unlink btrfs_root::dirty_list during
+ btrfs_put_root()
+Date: Thu, 08 Oct 2026 06:39:17 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: deferred dirty_list unlink causes transaction abort if refcount > 0
+--
+
+commit f6676269735583b025324a9f89c61e2b924ad92d
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: unlink btrfs_root::dirty_list during btrfs_put_root()
+
+This commit addresses a use-after-free by moving the removal of a root
+from the dirty_list into btrfs_put_root().
+
+Link: https://lore.kernel.org/linux-btrfs/6ac5a5e1.9ad129c8.3ce5b3.0010.GAE@google.com/
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 4d2df76754fc4..6900dbc5709a5 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -1839,6 +1839,12 @@ void btrfs_put_root(struct btrfs_root *root)
+>  		return;
+>  
+>  	if (refcount_dec_and_test(&root->refs)) {
+> +		struct btrfs_fs_info *fs_info = root->fs_info;
+> +
+> +		spin_lock(&fs_info->trans_lock);
+> +		list_del_init(&root->dirty_list);
+> +		spin_unlock(&fs_info->trans_lock);
+> +
+
+[Severity: High]
+Does this conditional removal allow a deleted root to remain on the dirty list
+if there are concurrent references?
+
+If a concurrent ioctl or subsystem holds a reference to the root when
+btrfs_quota_disable() drops its reference, the refcount will remain > 0
+and the root will not be unlinked from dirty_cowonly_roots.
+
+Later, when commit_cowonly_roots() processes the deleted root, it calls
+update_cowonly_root():
+
+fs/btrfs/transaction.c:commit_cowonly_roots() {
+    ...
+    ret = update_cowonly_root(trans, root);
+    if (ret)
+        return ret;
+    ...
+}
+
+Because the root item was already destroyed by btrfs_del_root(), does this
+cause the update to fail with -EUCLEAN and abort the transaction?
+
+[ ... ]
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index cf8dfd5c692be..38a268b63991d 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -1433,10 +1433,6 @@ int btrfs_quota_disable(struct btrfs_fs_info *fs_info)
+>  		goto out;
+>  	}
+>  
+> -	spin_lock(&fs_info->trans_lock);
+> -	list_del(&quota_root->dirty_list);
+> -	spin_unlock(&fs_info->trans_lock);
+> -
+
+[Severity: High]
+Since this unconditional removal was taken out, the quota_root can now
+remain in dirty_cowonly_roots if btrfs_put_root() does not drop the
+final reference. Will this lead to the transaction abort described above?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1791439852.git.wqu@suse.com?part=3
+

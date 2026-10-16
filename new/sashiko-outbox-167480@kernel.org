@@ -1,0 +1,61 @@
+From sashiko-bot@kernel.org Mon Oct 12 00:31:41 2026
+Message-ID: <sashiko-outbox-167480@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] fstests: generic: add a test case to check fsverity
+ reads
+Date: Sun, 11 Oct 2026 22:31:34 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] fstests: missing status=0 and invalid _exit command
+--
+
+commit 369ac0c4df32c1353ce1abb2b09bb152ef87e1c3
+Author: Qu Wenruo <wqu@suse.com>
+
+fstests: generic: add a test case to check fsverity reads
+
+This commit adds a new regression test to verify that reading a large file
+with holes does not trigger unexpected fsverity file corruption warnings.
+The test creates a 32M file, punches holes to limit read bio sizes, enables
+fsverity, and checks dmesg for corruption warnings after dropping caches.
+
+> diff --git a/tests/generic/807 b/tests/generic/807
+> new file mode 100755
+> index 0000000000000..bdd89a089cf03
+> --- /dev/null
+> +++ b/tests/generic/807
+
+[ ... ]
+
+> +cat "$SCRATCH_MNT/foobar" > /dev/null
+> +
+> +# Check for any kernel warnings from fs-verity on file corruption.
+> +if _check_dmesg_for "FILE CORRUPTED!"; then
+> +	echo "fs-verity detected corruption"
+> +fi
+> +echo "Silence is golden"
+> +
+> +_exit 0
+
+[Severity: Medium]
+In the fstests framework, the _begin_fstest helper initializes the global
+status variable to 1 and establishes an EXIT trap. For a test to signal a
+successful run, it must explicitly set status=0 before terminating.
+
+Since this script fails to set status=0, won't the EXIT trap execute with
+status=1 and cause the framework to unconditionally report a test failure
+even on a successful run?
+
+Furthermore, the script ends with _exit 0, which is not a standard Bash
+built-in or a standard fstests helper. Executing _exit 0 will likely
+produce a command not found error on stderr. Could this mismatch the
+golden .out file and guarantee a test failure? 
+
+The standard idiom to conclude a successful fstest is usually:
+
+status=0
+exit
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261011222613.10793-1-wqu@suse.com?part=1
+

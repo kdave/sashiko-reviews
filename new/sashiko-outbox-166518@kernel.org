@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Sat Oct 10 14:24:58 2026
+Message-ID: <sashiko-outbox-166518@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 05/12] btrfs: zoned: use the regular allocator for
+ conventional metadata block groups
+Date: Sat, 10 Oct 2026 12:24:55 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: premature ENOSPC on fragmented conventional metadata block groups
+--
+
+commit cfd626ea3f8b5b9221241ed9502be70a3d8225f7
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Subject: btrfs: zoned: use the regular allocator for conventional metadata block groups
+
+This commit allows metadata or system block groups backed by conventional zones
+to use the regular free space cache and unclustered allocator. It accomplishes
+this by replacing filesystem-wide zoned checks with append-only block group
+checks.
+
+> diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+> index 9b0a5c6b96f3c..4539a775cdcc8 100644
+> --- a/fs/btrfs/extent-tree.c
+> +++ b/fs/btrfs/extent-tree.c
+[ ... ]
+> @@ -4191,11 +4191,28 @@ static int do_allocation_zoned(struct btrfs_block_group *block_group,
+>  	return ret;
+>  }
+>  
+> +/*
+> + * On a zoned filesystem ffe_ctl->policy is BTRFS_EXTENT_ALLOC_ZONED, but block
+> + * groups that are not append only are allocated from with the regular free
+> + * space cache. As prepare_allocation_zoned() does not set up a cluster, this
+> + * always ends up in find_free_extent_unclustered().
+> + */
+> +static enum btrfs_extent_allocation_policy
+> +bg_alloc_policy(const struct find_free_extent_ctl *ffe_ctl,
+> +		const struct btrfs_block_group *block_group)
+> +{
+> +	if (ffe_ctl->policy == BTRFS_EXTENT_ALLOC_ZONED &&
+> +	    !btrfs_zoned_bg_is_append_only(block_group))
+> +		return BTRFS_EXTENT_ALLOC_CLUSTERED;
+
+[Severity: High]
+Does this bypass the retry fallback for fragmented conventional metadata block
+groups, causing valid metadata allocations to fail prematurely with -ENOSPC?
+
+When metadata allocation is requested, empty_size is passed to reserve
+contiguous space for future COW operations. The per-block-group allocator
+policy for conventional metadata block groups is correctly altered here to
+BTRFS_EXTENT_ALLOC_CLUSTERED, forcing them to use the unclustered allocator.
+
+The unclustered allocator strictly enforces the empty_size requirement.
+If a conventional block group is fragmented, the search fails.
+
+In standard non-zoned BTRFS, find_free_extent_update_loop() gracefully handles
+this by transitioning to LOOP_NO_EMPTY_SIZE, clearing empty_size to 0, and
+retrying the allocation.
+
+However, because the global ffe_ctl->policy remains BTRFS_EXTENT_ALLOC_ZONED,
+find_free_extent_update_loop() sees the original policy:
+
+fs/btrfs/extent-tree.c:find_free_extent_update_loop() {
+    ...
+	if (ffe_ctl->loop == LOOP_NO_EMPTY_SIZE) {
+		if (ffe_ctl->policy != BTRFS_EXTENT_ALLOC_CLUSTERED)
+			return -ENOSPC;
+    ...
+}
+
+This unconditionally aborts the search, skipping the empty_size retry
+fallback that would allow the allocation to succeed with empty_size = 0.
+
+> +
+> +	return ffe_ctl->policy;
+> +}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261010120622.3781326-1-johannes.thumshirn@wdc.com?part=5
+

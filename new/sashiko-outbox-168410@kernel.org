@@ -1,0 +1,66 @@
+From sashiko-bot@kernel.org Mon Oct 12 18:41:39 2026
+Message-ID: <sashiko-outbox-168410@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 15/18] btrfs: remove the free space inode special
+ cases from the COW paths
+Date: Mon, 12 Oct 2026 16:41:34 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: stale extent map left pointing to freed block on transaction error
+--
+
+commit ee6e8f980db2e24540e5c2832464a5395955ca24
+Author: Tal Zussman <tz2294@columbia.edu>
+btrfs: remove the free space inode special cases from the COW paths
+
+This commit removes special cases for free space inodes in cow_file_range(),
+fallback_to_cow(), can_nocow_file_extent() and btrfs_finish_one_ordered(),
+as free space inodes are never written anymore.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+[ ... ]
+> @@ -3382,29 +3372,11 @@ int btrfs_finish_one_ordered(struct btrfs_ordered_extent *ordered_extent)
+>  		if (ret)
+>  			btrfs_mark_ordered_extent_error(ordered_extent);
+>  
+> -		/*
+> -		 * Drop extent maps for the part of the extent we didn't write.
+[ ... ]
+> -		if (!btrfs_is_free_space_inode(inode)) {
+> -			u64 unwritten_start = start;
+> -
+> -			if (truncated)
+> -				unwritten_start += logical_len;
+> -
+> -			btrfs_drop_extent_map_range(inode, unwritten_start,
+> -						    end, false);
+> -		}
+> +		/* Drop extent maps for the part of the extent we didn't write. */
+> +		unwritten_start = start;
+> +		if (truncated)
+> +			unwritten_start += logical_len;
+> +		btrfs_drop_extent_map_range(inode, unwritten_start, end, false);
+
+[Severity: High]
+If a write completes but a subsequent transaction operation fails (e.g.,
+btrfs_join_transaction() returns -ENOMEM), ret is set to an error code after
+truncated is potentially set to true.
+
+In the error cleanup path, if truncated is true, unwritten_start is advanced
+by logical_len, so btrfs_drop_extent_map_range() skips dropping the extent
+map for the range [start, start + logical_len - 1].
+
+However, because ret != 0, the function proceeds below to call
+btrfs_free_reserved_extent(), freeing the physical disk blocks back to the
+free space pool.
+
+Can this leave the extent map in memory pointing to the freed blocks,
+creating a use-after-free of a physical disk block where subsequent reads
+of this file range can read data written by another file that reallocates
+the block?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012-btrfs-remove-v1-space-cache-v4-0-f125bd8c07f9@columbia.edu?part=15
+

@@ -1,0 +1,87 @@
+From sashiko-bot@kernel.org Wed Oct  7 11:29:05 2026
+Message-ID: <sashiko-outbox-162794@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix use-after-free on quota enable allocation
+ failure
+Date: Wed, 07 Oct 2026 09:28:58 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: slab-use-after-free in add_root_to_dirty_list() on transaction abort
+--
+
+commit ad97d07000f00cf65678a65aaa0795fabd618d9c
+Author: Yalagada Pavan Kumar <pavankumaryalagada@gmail.com>
+
+btrfs: fix use-after-free on quota enable allocation failure
+
+The quota root remains on the transaction's dirty root list when
+kzalloc_obj() fails and btrfs_quota_enable() releases it without
+aborting the transaction. Later add_root_to_dirty_list() then accesses
+the freed dirty_list, causing a slab-use-after-free.
+
+Abort the transaction on allocation failure to clean up the dirty
+root before releasing the quota root.
+
+Closes: https://syzkaller.appspot.com/bug?extid=947286c775f432b073a8
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index f68b696b4bf72..42be06675c903 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -1204,6 +1204,7 @@ int btrfs_quota_enable(struct btrfs_fs_info *fs_info,
+>  	prealloc = kzalloc_obj(*prealloc, GFP_NOFS);
+>  	if (!prealloc) {
+>  		ret = -ENOMEM;
+> +		btrfs_abort_transaction(trans, ret);
+>  		goto out_free_path;
+
+[Severity: High]
+Does aborting the transaction here fully resolve the use-after-free, or does it
+leave the root on a global list?
+
+Earlier in btrfs_quota_enable(), quota_root is modified by add_qgroup_item(),
+which triggers a COW and causes add_root_to_dirty_list() to link
+quota_root->dirty_list into the global fs_info->dirty_cowonly_roots list.
+
+When the jump to out_free_path happens:
+
+fs/btrfs/qgroup.c:btrfs_quota_enable() {
+    ...
+out_free_path:
+	btrfs_free_path(path);
+out_free_root:
+	if (ret)
+		btrfs_put_root(quota_root);
+    ...
+}
+
+btrfs_put_root() will drop the refcount and free quota_root, but it does
+not explicitly unlink quota_root->dirty_list from
+fs_info->dirty_cowonly_roots. Since dirty_cowonly_roots is per-fs rather
+than per-transaction, the freed quota_root remains linked.
+
+Any concurrent or future thread that modifies a cowonly root before the
+filesystem is fully stopped will call add_root_to_dirty_list():
+
+fs/btrfs/ctree.c:add_root_to_dirty_list() {
+    ...
+		if (btrfs_root_id(root) == BTRFS_EXTENT_TREE_OBJECTID)
+			list_move_tail(&root->dirty_list,
+				       &fs_info->dirty_cowonly_roots);
+		else
+			list_move(&root->dirty_list,
+				  &fs_info->dirty_cowonly_roots);
+    ...
+}
+
+Will this unconditionally overwrite freed memory, as the head's prev/next
+pointers still point to the freed quota_root? Does this error path need an
+explicit list_del_init(&quota_root->dirty_list) under trans_lock, similar
+to the cleanup in btrfs_quota_disable()?
+
+>  	}
+>  	qgroup = add_qgroup_rb(fs_info, prealloc, BTRFS_FS_TREE_OBJECTID);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261007090656.20609-1-pavankumaryalagada@gmail.com?part=1
+

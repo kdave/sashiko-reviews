@@ -1,0 +1,69 @@
+From sashiko-bot@kernel.org Tue Oct  6 23:47:12 2026
+Message-ID: <sashiko-outbox-162468@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 6.6 1/2] fs,fsverity: reject size changes on fsverity
+ files in setattr_prepare
+Date: Tue, 06 Oct 2026 21:47:00 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] fs: setattr_prepare bypasses fsverity immutability if CONFIG_FS_VERITY=n
+--
+
+commit 124beac2c5f385e936a45c9aaf9bc8b5a46a9785
+Author: Christoph Hellwig <hch@lst.de>
+
+fs,fsverity: reject size changes on fsverity files in setattr_prepare
+    
+Add the check to reject truncates of fsverity files directly to
+setattr_prepare instead of requiring the file system to handle it.
+Besides removing boilerplate code, this also fixes the complete lack of
+such check in btrfs.
+
+Link: https://lore.kernel.org/r/20260128152630.627409-2-hch@lst.de
+
+> diff --git a/fs/attr.c b/fs/attr.c
+> index a8ae5f6d9b167..c2302fc4b3330 100644
+> --- a/fs/attr.c
+> +++ b/fs/attr.c
+> @@ -173,7 +173,17 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
+>  	 * ATTR_FORCE.
+>  	 */
+>  	if (ia_valid & ATTR_SIZE) {
+> -		int error = inode_newsize_ok(inode, attr->ia_size);
+> +		int error;
+> +
+> +		/*
+> +		 * Verity files are immutable, so deny truncates.  This isn't
+> +		 * covered by the open-time check because sys_truncate() takes a
+> +		 * path, not an open file.
+> +		 */
+> +		if (IS_ENABLED(CONFIG_FS_VERITY) && IS_VERITY(inode))
+> +			return -EPERM;
+
+[Severity: High]
+Is it possible that this IS_ENABLED() guard bypasses the immutability check
+when verity is disabled in the kernel?
+
+Ext4 and F2FS previously relied on fsverity_prepare_setattr() which correctly
+returned -EOPNOTSUPP on non-verity kernels. By replacing those checks with
+this code, if the kernel is compiled without CONFIG_FS_VERITY, this check
+evaluates to false and the truncation is allowed to proceed.
+
+Can an unprivileged user with write permissions to a verity file use
+sys_truncate() to destroy its contents and cryptographically sealed metadata
+on a kernel compiled without CONFIG_FS_VERITY support?
+
+While I noticed this issue is addressed later in the series by commit
+0129f7fd3696d1d9b07abe1ecccfcb575dde56d8 ("fs,fsverity: remove check for
+fsverity being enabled in setattr_prepare()"), shouldn't this patch be
+self-contained and not introduce new regressions?
+
+> +
+> +		error = inode_newsize_ok(inode, attr->ia_size);
+>  		if (error)
+>  			return error;
+>  	}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261006213815.47194-1-ebiggers@kernel.org?part=1
+

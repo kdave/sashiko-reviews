@@ -1,0 +1,69 @@
+From sashiko-bot@kernel.org Mon Oct 12 12:35:39 2026
+Message-ID: <sashiko-outbox-167967@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 08/28] exfat: don't set SB_RDONLY after filesystem
+ errors
+Date: Mon, 12 Oct 2026 10:35:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] fs/exfat: exfat_evict_inode bypasses emergency_ro state causing read-only violation
+--
+
+commit 3964e8f2b3e07c51599bfa953e3997f549740387
+Author: Christian Brauner <brauner@kernel.org>
+
+    exfat: don't set SB_RDONLY after filesystem errors
+    
+    With errors=remount-ro, the exfat default, __exfat_fs_error() sets
+    SB_RDONLY without holding sb->s_umount.
+    
+    freeze_super() and thaw_super() both look at sb_rdonly() to figure out
+    whether the s_writers rwsems need to be taken or released.
+    
+    [ ... ]
+
+> diff --git a/fs/exfat/inode.c b/fs/exfat/inode.c
+> index ccd13630187e1..9fcd1a1255b06 100644
+> --- a/fs/exfat/inode.c
+> +++ b/fs/exfat/inode.c
+> @@ -113,8 +113,9 @@ int exfat_write_inode(struct inode *inode, struct writeback_control *wbc)
+>  {
+>  	int ret;
+>  
+> -	if (unlikely(exfat_forced_shutdown(inode->i_sb)))
+> -		return -EIO;
+> +	ret = exfat_emergency_state(inode->i_sb);
+> +	if (unlikely(ret))
+> +		return ret;
+>  
+>  	mutex_lock(&EXFAT_SB(inode->i_sb)->s_lock);
+>  	ret = __exfat_write_inode(inode, wbc->sync_mode == WB_SYNC_ALL);
+
+[Severity: High]
+While many VFS entry points were updated to check for the emergency read-only
+state, it appears exfat_evict_inode() might have been missed.
+
+If an unlinked file (i_nlink == 0) is held open, its clusters are not freed
+until the final file descriptor is closed. 
+
+If the filesystem enters the emergency RO state before this final close,
+exfat_evict_inode() unconditionally invokes __exfat_truncate():
+
+fs/exfat/inode.c:exfat_evict_inode() {
+	if (!inode->i_nlink) {
+		i_size_write(inode, 0);
+		mutex_lock(&EXFAT_SB(inode->i_sb)->s_lock);
+		__exfat_truncate(inode);
+		mutex_unlock(&EXFAT_SB(inode->i_sb)->s_lock);
+	}
+}
+
+Could this bypass the intended read-only protection and mutate the corrupted
+filesystem on disk by modifying the FAT chain and allocation bitmap?
+
+Since this also submits synchronous I/O to the block device, does this need
+an exfat_emergency_state() check before truncating the inode?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012-work-fs-sb_rdonly-v1-0-60743a3dc326@kernel.org?part=8
+

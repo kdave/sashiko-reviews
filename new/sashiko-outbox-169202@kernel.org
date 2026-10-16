@@ -1,0 +1,110 @@
+From sashiko-bot@kernel.org Tue Oct 13 09:43:48 2026
+Message-ID: <sashiko-outbox-169202@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 01/12] btrfs: zoned: fix possible race for
+ reserved_active_zones
+Date: Tue, 13 Oct 2026 07:43:44 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] btrfs: permanent active zone leak on zone finish failure
+- [Medium] btrfs: torn state between reserved_active_zones and active_zones_left causes spurious ENOSPC
+--
+
+commit 8eb8f90f2dc16393b235c76bad15964868af323e
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: fix possible race for reserved_active_zones
+
+The commit adds spinlock protection around the increment of
+zinfo->reserved_active_zones in call_zone_finish() to prevent a race
+condition when updating the counter.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 1cda88332284e..fcb80afa700d5 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2528,8 +2528,13 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+>  			return ret;
+>  	}
+
+[Severity: High]
+Does this early error return leak the active zone counters?
+
+If blkdev_zone_mgmt() fails and returns an error, we return early, skipping
+the restoration of zinfo->reserved_active_zones and the clearing of the
+active zone bit.
+
+In do_zone_finish(), the block group's BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE flag
+is cleared before the IO:
+
+fs/btrfs/zoned.c:do_zone_finish() {
+	clear_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &block_group->runtime_flags);
+	...
+		ret = call_zone_finish(block_group, &map->stripes[i]);
+		if (ret)
+			break;
+	...
+	spin_lock(&fs_info->zone_active_bgs_lock);
+	ASSERT(!list_empty(&block_group->active_bg_list));
+	list_del_init(&block_group->active_bg_list);
+}
+
+If call_zone_finish() fails, the block group is unconditionally removed from
+the active_bg_list. Callers like btrfs_delete_unused_bgs() do not abort the
+filesystem on failure, but instead place the block group on a retry list:
+
+fs/btrfs/block-group.c:btrfs_delete_unused_bgs() {
+		ret = btrfs_zone_finish(block_group);
+		if (ret < 0) {
+			btrfs_dec_block_group_ro(block_group);
+			if (ret == -EAGAIN) {
+				btrfs_link_bg_list(block_group, &retry_list);
+				ret = 0;
+			}
+			goto next;
+		}
+}
+
+Since the active flag was already cleared and the block group removed from
+the active list, wouldn't subsequent retries immediately return 0 without
+doing anything?
+
+It appears this would permanently leak the active zone hardware limit
+counters and eventually exhaust the device's open/active zone limits.
+
+>  
+> -	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
+> +	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA)) {
+> +		struct btrfs_fs_info *fs_info = block_group->fs_info;
+> +
+> +		spin_lock(&fs_info->zone_active_bgs_lock);
+>  		zinfo->reserved_active_zones++;
+> +		spin_unlock(&fs_info->zone_active_bgs_lock);
+> +	}
+>  	btrfs_dev_clear_active_zone(device, physical);
+
+[Severity: Medium]
+Could this create a torn state between reserved_active_zones and
+active_zones_left?
+
+This code increments zinfo->reserved_active_zones under the
+zone_active_bgs_lock and then releases the lock. It subsequently calls
+btrfs_dev_clear_active_zone(), which atomically increments
+active_zones_left.
+
+Could a concurrent btrfs_zone_activate() or btrfs_can_activate_zone() for a
+data block group check atomic_read(&zinfo->active_zones_left) <= reserved
+during this window?
+
+If so, it might observe this torn state as spuriously true and cause the
+activation to fail. If btrfs_zone_finish_one_bg() finds no other block
+group to finish, this conservative failure could propagate to
+find_free_extent() as -ENOSPC, causing a spurious premature ENOSPC for
+allocations.
+
+>  
+>  	return 0;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261013072941.424029-1-johannes.thumshirn@wdc.com?part=1
+

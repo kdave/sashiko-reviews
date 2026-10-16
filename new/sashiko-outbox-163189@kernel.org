@@ -1,0 +1,101 @@
+From sashiko-bot@kernel.org Wed Oct  7 18:19:34 2026
+Message-ID: <sashiko-outbox-163189@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: unwind device add when sysfs registration
+ fails
+Date: Wed, 07 Oct 2026 16:19:31 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] btrfs: use-after-free of device due to missing kobj wait_for_completion
+- [High] btrfs: RCU UAF of btrfs_device on btrfs_init_new_device() error path
+--
+
+commit cd3be96bac0d67297d56d66ef5b91618235db734
+Author: Adarsh Das <adarshdas950@gmail.com>
+
+btrfs: unwind device add when sysfs registration fails
+
+This commit modifies btrfs_init_new_device() to check the return value
+of btrfs_sysfs_add_device(). If it fails, it unwinds the device addition
+instead of ignoring the error and proceeding.
+
+Link: https://lore.kernel.org/all/6a791c94.01d0871a.3a0d52.0099.GAE@google.com
+
+> diff --git a/fs/btrfs/sysfs.c b/fs/btrfs/sysfs.c
+> index 3ac1fa608d3b5..f508a2329181d 100644
+> --- a/fs/btrfs/sysfs.c
+> +++ b/fs/btrfs/sysfs.c
+> @@ -2049,6 +2049,9 @@ int btrfs_sysfs_add_device(struct btrfs_device *device)
+>  	ret = kobject_init_and_add(&device->devid_kobj, &devid_ktype,
+>  				   devinfo_kobj, "%llu", device->devid);
+>  	if (ret) {
+> +		if (device->bdev)
+> +			sysfs_remove_link(devices_kobj,
+> +					  bdev_kobj(device->bdev)->name);
+>  		kobject_put(&device->devid_kobj);
+
+[Severity: High]
+Does this error path need to wait for the kobject release to complete?
+
+If kobject_init_and_add() fails after initializing the kobject,
+kobject_put() will trigger the release callback. Since the btrfs_device
+struct containing this kobject is freed shortly after in the error path,
+could this cause a use-after-free if the delayed release callback
+executes after the device is freed?
+
+For example, btrfs_sysfs_remove_device() handles this by calling:
+    wait_for_completion(&device->kobj_unregister);
+
+>  		btrfs_warn(device->fs_info,
+>  			   "devinfo init for devid %llu failed: %d",
+
+[ ... ]
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index d3e6a9b429dd9..f1305f68b1f8a 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -3097,7 +3097,11 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  	mutex_unlock(&fs_info->chunk_mutex);
+>  
+>  	/* Add sysfs device entry */
+> -	btrfs_sysfs_add_device(device);
+> +	ret = btrfs_sysfs_add_device(device);
+> +	if (ret) {
+> +		mutex_unlock(&fs_devices->device_list_mutex);
+> +		goto error_unwind_device;
+> +	}
+
+[Severity: High]
+Can this error path cause a use-after-free for concurrent RCU readers?
+
+Earlier in btrfs_init_new_device(), the device is added to the
+RCU-protected list:
+    list_add_rcu(&device->dev_list, &fs_devices->devices);
+
+When btrfs_sysfs_add_device() fails, the goto error_unwind_device path
+removes the device:
+    list_del_rcu(&device->dev_list);
+
+Then it falls through to error_free_device and frees it synchronously:
+    btrfs_free_device(device); -> kfree(device);
+
+Since the memory is freed without waiting for an RCU grace period (no
+synchronize_rcu() or kfree_rcu() used), could concurrent RCU readers
+traversing fs_devices->devices dereference the freed device?
+
+>  
+>  	mutex_unlock(&fs_devices->device_list_mutex);
+>  
+> @@ -3178,6 +3182,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  
+>  error_sysfs:
+>  	btrfs_sysfs_remove_device(device);
+> +error_unwind_device:
+>  	mutex_lock(&fs_info->fs_devices->device_list_mutex);
+>  	if (seeding_dev)
+>  		btrfs_assign_next_active_device(device, seed_devices->latest_dev);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261007160349.22411-1-adarshdas950@gmail.com?part=1
+

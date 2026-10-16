@@ -1,0 +1,59 @@
+From sashiko-bot@kernel.org Tue Oct 13 09:45:39 2026
+Message-ID: <sashiko-outbox-169207@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 09/12] btrfs: zoned: use plain mutex lock in
+ check_bg_is_active
+Date: Tue, 13 Oct 2026 07:45:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: UAF in check_bg_is_active() due to missing reference on active_bg
+--
+
+commit 2213d465388b057dee7a920c40e80f3f00fe631c
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: use plain mutex lock in check_bg_is_active
+
+check_bg_is_active() is only called for zoned filesystems, so there is
+no need in using the wrapper for taking fs_info::zoned_meta_io_lock.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index e3917ee251d2e..b46d18b2769b8 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> @@ -2266,10 +2266,10 @@ static bool check_bg_is_active(struct btrfs_eb_write_context *ctx,
+>  			}
+>  
+>  			/* Pivot active metadata/system block group. */
+> -			btrfs_zoned_meta_io_unlock(fs_info);
+> +			mutex_unlock(&fs_info->zoned_meta_io_lock);
+>  			wait_eb_writebacks(tgt);
+>  			do_zone_finish(tgt, true);
+
+[Severity: High]
+Does dropping the lock without holding a local reference to tgt expose it
+to a concurrent use-after-free?
+
+If two threads concurrently process extent buffers for a new metadata block
+group, could they both evaluate *active_bg != block_group, read the same
+tgt pointer, and drop the lock?
+
+If Thread 1 finishes its writebacks first, reacquires the lock, observes
+*active_bg == tgt, clears *active_bg, and calls btrfs_put_block_group(),
+the block group could be freed if it has no other references (e.g. if
+concurrently removed from the cache tree via btrfs_delete_unused_bgs()).
+
+When Thread 2 resumes, wouldn't it blindly dereference the freed tgt inside
+wait_eb_writebacks() and do_zone_finish()? Should the code take a local
+reference via btrfs_get_block_group() before dropping the lock?
+
+> -			btrfs_zoned_meta_io_lock(fs_info);
+> +			mutex_lock(&fs_info->zoned_meta_io_lock);
+>  			if (*active_bg == tgt) {
+>  				btrfs_put_block_group(tgt);
+>  				*active_bg = NULL;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261013072941.424029-1-johannes.thumshirn@wdc.com?part=9
+

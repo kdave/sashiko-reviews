@@ -1,0 +1,80 @@
+From sashiko-bot@kernel.org Mon Oct 12 12:45:04 2026
+Message-ID: <sashiko-outbox-167982@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC 15/28] ocfs2: keep options that can't change on
+ remount
+Date: Mon, 12 Oct 2026 10:45:01 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] ocfs2: TOCTOU lost-update on mount options during concurrent remounts
+--
+
+commit 113bf3bcf65b6ea75a7b673818520d321b5bd39c
+Author: Christian Brauner <brauner@kernel.org>
+
+ocfs2: keep options that can't change on remount
+
+This commit fixes ocfs2 remount to inherit current mount options so that
+unspecified options are not dropped or reset. It copies the current
+options into the fs_context during reconfigure initialization.
+
+> diff --git a/fs/ocfs2/super.c b/fs/ocfs2/super.c
+> index c62e389d4dd65..26041371a6667 100644
+> --- a/fs/ocfs2/super.c
+> +++ b/fs/ocfs2/super.c
+> @@ -1213,6 +1213,20 @@ static int ocfs2_init_fs_context(struct fs_context *fc)
+>  	mopt->resv_level = OCFS2_DEFAULT_RESV_LEVEL;
+>  	mopt->dir_resv_level = -1;
+>  
+> +	/*
+> +	 * Start out with the current options so that a remount only changes
+> +	 * what it specifies. Emergency remount (sysrq u) passes no options at
+> +	 * all, and the heartbeat and data mode can't change.
+> +	 */
+> +	if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE) {
+> +		struct ocfs2_super *osb = OCFS2_SB(fc->root->d_sb);
+> +
+> +		mopt->mount_opt = osb->s_mount_opt;
+> +		mopt->atime_quantum = osb->s_atime_quantum;
+> +		mopt->slot = osb->preferred_slot;
+
+[Severity: Medium]
+Can this lead to a TOCTOU lost-update on the mount options when multiple
+remounts occur concurrently?
+
+If two threads execute sys_mount() with MS_REMOUNT simultaneously, both can
+invoke do_remount() and locklessly read the active osb->s_mount_opt into
+mopt->mount_opt in ocfs2_init_fs_context() before either acquires the
+s_umount lock.
+
+Both threads will parse their distinct mount options into their separate
+mopt instances. They then sequentially acquire s_umount and apply their
+changes in ocfs2_reconfigure():
+
+fs/ocfs2/super.c:ocfs2_reconfigure() {
+    ...
+	if (!ret) {
+		/* Only save off the new mount options in case of a successful
+		 * remount. */
+		osb->s_mount_opt = parsed_options->mount_opt;
+		osb->s_atime_quantum = parsed_options->atime_quantum;
+		osb->preferred_slot = parsed_options->slot;
+    ...
+}
+
+Will the second thread unconditionally overwrite osb->s_mount_opt with its
+parsed state and completely erase the first thread's updates?
+
+Could this be avoided by using a mask to apply only explicitly specified
+delta changes under s_umount instead of snapshotting and rewriting the
+entire state?
+
+> +		mopt->user_stack = ocfs2_userspace_stack(osb);
+> +	}
+> +
+>  	fc->fs_private = mopt;
+>  	fc->ops = &ocfs2_context_ops;
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261012-work-fs-sb_rdonly-v1-0-60743a3dc326@kernel.org?part=15
+
