@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Mon Oct 19 08:48:42 2026
+Message-ID: <sashiko-outbox-176702@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 9/9] btrfs: introduce extra limits on
+ btrfs_chunk::stripe_len
+Date: Mon, 19 Oct 2026 06:48:39 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] btrfs: missing stripe_len argument in btrfs_stripe_nr_to_offset() calls
+--
+
+commit fa1599553fc4c7568781b8bd2f580c16c6c93b75
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: introduce extra limits on btrfs_chunk::stripe_len
+
+This commit adds validation checks in btrfs_check_chunk_valid() to ensure
+that btrfs_chunk::stripe_len is at least sectorsize and at most
+BTRFS_STRIPE_LEN, preparing for future variable stripe length support.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index 9cd79d97b9b5e..b4a8a12276bda 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+> @@ -1044,7 +1044,18 @@ int btrfs_check_chunk_valid(const struct btrfs_fs_info *fs_info,
+>  			  logical, length);
+>  		return -EUCLEAN;
+>  	}
+> -	if (unlikely(!is_power_of_2(stripe_len) || stripe_len != BTRFS_STRIPE_LEN)) {
+> +
+> +	/*
+> +	 * For now the "stripe_len != BTRFS_STRIPE_LEN" will cover all cases,
+> +	 * but the power_of_2 and stripe_len >= sectorsize and
+> +	 * stripe_len <= BTRFS_STRIPE_LEN are the requirements for future
+> +	 * stripe_len support.
+> +	 *
+> +	 * In the future, "stripe_len != BTRFS_STRIPE_LEN" will be removed.
+> +	 */
+> +	if (unlikely(stripe_len != BTRFS_STRIPE_LEN ||
+> +		     !is_power_of_2(stripe_len) || stripe_len < sectorsize ||
+> +		     stripe_len > BTRFS_STRIPE_LEN)) {
+>  		chunk_err(fs_info, leaf, chunk, logical,
+>  			  "invalid chunk stripe length: %llu",
+>  			  stripe_len);
+
+[Severity: Low]
+Earlier in the series, the commit "btrfs: add a new 'stripe_len' parameter to
+btrfs_stripe_nr_to_offset()" updated the helper in fs/btrfs/volumes.h to
+require two parameters and assert these stripe_len bounds:
+
+static inline u64 btrfs_stripe_nr_to_offset(u32 stripe_nr, u32 stripe_len)
+{
+	ASSERT(is_power_of_2(stripe_len) && stripe_len <= BTRFS_STRIPE_LEN);
+	return (u64)stripe_nr << ilog2(stripe_len);
+}
+
+Immediately following this stripe_len validation in btrfs_check_chunk_valid()
+in fs/btrfs/tree-checker.c, the two calls to btrfs_stripe_nr_to_offset()
+still pass only U32_MAX:
+
+	if (unlikely(length >= btrfs_stripe_nr_to_offset(U32_MAX))) {
+		chunk_err(fs_info, leaf, chunk, logical,
+			  "chunk length too large: have %llu limit %llu",
+			  length, btrfs_stripe_nr_to_offset(U32_MAX));
+		return -EUCLEAN;
+	}
+
+Should these two calls pass stripe_len as the second argument so that
+fs/btrfs/tree-checker.c compiles when CONFIG_BTRFS_FS is enabled?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1792391732.git.wqu@suse.com?part=9
+

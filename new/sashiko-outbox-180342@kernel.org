@@ -1,0 +1,118 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:24:27 2026
+Message-ID: <sashiko-outbox-180342@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 15/25] btrfs: zoned: don't recheck the reclaim
+ threshold of full zoned block-groups
+Date: Wed, 21 Oct 2026 14:00:05 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: btrfs_reclaim_block_group() reclaims zones filled after queueing
+--
+
+commit 5fe7fffd201b567222f703f58ae1dfb843dfa13c
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't recheck the reclaim threshold of full zoned block-groups
+
+This commit skips the should_reclaim_block_group() threshold check in
+btrfs_reclaim_block_group() when a zoned append-only block group is full,
+on the basis that its usage can only decrease once full.
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index e38c728a503b0..396783c49a88f 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -2004,8 +2004,13 @@ static int btrfs_reclaim_block_group(struct btrfs_block_group *bg, int *reclaime
+>  	 * being freed, pass in a fake giant value to skip that extra
+>  	 * check, which is more meaningful when adding to the list in
+>  	 * the first place.
+> +	 *
+> +	 * On zoned, the usage of a full append only block group can only go
+> +	 * down, so it still qualifies.
+>  	 */
+> -	if (!should_reclaim_block_group(bg, bg->length)) {
+> +	if (!(btrfs_zoned_bg_is_append_only(bg) &&
+> +	      btrfs_zoned_bg_is_full(bg)) &&
+> +	    !should_reclaim_block_group(bg, bg->length)) {
+
+[Severity: Medium]
+Can this cause btrfs_reclaim_block_group() in fs/btrfs/block-group.c to
+relocate nearly or completely full append-only block groups that were not
+full when they were queued onto fs_info->reclaim_bgs?
+
+A non-full append-only block group can be added to fs_info->reclaim_bgs
+through several paths while it still has unallocated space in the zone:
+
+1. In fs/btrfs/block-group.c:btrfs_update_block_group(), freeing an extent
+from an active non-full block group whose alloc_offset is around the
+reclaim threshold (75% by default on zoned filesystems) can drop
+cache->used from above to below the threshold, queueing the block group
+while roughly 25% of the zone remains unallocated:
+
+fs/btrfs/block-group.c:btrfs_update_block_group() {
+	...
+		if (READ_ONCE(space_info->periodic_reclaim))
+			btrfs_space_info_update_reclaimable(space_info, num_bytes);
+		else
+			reclaim = should_reclaim_block_group(cache, num_bytes);
+	...
+	} else if (!alloc && reclaim) {
+		btrfs_mark_bg_to_reclaim(cache);
+	}
+}
+
+2. When periodic_reclaim is enabled,
+btrfs_reclaim_bgs()->btrfs_reclaim_sweep()->do_reclaim_sweep() in
+fs/btrfs/space-info.c queues any partially written append-only block group
+with bg->used < thresh and bg->reclaim_mark set, even if it has zero
+zone_unusable bytes:
+
+fs/btrfs/space-info.c:do_reclaim_sweep() {
+	...
+		thresh = mult_perc(bg->length, thresh_pct);
+		if (bg->used < thresh && bg->reclaim_mark) {
+			will_reclaim = true;
+			reclaim = true;
+		}
+		bg->reclaim_mark = true;
+		spin_unlock(&bg->lock);
+		if (reclaim)
+			btrfs_mark_bg_to_reclaim(bg);
+}
+
+3. In fs/btrfs/block-group.c:btrfs_delete_unused_bgs(), a non-full block
+group on unused_bgs that receives new allocations and satisfies
+block_group->zone_unusable >= div_u64(block_group->length, 2) is also
+queued via btrfs_mark_bg_to_reclaim().
+
+Being on fs_info->reclaim_bgs does not mark bg read-only or prevent
+do_allocation_zoned() from allocating out of it while
+bg->alloc_offset < bg->zone_capacity. While the block group sits on
+fs_info->reclaim_bgs (for example, while btrfs_zoned_should_reclaim() is
+false or before the reclaim worker processes the list), subsequent
+allocations can fill the rest of the zone until
+bg->alloc_offset == bg->zone_capacity, pushing bg->used up to or near 100%
+of zone_capacity.
+
+Because btrfs_zoned_bg_is_full(bg) is checked here in
+btrfs_reclaim_block_group() at reclaim time rather than when the block
+group was queued, btrfs_zoned_bg_is_append_only(bg) &&
+btrfs_zoned_bg_is_full(bg) will be true and
+should_reclaim_block_group(bg, bg->length) will be bypassed.
+
+Although a later patch in the series introduces btrfs_zoned_reclaim_sweep()
+for synchronous zone reclaim in flush_space(), btrfs_update_block_group(),
+btrfs_reclaim_bgs()->btrfs_reclaim_sweep()->do_reclaim_sweep(), and
+btrfs_delete_unused_bgs() still queue non-full block groups onto
+fs_info->reclaim_bgs. Wouldn't skipping should_reclaim_block_group() here
+relocate full block groups whose usage increased after queueing, wasting
+I/O and zone resets and consuming the synchronous reclaim batch budget
+without freeing usable space?
+
+>  		spin_unlock(&bg->lock);
+>  		spin_unlock(&space_info->lock);
+>  		up_write(&space_info->groups_sem);
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=15
+

@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:19:09 2026
+Message-ID: <sashiko-outbox-180336@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 01/25] btrfs: zoned: fix possible race for
+ reserved_active_zones
+Date: Wed, 21 Oct 2026 13:55:57 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: incomplete lock scope in call_zone_finish() zone reservation
+--
+
+commit 97af42c4b0f233222e039606695d5544ee24fcf8
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: fix possible race for reserved_active_zones
+
+This commit acquires fs_info->zone_active_bgs_lock in call_zone_finish()
+when incrementing zinfo->reserved_active_zones after finishing a metadata
+or system block group zone.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index c0bd5e0868867..8e2de2640457f 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2547,8 +2547,13 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+>  	}
+>  
+>  	cleared = btrfs_dev_clear_active_zone(device, physical);
+> -	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA) && cleared)
+> +	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA) && cleared) {
+> +		struct btrfs_fs_info *fs_info = block_group->fs_info;
+> +
+> +		spin_lock(&fs_info->zone_active_bgs_lock);
+>  		zinfo->reserved_active_zones++;
+> +		spin_unlock(&fs_info->zone_active_bgs_lock);
+> +	}
+>  
+>  	return 0;
+>  }
+
+[Severity: Medium]
+Should fs_info->zone_active_bgs_lock also cover the call to
+btrfs_dev_clear_active_zone() in call_zone_finish()?
+
+In fs/btrfs/zoned.c, btrfs_dev_clear_active_zone() increments
+zone_info->active_zones_left as soon as the active zone bit is cleared:
+
+	if (test_and_clear_bit(zno, zone_info->active_zones)) {
+		atomic_inc(&zone_info->active_zones_left);
+		return true;
+	}
+
+Meanwhile, btrfs_zone_activate() (and btrfs_can_activate_zone()) checks
+whether a data block group can take an active zone while holding
+fs_info->zone_active_bgs_lock:
+
+		if (is_data)
+			reserved = zinfo->reserved_active_zones;
+		/*
+		 * For the data block group, leave active zones for one
+		 * metadata block group and one system block group.
+		 */
+		if (atomic_read(&zinfo->active_zones_left) <= reserved) {
+			ret = false;
+			goto out_unlock;
+		}
+
+		if (!btrfs_dev_set_active_zone(device, physical, &new)) {
+			/* Cannot activate the zone */
+			ret = false;
+			goto out_unlock;
+		}
+		if (!is_data && new)
+			zinfo->reserved_active_zones--;
+
+When all unreserved active zones are in use (active_zones_left equals
+reserved_active_zones) and do_zone_finish() -> call_zone_finish() finishes a
+metadata or system block group zone, btrfs_dev_clear_active_zone() increments
+active_zones_left before fs_info->zone_active_bgs_lock is acquired.
+
+If a concurrent btrfs_zone_activate() for a data block group runs in that
+window, it can observe active_zones_left > reserved_active_zones and consume
+the newly freed active zone before call_zone_finish() increments
+reserved_active_zones. That leaves active_zones_left smaller than
+reserved_active_zones and allows data block groups to steal an active zone
+slot reserved for metadata or system block groups.
+
+Would taking fs_info->zone_active_bgs_lock before calling
+btrfs_dev_clear_active_zone() close this window?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=1
+

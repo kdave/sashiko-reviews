@@ -1,0 +1,204 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:27:56 2026
+Message-ID: <sashiko-outbox-180371@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 25/25] btrfs: zoned: provide zoned specific reclaim
+ sweep
+Date: Wed, 21 Oct 2026 14:27:51 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] btrfs: zoned: btrfs_zoned_reclaim_sweep() counts non-relocatable bgs as garbage
+- [Medium] btrfs: zoned: use zone_capacity for reclaim threshold in zoned_sweep_space_info()
+--
+
+commit f5359e1bce9842caf15a35e37c7ddc1e02c6bfe4
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: provide zoned specific reclaim sweep
+
+This commit introduces btrfs_zoned_reclaim_sweep() and calls it from the
+RECLAIM_ZONES flush state in flush_space() so that full data and data
+relocation block groups with reclaimable zone_unusable space are queued
+for garbage collection.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 205f7ed207ebf..191815c62dfd3 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -3652,6 +3653,130 @@ void btrfs_show_zoned_stats(struct btrfs_fs_info *fs_info, struct seq_file *seq)
+>  	spin_unlock(&fs_info->zone_active_bgs_lock);
+>  }
+>  
+> +static u64 zoned_bg_garbage(const struct btrfs_block_group *bg)
+> +{
+> +	const u64 slack = bg->length - bg->zone_capacity;
+> +
+> +	if (bg->zone_unusable <= slack)
+> +		return 0;
+> +
+> +	return bg->zone_unusable - slack;
+> +}
+> +
+> +static bool zoned_bg_reclaimable(const struct btrfs_block_group *bg)
+> +{
+> +	if (bg->ro)
+> +		return false;
+> +
+> +	if (!btrfs_zoned_bg_is_full(bg))
+> +		return false;
+> +
+> +	if (test_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC, &bg->runtime_flags))
+> +		return false;
+> +
+> +	return zoned_bg_garbage(bg) > 0;
+> +}
+
+[Severity: Medium]
+Should zoned_bg_reclaimable() also check that bg->used > 0 and that
+bg->reserved and bg->pinned are zero?
+
+During flush_space() -> btrfs_zoned_reclaim_sweep(),
+zoned_sweep_space_info() treats any full block group where
+zoned_bg_reclaimable() returns true as a relocation candidate and credits
+its bg_garbage toward the two-zone garbage target in
+btrfs_zoned_reclaim_sweep().
+
+However, when btrfs_reclaim_block_groups() subsequently calls
+btrfs_reclaim_block_group() in fs/btrfs/block-group.c, it skips block
+groups with active reservations, pinned bytes, or zero used bytes without
+relocating them:
+
+fs/btrfs/block-group.c:btrfs_reclaim_block_group() {
+    ...
+	if (bg->reserved || bg->pinned || bg->ro) {
+		spin_unlock(&bg->lock);
+		spin_unlock(&space_info->lock);
+		up_write(&space_info->groups_sem);
+		return 0;
+	}
+
+	if (bg->used == 0) {
+		if (!btrfs_test_opt(fs_info, DISCARD_ASYNC))
+			btrfs_mark_bg_unused(bg);
+		spin_unlock(&bg->lock);
+		spin_unlock(&space_info->lock);
+		up_write(&space_info->groups_sem);
+		return 0;
+	}
+    ...
+}
+
+For a full block group where all extents have been freed (bg->used == 0
+and zoned_bg_garbage(bg) == bg->zone_capacity), or one with bg->pinned > 0
+or bg->reserved > 0, zoned_bg_reclaimable() still returns true. In
+addition, if an empty block group is already linked on
+fs_info->unused_bgs, calling btrfs_mark_bg_to_reclaim() in
+zoned_sweep_space_info() is a no-op, yet garbage is still incremented by
+bg_garbage.
+
+Can counting these non-relocatable block groups toward the two-zone target
+prevent btrfs_zoned_reclaim_sweep() from queuing actual relocatable
+candidates from cands[], causing RECLAIM_ZONES to reclaim nothing and fail
+waiting data tickets with -ENOSPC?
+
+> +
+> +struct zoned_gc_candidate {
+> +	struct btrfs_block_group *bg;
+> +	u64 garbage;
+> +};
+> +
+> +static int zoned_gc_candidate_cmp(const void *a, const void *b)
+> +{
+> +	const struct zoned_gc_candidate *ca = a;
+> +	const struct zoned_gc_candidate *cb = b;
+> +
+> +	if (ca->garbage > cb->garbage)
+> +		return -1;
+> +	if (ca->garbage < cb->garbage)
+> +		return 1;
+> +	return 0;
+> +}
+> +
+> +static u64 zoned_sweep_space_info(struct btrfs_space_info *sinfo, int thresh_pct,
+> +				  struct zoned_gc_candidate *cands, size_t *nr,
+> +				  size_t max)
+> +{
+> +	struct btrfs_block_group *bg;
+> +	u64 garbage = 0;
+> +
+> +	down_read(&sinfo->groups_sem);
+> +	for (int i = 0; i < BTRFS_NR_RAID_TYPES; i++) {
+> +		list_for_each_entry(bg, &sinfo->block_groups[i], list) {
+> +			u64 bg_garbage;
+> +			bool below;
+> +
+> +			spin_lock(&bg->lock);
+> +			if (!zoned_bg_reclaimable(bg)) {
+> +				spin_unlock(&bg->lock);
+> +				continue;
+> +			}
+> +			bg_garbage = zoned_bg_garbage(bg);
+> +			below = bg->used < mult_perc(bg->length, thresh_pct);
+> +			if (below)
+> +				btrfs_mark_bg_to_reclaim(bg);
+
+[Severity: Medium]
+Should the reclaim threshold in zoned_sweep_space_info() be calculated
+against bg->zone_capacity instead of bg->length?
+
+On zoned devices where zone_capacity is smaller than zone_size, the region
+[bg->zone_capacity, bg->length) is never writable and is permanently
+accounted in bg->zone_unusable, so bg->used can never exceed
+bg->zone_capacity.
+
+In fs/btrfs/free-space-cache.c, __btrfs_add_free_space_zoned() scales the
+reclaim threshold against block_group->zone_capacity (see commit
+d8da0e85673a ("btrfs: zoned: tweak reclaim threshold for zone capacity")):
+
+fs/btrfs/free-space-cache.c:__btrfs_add_free_space_zoned() {
+    ...
+	reclaimable_unusable = block_group->zone_unusable -
+			       (block_group->length - block_group->zone_capacity);
+	/* All the region is now unusable. Mark it as unused and reclaim */
+	if (block_group->zone_unusable == block_group->length) {
+		btrfs_mark_bg_unused(block_group);
+	} else if (bg_reclaim_threshold &&
+		   reclaimable_unusable >=
+		   mult_perc(block_group->zone_capacity, bg_reclaim_threshold)) {
+		btrfs_mark_bg_to_reclaim(block_group);
+	}
+    ...
+}
+
+By passing bg->length to mult_perc() here, the threshold is inflated by
+the unusable slack between bg->zone_capacity and bg->length. On ZNS
+devices where zone_capacity is at or below thresh_pct percent of
+bg->length (for example, with the default 75% threshold), wouldn't
+bg->used < mult_perc(bg->length, thresh_pct) evaluate to true for every
+full block group with non-zero garbage, queuing all of them
+unconditionally and bypassing the candidate sorting and two-zone target?
+
+> +			spin_unlock(&bg->lock);
+> +
+> +			if (below) {
+> +				garbage += bg_garbage;
+> +			} else if (*nr < max) {
+> +				btrfs_get_block_group(bg);
+> +				cands[*nr].bg = bg;
+> +				cands[*nr].garbage = bg_garbage;
+> +				(*nr)++;
+> +			}
+> +		}
+> +	}
+> +	up_read(&sinfo->groups_sem);
+> +
+> +	return garbage;
+> +}
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=25
+

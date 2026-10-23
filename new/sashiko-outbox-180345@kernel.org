@@ -1,0 +1,110 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:02:35 2026
+Message-ID: <sashiko-outbox-180345@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 17/25] btrfs: zoned: factor out resetting a block
+ group in place
+Date: Wed, 21 Oct 2026 14:02:22 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: btrfs_reset_unused_block_groups() credits wrong space_info
+--
+
+commit c566c6bb80a8c6dabc0d4979b3d2cc5c858cfb73
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: factor out resetting a block group in place
+
+This commit factors out the block group zone reset and free space accounting
+logic from btrfs_reset_unused_block_groups() into a new helper function,
+zoned_reset_bg_in_place().
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index ade2d0adfe258..1bb8716915a91 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2921,6 +2921,72 @@ void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg)
+>  	spin_unlock(&fs_info->relocation_bg_lock);
+>  }
+>  
+> +static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+> +{
+> +	struct btrfs_fs_info *fs_info = bg->fs_info;
+> +	struct btrfs_space_info *space_info = bg->space_info;
+
+[ ... ]
+
+> +	bg->free_space_ctl->free_space += *reclaimed;
+> +	btrfs_space_info_update_bytes_zone_unusable(space_info, -*reclaimed);
+> +	spin_unlock(&bg->lock);
+> +	btrfs_return_free_space(space_info, *reclaimed);
+> +	spin_unlock(&space_info->lock);
+> +
+> +	return 0;
+> +}
+> +
+>  void btrfs_zoned_reserve_data_reloc_bg(struct btrfs_fs_info *fs_info)
+
+[ ... ]
+
+> @@ -3307,65 +3371,9 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		list_del_init(&bg->bg_list);
+>  		spin_unlock(&fs_info->unused_bgs_lock);
+>  
+> -		/*
+> -		 * Since the block group is fully zone_unusable and we cannot
+> -		 * allocate from this block group anymore, we don't need to set
+> -		 * this block group read-only.
+> -		 */
+> -
+
+[ ... ]
+
+> -		bg->free_space_ctl->free_space += reclaimed;
+> -		btrfs_space_info_update_bytes_zone_unusable(space_info, -reclaimed);
+> -		spin_unlock(&bg->lock);
+> -		btrfs_return_free_space(space_info, reclaimed);
+> -		spin_unlock(&space_info->lock);
+> +		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+> +		if (ret || !reclaimed)
+>  			goto requeue;
+>  
+>  		btrfs_put_block_group(bg);
+
+[Severity: Medium]
+Can this cause btrfs_reset_unused_block_groups() to return without reclaiming
+space for the requested space_info when a sub-group block group is on
+fs_info->unused_bgs?
+
+On zoned filesystems, create_space_info() creates a sub_group[0] (for data
+relocation or tree-log) with the same space_info->flags as the parent primary
+space_info.
+
+In btrfs_reset_unused_block_groups(), the search over fs_info->unused_bgs
+filters only by type flags rather than matching bg->space_info:
+
+	list_for_each_entry(bg, &fs_info->unused_bgs, bg_list) {
+		if ((bg->flags & BTRFS_BLOCK_GROUP_TYPE_MASK) != space_info->flags)
+			continue;
+
+Previously, btrfs_reset_unused_block_groups() updated bytes_zone_unusable and
+called btrfs_return_free_space() on its space_info argument, whereas
+zoned_reset_bg_in_place() now uses bg->space_info.
+
+When flush_space() calls btrfs_reset_unused_block_groups(space_info,
+num_bytes) and the loop picks a block group where bg->space_info !=
+space_info (for example, an unused tree-log block group when flushing the
+primary metadata space_info, or vice versa), zoned_reset_bg_in_place()
+returns the reclaimed space to bg->space_info, but
+btrfs_reset_unused_block_groups() still deducts reclaimed from num_bytes:
+
+	if (num_bytes <= reclaimed)
+		break;
+	num_bytes -= reclaimed;
+
+Should the candidate lookup in btrfs_reset_unused_block_groups() check
+bg->space_info != space_info so that it only resets block groups belonging to
+the target space_info?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=17
+

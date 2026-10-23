@@ -1,0 +1,115 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:12:26 2026
+Message-ID: <sashiko-outbox-180353@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 03/25] btrfs: zoned: skip the append only metadata
+ writeback path for conventional block groups
+Date: Wed, 21 Oct 2026 14:12:17 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: leaked meta bg counter on block group setup failure
+--
+
+commit 72d6e0d3891f3deb8e2979c750753e67e2091cf0
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: skip the append only metadata writeback path for conventional block groups
+
+This commit adds btrfs_zoned_bg_is_append_only() and per-filesystem metadata
+block group counters so metadata block groups backed only by conventional
+zones can bypass append-only writeback serialization and zeroout handling.
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index f1c663e81d9d4..93f3251f93e69 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+
+[ ... ]
+
+> @@ -1204,6 +1204,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+>  	rb_erase_cached(&block_group->cache_node,
+>  			&fs_info->block_group_cache_tree);
+>  	RB_CLEAR_NODE(&block_group->cache_node);
+> +	btrfs_zoned_account_meta_bg(block_group, -1);
+>  
+>  	/* Once for the block groups rbtree */
+>  	btrfs_put_block_group(block_group);
+
+[ ... ]
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index ee5998b8e269e..c65f1b4f6dbe4 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2019,6 +2019,7 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	}
+>  
+>  	if (!ret) {
+> +		btrfs_zoned_account_meta_bg(cache, 1);
+
+[Severity: Medium]
+Can this leak a count in fs_info->zoned_seq_meta_bgs or
+fs_info->zoned_conv_meta_bgs if block group setup fails after
+btrfs_load_block_group_zone_info() succeeds?
+
+In fs/btrfs/block-group.c, both btrfs_make_block_group() (via
+btrfs_chunk_alloc() -> do_chunk_alloc() -> btrfs_create_chunk() ->
+create_chunk()) and read_one_block_group() (via btrfs_read_block_groups())
+call btrfs_load_block_group_zone_info() before finishing setup and inserting
+the block group into fs_info->block_group_cache_tree:
+
+fs/btrfs/block-group.c:btrfs_make_block_group() {
+	...
+	ret = btrfs_load_block_group_zone_info(cache, true);
+	if (ret) {
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+
+	ret = exclude_super_stripes(cache);
+	if (ret) {
+		/* We may have excluded something, so call this just in case */
+		btrfs_free_excluded_extents(cache);
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+	...
+	ret = btrfs_add_new_free_space(cache, chunk_offset, chunk_offset + size, NULL);
+	btrfs_free_excluded_extents(cache);
+	if (ret) {
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+
+	ret = btrfs_add_block_group_cache(cache);
+	if (ret) {
+		btrfs_remove_free_space_cache(cache);
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+	...
+}
+
+If exclude_super_stripes(), btrfs_add_new_free_space(), or
+btrfs_add_block_group_cache() fails, the block group is freed via
+btrfs_put_block_group(cache) without ever being added to
+fs_info->block_group_cache_tree. Since the only matching
+btrfs_zoned_account_meta_bg(block_group, -1) call is in
+btrfs_remove_block_group() when erasing from block_group_cache_tree, the
+incremented counter is never decremented, which can leave both
+zoned_seq_meta_bgs and zoned_conv_meta_bgs non-zero and disable the fast path
+in btrfs_zoned_meta_is_append_only().
+
+Would it make sense to account the metadata block group in
+btrfs_add_block_group_cache() when it is inserted into
+fs_info->block_group_cache_tree, symmetric with where
+btrfs_remove_block_group() decrements the counter?
+
+>  		cache->meta_write_pointer = cache->alloc_offset + cache->start;
+>  		if (test_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &cache->runtime_flags)) {
+>  			spin_lock(&fs_info->zone_active_bgs_lock);
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=3
+

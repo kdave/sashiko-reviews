@@ -1,0 +1,234 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:43:32 2026
+Message-ID: <sashiko-outbox-180356@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 23/25] btrfs: zoned: keep a zone free for relocation
+ when allocating data chunks
+Date: Wed, 21 Oct 2026 14:15:00 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: zoned: relocation reserve zone absorbed into data_sinfo on split reloc
+- [High] btrfs: zoned: btrfs_zoned_data_chunk_allowed() overestimates free zones
+- [Medium] btrfs: zoned: per-device stripe constraints ignored in btrfs_zoned_data_chunk_allowed()
+--
+
+commit 39007970abec35645f6fc445d759d3c11e288025
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: keep a zone free for relocation when allocating data chunks
+
+This commit adds btrfs_zoned_data_chunk_allowed() to check that at least two
+chunks worth of available device space remain before allocating a new data
+chunk on a zoned filesystem, reserving one zone as a relocation target.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 1394b7740b185..205f7ed207ebf 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -3651,3 +3651,35 @@ void btrfs_show_zoned_stats(struct btrfs_fs_info *fs_info, struct seq_file *seq)
+>  	}
+>  	spin_unlock(&fs_info->zone_active_bgs_lock);
+>  }
+> +
+> +bool btrfs_zoned_data_chunk_allowed(struct btrfs_space_info *space_info, u64 flags)
+> +{
+> +	struct btrfs_fs_info *fs_info = space_info->fs_info;
+> +	const u64 chunk_bytes = fs_info->zone_size *
+> +				btrfs_bg_type_to_num_stripes(fs_info, flags);
+> +	struct btrfs_device *device;
+> +	u64 avail = 0;
+> +
+> +	ASSERT(btrfs_is_zoned(fs_info));
+> +
+> +	if (space_info != fs_info->data_sinfo)
+> +		return true;
+
+[Severity: High]
+Can the single unallocated zone reserved by btrfs_zoned_data_chunk_allowed()
+be permanently absorbed into fs_info->data_sinfo when relocating a block
+group spans across two relocation block groups?
+
+When normal data writes allocate chunks in fs_info->data_sinfo until
+avail == chunk_bytes (one unallocated zone left on the device), reloc_sinfo
+(data_sinfo->sub_group[0]) may hold a partially filled active relocation
+block group (bg_r1) from a previous relocation.
+
+During btrfs_reclaim_block_groups() -> btrfs_reclaim_block_group() ->
+btrfs_relocate_chunk(), if relocating a source block group (bg_src) exceeds
+the remaining free space in bg_r1, do_allocation_zoned() fills bg_r1 and
+clears fs_info->data_reloc_bg = 0. Relocating the remaining extents of
+bg_src then calls find_free_extent_update_loop() -> btrfs_chunk_alloc() for
+reloc_sinfo. Because space_info != fs_info->data_sinfo,
+btrfs_zoned_data_chunk_allowed() returns true and allocates a second
+relocation block group (bg_r2) from the last unallocated zone on the device
+(reducing avail to 0), and do_allocation_zoned() sets
+fs_info->data_reloc_bg = bg_r2->start.
+
+When bg_src finishes relocating in btrfs_relocate_chunk_finish(),
+btrfs_zoned_reuse_reclaimed_bg() runs:
+
+fs/btrfs/zoned.c:btrfs_zoned_reuse_reclaimed_bg() {
+    ...
+	ret = zoned_reset_bg_in_place(bg, !fs_info->data_reloc_bg, &reclaimed);
+	if (ret || !reclaimed)
+		btrfs_mark_bg_unused(bg);
+
+	return true;
+}
+
+Because fs_info->data_reloc_bg is already non-zero (bg_r2->start),
+zoned_reset_bg_in_place() runs with promote = false: it resets bg_src in
+place inside data_sinfo, returns its free space to data_sinfo via
+btrfs_return_free_space(), and returns true from
+btrfs_zoned_reuse_reclaimed_bg() so btrfs_remove_chunk() is skipped.
+
+At the end of btrfs_reclaim_block_groups(),
+btrfs_zoned_return_data_reloc_bgs() then moves the filled bg_r1 from
+reloc_sinfo into data_sinfo:
+
+fs/btrfs/zoned.c:btrfs_zoned_return_data_reloc_bgs() {
+    ...
+		if (found) {
+			zoned_move_bg_to_space_info(fs_info, found, data_sinfo);
+			btrfs_put_block_group(found);
+			goto again;
+		}
+    ...
+}
+
+Wouldn't this leave data_sinfo with both bg_src and bg_r1, zero unallocated
+zones on the device, and only the partially filled bg_r2 in reloc_sinfo,
+causing subsequent relocations that exceed the remaining space in bg_r2 to
+fail with -ENOSPC?
+
+> +
+> +	lockdep_assert_held(&fs_info->chunk_mutex);
+> +
+> +	list_for_each_entry(device, &fs_info->fs_devices->alloc_list, dev_alloc_list) {
+> +		u64 total;
+> +		u64 used;
+> +
+> +		if (!test_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state) ||
+> +		    test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state))
+> +			continue;
+> +
+> +		total = btrfs_device_get_total_bytes(device);
+> +		used = btrfs_device_get_bytes_used(device);
+> +		if (total > used)
+> +			avail += btrfs_zoned_dev_avail_bytes(device, total - used);
+> +	}
+
+[Severity: High]
+Won't btrfs_zoned_dev_avail_bytes(device, total - used) overestimate the
+allocatable bytes on a device by counting zones that contain regular
+superblock positions?
+
+In btrfs_zoned_dev_avail_bytes(), only the superblock log zones at
+sb_zone_number() are subtracted from avail:
+
+fs/btrfs/zoned.c:btrfs_zoned_dev_avail_bytes() {
+    ...
+	for (int i = 0; i < BTRFS_SUPER_MIRROR_MAX; i++) {
+		const u32 sb_zone = sb_zone_number(zinfo->zone_size_shift, i);
+
+		for (int j = 0; j < BTRFS_NR_SB_LOG_ZONES; j++) {
+			if (zone_start_physical(sb_zone + j, zinfo) < total)
+				sb_bytes += zinfo->zone_size;
+		}
+	}
+    ...
+}
+
+However, during chunk allocation, btrfs_find_allocatable_zones() also
+excludes any zone overlapping the regular superblock position
+btrfs_sb_offset(i):
+
+fs/btrfs/zoned.c:btrfs_find_allocatable_zones() {
+    ...
+			/* We also need to exclude regular superblock positions */
+			sb_pos = btrfs_sb_offset(i);
+			if (!(pos + num_bytes <= sb_pos ||
+			      sb_pos + BTRFS_SUPER_INFO_SIZE <= pos)) {
+				have_sb = true;
+				pos = ALIGN(sb_pos + BTRFS_SUPER_INFO_SIZE,
+					    zinfo->zone_size);
+				break;
+			}
+    ...
+}
+
+Because the maximum supported zone size (8 GiB) is smaller than the distance
+between btrfs_sb_offset(2) (256 GiB) and the superblock log zones (0B,
+512 GiB, and 4 TiB), the zone containing btrfs_sb_offset(2) is always
+disjoint from the superblock log zones on devices larger than 256 GiB.
+Likewise, when zone_size is 32 MiB or smaller, the zone containing
+btrfs_sb_offset(1) (64 MiB) lies outside zones 0 and 1.
+
+Since btrfs_find_allocatable_zones() skips these zones, they can never be
+allocated as device extents and are never included in device->bytes_used.
+Won't btrfs_zoned_dev_avail_bytes(device, total - used) therefore
+overestimate avail by 1 to 2 zones per device, allowing
+avail >= 2 * chunk_bytes to evaluate to true when only one allocatable zone
+actually remains on the device?
+
+> +
+> +	return avail >= 2 * chunk_bytes;
+> +}
+
+[Severity: Medium]
+How does summing avail across all devices and comparing against
+2 * chunk_bytes account for per-device stripe placement constraints?
+
+In btrfs_zoned_data_chunk_allowed(), avail is computed as a flat sum across
+all devices in fs_devices->alloc_list and compared against 2 * chunk_bytes,
+where chunk_bytes uses btrfs_bg_type_to_num_stripes():
+
+fs/btrfs/volumes.c:btrfs_bg_type_to_num_stripes() {
+	const int index = btrfs_bg_flags_to_raid_index(flags);
+	int ndevs;
+
+	if (btrfs_raid_array[index].devs_max)
+		ndevs = btrfs_raid_array[index].devs_max;
+	else
+		ndevs = fs_info->fs_devices->rw_devices;
+
+	return btrfs_raid_array[index].dev_stripes * ndevs;
+}
+
+During chunk allocation, gather_device_info() and decide_dev_extent_size()
+require at least ctl->devs_min distinct devices (rounded down to a multiple
+of ctl->devs_increment, up to ctl->devs_max) to each have at least
+zone_size * ctl->dev_stripes of contiguous allocatable space:
+
+fs/btrfs/volumes.c:decide_dev_extent_size() {
+    ...
+	ctl->ndevs = rounddown(ctl->ndevs, ctl->devs_increment);
+
+	if (ctl->ndevs < ctl->devs_min) {
+    ...
+		return -ENOSPC;
+	}
+    ...
+}
+
+For profiles like raid1 (devs_min = 2, devs_max = 2, dev_stripes = 1), if
+free zones are unevenly distributed across devices (for example, 3 free
+zones on dev0 and 1 free zone on dev1, so avail = 4 * zone_size >=
+2 * chunk_bytes), btrfs_zoned_data_chunk_allowed() returns true and
+do_chunk_alloc() consumes 1 zone on dev0 and the last free zone on dev1.
+That leaves 2 free zones on dev0 and 0 on dev1, so a subsequent raid1 chunk
+allocation for data relocation fails in decide_dev_extent_size() because
+ctl->ndevs (1) < ctl->devs_min (2). A similar issue occurs with dup
+(dev_stripes = 2) on multiple devices when dev0 has 3 free zones and dev1
+has 1 free zone, leaving 1 free zone on each device after one dup allocation.
+
+Conversely, for profiles with devs_max == 0 (raid0, raid10),
+btrfs_bg_type_to_num_stripes() always uses fs_info->fs_devices->rw_devices.
+On a raid10 filesystem with an odd number of devices, or on a raid0/raid10
+filesystem where some devices are full while at least ctl->devs_min devices
+still have free zones, decide_dev_extent_size() can allocate narrower chunks
+across the remaining devices, whereas requiring 2 * chunk_bytes based on
+rw_devices will reject btrfs_chunk_alloc() prematurely.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=23
+

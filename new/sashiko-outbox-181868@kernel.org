@@ -1,0 +1,181 @@
+From sashiko-bot@kernel.org Thu Oct 22 19:39:07 2026
+Message-ID: <sashiko-outbox-181868@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 6/7] btrfs: find_free_extent checks size class
+ unlocked
+Date: Thu, 22 Oct 2026 17:39:01 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] btrfs: zoned allocation skips max_extent_size update in find_free_extent()
+- [High] btrfs: stranded cluster space in find_free_extent_skip_block_group()
+--
+
+commit 2d3cc089b8d98e6233d03af2cce1a865c1b29dba
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: find_free_extent checks size class unlocked
+
+This commit extends find_free_extent_skip_block_group() in
+fs/btrfs/extent-tree.c to check the block group size class without taking
+the block group lock when caching has finished. If the size class does not
+match on the current allocation loop, it records size_class_skipped and skips
+the block group early.
+
+> diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+> index 8b57798c2d943..80f2c735f4322 100644
+> --- a/fs/btrfs/extent-tree.c
+> +++ b/fs/btrfs/extent-tree.c
+> @@ -4334,6 +4334,9 @@ static bool find_free_extent_skip_block_group(struct btrfs_block_group *block_gr
+>  			ffe_ctl->total_free_space = max(ffe_ctl->total_free_space,
+>  							free_space);
+>  			skip = true;
+
+[Severity: High]
+When find_free_extent_skip_block_group() in fs/btrfs/extent-tree.c (added in
+commit 0f59db59bce5 ("btrfs: find_free_extent checks full block groups
+unlocked") and extended here) skips a block group because free_space is less
+than ffe_ctl->num_bytes, it updates ffe_ctl->total_free_space but leaves
+ffe_ctl->max_extent_size untouched. Can this cause a hang or premature
+allocation failure on zoned filesystems?
+
+On a zoned filesystem (ffe_ctl->policy == BTRFS_EXTENT_ALLOC_ZONED), all
+block groups have block_group->cached == BTRFS_CACHE_FINISHED and
+block_group->free_space_ctl->free_space equal to
+block_group->zone_capacity - block_group->alloc_offset. Previously, when
+btrfs_reserve_extent() -> find_free_extent() scanned an active data block
+group whose remaining contiguous space was at least ffe_ctl->min_alloc_size
+but less than ffe_ctl->num_bytes, do_allocation() -> do_allocation_zoned()
+updated ffe_ctl->max_extent_size:
+
+fs/btrfs/extent-tree.c:do_allocation_zoned() {
+	...
+	avail = block_group->zone_capacity - block_group->alloc_offset;
+	if (avail < num_bytes) {
+		if (ffe_ctl->max_extent_size < avail) {
+			/*
+			 * With sequential allocator, free space is always
+			 * contiguous
+			 */
+			ffe_ctl->max_extent_size = avail;
+			ffe_ctl->total_free_space = avail;
+		}
+		ret = 1;
+		goto out;
+	}
+	...
+}
+
+Because find_free_extent_skip_block_group() now skips the block group before
+do_allocation_zoned() runs, ffe_ctl->max_extent_size remains 0 during the
+scan (the fallback in find_free_extent() that copies
+ffe_ctl->total_free_space to ffe_ctl->max_extent_size only runs after
+find_free_extent_update_loop() returns -ENOSPC).
+
+When find_free_extent_update_loop() reaches LOOP_ALLOC_CHUNK and calls
+can_allocate_chunk() -> can_allocate_chunk_zoned() while the device is at
+max_active_zones (so btrfs_can_activate_zone() returns false and sets
+BTRFS_FS_NEED_ZONE_FINISH) and active data block groups cannot be finished
+immediately because block_group->reserved > 0 (so btrfs_zone_finish_one_bg()
+returns 0), can_allocate_chunk_zoned() checks ffe_ctl->max_extent_size:
+
+fs/btrfs/extent-tree.c:can_allocate_chunk_zoned() {
+	...
+	if (ffe_ctl->max_extent_size >= ffe_ctl->min_alloc_size)
+		return -ENOSPC;
+
+	if (ffe_ctl->flags & BTRFS_BLOCK_GROUP_DATA)
+		return -EAGAIN;
+	...
+}
+
+With ffe_ctl->max_extent_size still 0, can_allocate_chunk_zoned() returns
+-EAGAIN instead of -ENOSPC. Because btrfs_reserve_extent() only shrinks
+num_bytes on -ENOSPC, it propagates -EAGAIN to callers such as
+cow_file_range() and btrfs_new_extent_direct(), which sleep in
+wait_on_bit_io() on BTRFS_FS_NEED_ZONE_FINISH. Since the active zone still
+has unallocated space before zone_capacity, btrfs_zone_finish_endio() bails
+out on I/O completion without finishing the zone or clearing
+BTRFS_FS_NEED_ZONE_FINISH, leaving the waiter hung in D state.
+
+> +		} else if (!find_free_extent_check_size_class(ffe_ctl, block_group)) {
+> +			ffe_ctl->size_class_skipped = true;
+> +			skip = true;
+>  		}
+
+[Severity: High]
+Could skipping a block group in find_free_extent_skip_block_group() when
+free_space < ffe_ctl->num_bytes also leave a free space cluster stranded in
+ffe_ctl->last_ptr->root and cause premature -ENOSPC under -o ssd_spread?
+
+When a cluster (ffe_ctl->last_ptr, i.e. fs_info->data_alloc_cluster under
+-o ssd_spread) is populated in a block group bg by setup_cluster_no_bitmap()
+or btrfs_bitmap_cluster(), the free space entries are removed from
+bg->free_space_ctl->free_space_offset and
+bg->free_space_ctl->free_space_bytes and placed into last_ptr->root, while
+bg->free_space_ctl->free_space still includes those bytes.
+
+If btrfs_reserve_extent() -> find_free_extent() is called for an allocation
+where ffe_ctl->num_bytes > bg->free_space_ctl->free_space >=
+ffe_ctl->min_alloc_size and no other block group can satisfy
+ffe_ctl->num_bytes (with chunk allocation returning -ENOSPC),
+find_free_extent_skip_block_group() skips bg on every loop while recording
+its free_space in ffe_ctl->total_free_space. Because
+do_allocation_clustered() -> find_free_extent_clustered() is never entered,
+the cluster is never returned to bg->free_space_ctl:
+
+fs/btrfs/extent-tree.c:find_free_extent_clustered() {
+	...
+	/* This cluster didn't work out, free it and start over */
+	btrfs_return_cluster_to_free_space(NULL, last_ptr);
+	...
+}
+
+find_free_extent() then returns -ENOSPC and sets space_info->max_extent_size
+from ffe_ctl->total_free_space:
+
+fs/btrfs/extent-tree.c:find_free_extent() {
+	...
+	if (ret == -ENOSPC && !cache_block_group_error) {
+		if (!ffe_ctl->max_extent_size)
+			ffe_ctl->max_extent_size = ffe_ctl->total_free_space;
+		spin_lock(&space_info->lock);
+		space_info->max_extent_size = ffe_ctl->max_extent_size;
+		spin_unlock(&space_info->lock);
+		ins->offset = ffe_ctl->max_extent_size;
+	}
+	...
+}
+
+When btrfs_reserve_extent() retries with a smaller num_bytes <=
+space_info->max_extent_size, prepare_allocation_clustered() sees
+space_info->max_extent_size != 0 and disables clustering:
+
+fs/btrfs/extent-tree.c:prepare_allocation_clustered() {
+	...
+	if (space_info->max_extent_size) {
+		spin_lock(&space_info->lock);
+		if (space_info->max_extent_size &&
+		    ffe_ctl->num_bytes > space_info->max_extent_size) {
+			ins->offset = space_info->max_extent_size;
+			spin_unlock(&space_info->lock);
+			return -ENOSPC;
+		} else if (space_info->max_extent_size) {
+			ffe_ctl->use_cluster = false;
+		}
+		spin_unlock(&space_info->lock);
+	}
+	...
+}
+
+On the retry, do_allocation_clustered() bypasses
+find_free_extent_clustered() and calls find_free_extent_unclustered(), which
+sets last_ptr->fragmented = 1 and searches only bg->free_space_ctl via
+btrfs_find_space_for_alloc(), unable to see the free space still held in
+last_ptr->root.
+
+>  	}
+>  	if (!skip)
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1792688736.git.boris@bur.io?part=6
+

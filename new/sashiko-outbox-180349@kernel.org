@@ -1,0 +1,249 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:39:29 2026
+Message-ID: <sashiko-outbox-180349@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 19/25] btrfs: zoned: promote reset data block groups
+ to the relocation target
+Date: Wed, 21 Oct 2026 14:09:29 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: zoned: space overcommit race in zoned_reset_bg_in_place() promotion
+- [High] btrfs: zoned: lost ticket wakeup when zoned_reset_bg_in_place() promotes reloc bg
+- [High] btrfs: zoned: data_reloc_bg race in btrfs_set_data_reloc_bg() at runtime
+--
+
+commit bb27aa27c601268c71d9ea070bfadcee0e2d6038
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: promote reset data block groups to the relocation target
+
+This commit updates btrfs_reset_unused_block_groups() and
+zoned_reset_bg_in_place() to promote an in-place reset data block group to
+be the data relocation target when fs_info->data_reloc_bg is unset, instead
+of returning its reclaimed space to the data space_info first.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 62a5cd1c9de29..331313cf01f03 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2990,7 +2990,8 @@ static bool btrfs_set_data_reloc_bg(struct btrfs_fs_info *fs_info,
+>  	return true;
+>  }
+>  
+> -static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+> +static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, bool promote,
+> +				   u64 *reclaimed)
+>  {
+>  	struct btrfs_fs_info *fs_info = bg->fs_info;
+>  	struct btrfs_space_info *space_info = bg->space_info;
+> @@ -3050,9 +3051,26 @@ static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+>  	bg->free_space_ctl->free_space += *reclaimed;
+>  	btrfs_space_info_update_bytes_zone_unusable(space_info, -*reclaimed);
+>  	spin_unlock(&bg->lock);
+> -	btrfs_return_free_space(space_info, *reclaimed);
+> +
+> +	/*
+> +	 * If we need a data relocation target, promote this just
+> +	 * evacuated and reset zone to be it directly, instead of
+> +	 * returning its free space to the data space_info. Otherwise the
+> +	 * returned space could be handed out to a waiting data write and
+> +	 * then yanked away by the migration into the relocation
+> +	 * space_info.
+> +	 */
+> +	promote = promote && (space_info->flags & BTRFS_BLOCK_GROUP_DATA);
+> +	if (!promote)
+> +		btrfs_return_free_space(space_info, *reclaimed);
+>  	spin_unlock(&space_info->lock);
+
+[Severity: High]
+Can a concurrent data reservation or extent allocation still claim this
+reclaimed space in fs/btrfs/zoned.c:zoned_reset_bg_in_place() after
+bg->lock and space_info->lock are dropped, before btrfs_set_data_reloc_bg()
+migrates the block group out of fs_info->data_sinfo?
+
+In zoned_reset_bg_in_place(), bg->alloc_offset is reset to 0 and
+space_info->bytes_zone_unusable is decremented by *reclaimed while
+space_info->total_bytes still includes bg->length:
+
+	*reclaimed = bg->alloc_offset;
+	bg->zone_unusable = bg->length - bg->zone_capacity;
+	bg->alloc_offset = 0;
+	...
+	bg->free_space_ctl->free_space += *reclaimed;
+	btrfs_space_info_update_bytes_zone_unusable(space_info, -*reclaimed);
+	spin_unlock(&bg->lock);
+
+Skipping btrfs_return_free_space() avoids calling
+btrfs_try_granting_tickets(space_info) on this CPU, but reducing
+bytes_zone_unusable immediately reduces btrfs_space_info_used(space_info,
+true). Once spin_unlock(&space_info->lock) runs, a concurrent buffered
+write calling:
+
+  btrfs_check_data_free_space()
+    -> btrfs_reserve_data_bytes()
+      -> reserve_bytes()
+
+(when no tickets are queued) or a concurrent reservation release calling:
+
+  btrfs_space_info_free_bytes_may_use()
+    -> btrfs_try_granting_tickets()
+
+can see used + orig_bytes <= space_info->total_bytes and grant
+space_info->bytes_may_use reservations backed by this block group.
+
+When btrfs_set_data_reloc_bg() then runs, its still_empty check only
+inspects block-group-level fields:
+
+		down_write(&data_sinfo->groups_sem);
+		spin_lock(&bg->lock);
+		still_empty = (bg->alloc_offset == 0 && bg->used == 0 &&
+			       bg->reserved == 0 && !bg->ro &&
+			       bg->space_info == data_sinfo);
+		if (still_empty)
+			list_del_init(&bg->list);
+		spin_unlock(&bg->lock);
+		up_write(&data_sinfo->groups_sem);
+
+Because delalloc reservations only increment data_sinfo->bytes_may_use,
+still_empty remains true, and zoned_move_bg_to_space_info() then subtracts
+bg->length from from->total_bytes:
+
+	spin_lock(&from->lock);
+	from->total_bytes -= bg->length;
+
+leaving data_sinfo->bytes_may_use overcommitted and causing subsequent
+writeback to hit -ENOSPC. In addition, between spin_unlock(&bg->lock) in
+zoned_reset_bg_in_place() and down_write(&data_sinfo->groups_sem) in
+btrfs_set_data_reloc_bg(), bg remains on data_sinfo->block_groups with
+bg->alloc_offset == 0 and without BLOCK_GROUP_FLAG_ZONED_DATA_RELOC, so a
+concurrent find_free_extent() for a normal data write can allocate an
+extent from bg and defeat the promotion.
+
+>  
+> +	if (promote && !btrfs_set_data_reloc_bg(fs_info, bg)) {
+> +		spin_lock(&space_info->lock);
+> +		btrfs_return_free_space(space_info, *reclaimed);
+> +		spin_unlock(&space_info->lock);
+> +	}
+> +
+>  	return 0;
+>  }
+
+[Severity: High]
+What happens in fs/btrfs/zoned.c:zoned_reset_bg_in_place() when the unused
+block group being reset already belongs to the data relocation
+sub-space_info (fs_info->data_sinfo->sub_group[0]) while
+fs_info->data_reloc_bg is 0?
+
+Both fs_info->data_sinfo and fs_info->data_sinfo->sub_group[0]
+(BTRFS_SUB_GROUP_DATA_RELOC) have BTRFS_BLOCK_GROUP_DATA set in
+space_info->flags. When a previous relocation block group in
+data_sinfo->sub_group[0] becomes unused and is reset via:
+
+  btrfs_async_reclaim_data_space()
+    -> do_async_reclaim_data_space()
+      -> flush_space(..., RESET_ZONES, ...)
+        -> btrfs_reset_unused_block_groups()
+          -> zoned_reset_bg_in_place()
+
+the check:
+
+	promote = promote && (space_info->flags & BTRFS_BLOCK_GROUP_DATA);
+	if (!promote)
+		btrfs_return_free_space(space_info, *reclaimed);
+
+evaluates promote as true and skips btrfs_return_free_space(). However, in
+fs/btrfs/zoned.c:btrfs_set_data_reloc_bg():
+
+	struct btrfs_space_info *data_sinfo = fs_info->data_sinfo;
+	const bool migrate = (bg->space_info == data_sinfo);
+
+	if (migrate) {
+		...
+	}
+	...
+	if (migrate)
+		zoned_move_bg_to_space_info(fs_info, bg, data_sinfo->sub_group[0]);
+
+	btrfs_zone_activate(bg);
+
+	return true;
+
+migrate is false because bg->space_info is already
+data_sinfo->sub_group[0]. As a result, btrfs_set_data_reloc_bg() skips the
+still_empty recheck after bg->lock was dropped, skips
+zoned_move_bg_to_space_info() (which would otherwise call
+btrfs_add_bg_to_space_info() -> btrfs_try_granting_tickets()), and returns
+true, so the fallback btrfs_return_free_space() in
+zoned_reset_bg_in_place() is also skipped. Wouldn't this leave waiting
+tickets on data_sinfo->sub_group[0] ungranted and stalled?
+
+>  
+> @@ -3430,7 +3448,7 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		list_del_init(&bg->bg_list);
+>  		spin_unlock(&fs_info->unused_bgs_lock);
+>  
+> -		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+> +		ret = zoned_reset_bg_in_place(bg, !fs_info->data_reloc_bg, &reclaimed);
+>  		if (ret || !reclaimed)
+>  			goto requeue;
+>  
+
+[Severity: High]
+Could sampling !fs_info->data_reloc_bg locklessly in
+fs/btrfs/zoned.c:btrfs_reset_unused_block_groups() race with concurrent
+data relocation allocations in fs/btrfs/extent-tree.c:find_free_extent() ->
+do_allocation_zoned() (or another reset caller)?
+
+In btrfs_reset_unused_block_groups(), !fs_info->data_reloc_bg is read
+without fs_info->relocation_bg_lock before zoned_reset_bg_in_place() issues
+synchronous REQ_OP_ZONE_RESET I/O via blkdev_zone_mgmt() and before
+btrfs_set_data_reloc_bg() acquires down_write(&data_sinfo->groups_sem).
+Then fs/btrfs/zoned.c:btrfs_set_data_reloc_bg() unconditionally overwrites
+fs_info->data_reloc_bg and publishes it before migrating the block group:
+
+	spin_lock(&fs_info->relocation_bg_lock);
+	fs_info->data_reloc_bg = bg->start;
+	spin_unlock(&fs_info->relocation_bg_lock);
+	set_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC, &bg->runtime_flags);
+
+	if (migrate)
+		zoned_move_bg_to_space_info(fs_info, bg, data_sinfo->sub_group[0]);
+
+If a concurrent relocation allocation in
+fs/btrfs/extent-tree.c:do_allocation_zoned() checks fs_info->data_reloc_bg,
+drops fs_info->relocation_bg_lock to call btrfs_zone_activate(block_group),
+and then re-acquires fs_info->relocation_bg_lock after
+btrfs_set_data_reloc_bg() has changed fs_info->data_reloc_bg to bg->start,
+it will trip the assertion in do_allocation_zoned():
+
+	ASSERT(!ffe_ctl->for_data_reloc ||
+	       block_group->start == fs_info->data_reloc_bg ||
+	       fs_info->data_reloc_bg == 0);
+
+Or if do_allocation_zoned() already set fs_info->data_reloc_bg and
+BLOCK_GROUP_FLAG_ZONED_DATA_RELOC on another block group while
+zoned_reset_bg_in_place() was in blkdev_zone_mgmt(),
+btrfs_set_data_reloc_bg() will overwrite fs_info->data_reloc_bg and strand
+the previous block group with BLOCK_GROUP_FLAG_ZONED_DATA_RELOC set so its
+active zone cannot be finished.
+
+Additionally, when migrate is true, btrfs_set_data_reloc_bg() removes
+bg->list from data_sinfo and publishes fs_info->data_reloc_bg = bg->start
+before zoned_move_bg_to_space_info() updates bg->space_info and adds
+bg->list to data_sinfo->sub_group[0]. A concurrent
+fs/btrfs/extent-tree.c:find_free_extent() for data relocation running in
+that window will read hint_byte = bg->start in prepare_allocation_zoned(),
+reject the hinted block_group in find_free_extent():
+
+		if (block_group && block_group_bits(block_group, ffe_ctl->flags) &&
+		    block_group->space_info == space_info &&
+		    block_group->cached != BTRFS_CACHE_NO) {
+			down_read(&space_info->groups_sem);
+			if (list_empty(&block_group->list) ||
+
+and then skip all other block groups in do_allocation_zoned() because
+bytenr != data_reloc_bytenr, failing the allocation.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=19
+

@@ -1,0 +1,75 @@
+From sashiko-bot@kernel.org Thu Oct 22 11:15:43 2026
+Message-ID: <sashiko-outbox-181247@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: test that fsynced data on a RAID stripe tree
+ survives a power failure
+Date: Thu, 22 Oct 2026 09:15:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: full fsync before _flakey_drop_and_remount() masks fast fsync failure
+--
+
+commit c9d9fbd31c445a578bc9d6b69fe0a5148868cd6e
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: test that fsynced data on a RAID stripe tree survives a power failure
+
+This commit adds fstest btrfs/363 to verify that data written and fsynced on
+a btrfs filesystem with a raid stripe tree remains readable after a simulated
+power failure, covering both fast fsync and full fsync paths.
+
+> diff --git a/tests/btrfs/363 b/tests/btrfs/363
+> new file mode 100755
+> index 0000000000000..834f2673c93e5
+> --- /dev/null
+> +++ b/tests/btrfs/363
+
+[ ... ]
+
+> +# The first fsync of an inode is always a full fsync. Do one here and then
+> +# commit the transaction, so that the second fsync of this file below is a
+> +# fast fsync.
+> +$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 128K" -c fsync $SCRATCH_MNT/fast | \
+> +	_filter_xfs_io
+> +_scratch_sync
+> +
+> +# Fast fsync: only the extents changed since the last fsync are logged.
+> +$XFS_IO_PROG -c "pwrite -S 0xbb 0 128K" -c fsync $SCRATCH_MNT/fast | \
+> +	_filter_xfs_io
+> +
+> +# Full fsync: this is the first fsync of this inode, so all of its items are
+> +# logged.
+> +$XFS_IO_PROG -f -c "pwrite -S 0xcc 0 128K" -c fsync $SCRATCH_MNT/full | \
+> +	_filter_xfs_io
+> +
+> +# Simulate a power failure. The log is replayed on the next mount and both
+> +# files must still have the data they were fsynced with.
+> +_flakey_drop_and_remount
+
+[Severity: Medium]
+Does running the full fsync right before _flakey_drop_and_remount mask
+failures in the preceding fast fsync?
+
+The kernel fix forces a full transaction commit via
+btrfs_sync_file() -> btrfs_commit_transaction() when fsyncing raid stripe
+tree extents. Because a btrfs transaction commit is filesystem-wide, it
+finishes all pending ordered extents and commits both the subvolume root and
+the raid stripe tree root for the entire running transaction.
+
+If the fast fsync path in log_one_extent() fails to force a transaction
+commit and only writes to the log tree, the uncommitted raid stripe tree
+entries for the "fast" file remain in the running transaction. The
+immediately following full fsync on the "full" file in copy_items() will
+then commit that same running transaction before _flakey_drop_and_remount
+drops writes, persisting the stripe tree mappings for the "fast" file as a
+side effect.
+
+Should the fast fsync and full fsync cases each have their own
+_flakey_drop_and_remount and _hexdump verification cycle so that both paths
+are tested independently?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261022090754.2584747-1-johannes.thumshirn@wdc.com?part=1
+

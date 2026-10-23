@@ -1,0 +1,149 @@
+From sashiko-bot@kernel.org Thu Oct 22 19:31:36 2026
+Message-ID: <sashiko-outbox-181860@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/7] btrfs: skip unhelpful size class relaxing
+ allocation loops
+Date: Thu, 22 Oct 2026 17:31:29 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: premature ENOSPC in find_free_extent_update_loop() on size class race
+--
+
+commit d3d973bc01cad0bc258a990f75fa5599118a6ce4
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: skip unhelpful size class relaxing allocation loops
+
+This commit tracks whether any block group was skipped due to a size class
+mismatch during an extent allocation loop in find_free_extent(). If no block
+group was skipped for its size class, find_free_extent_update_loop() skips
+the LOOP_UNSET_SIZE_CLASS and LOOP_WRONG_SIZE_CLASS phases.
+
+> diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+> index 9b0a5c6b96f3c..f6f4f1ce3f1fc 100644
+> --- a/fs/btrfs/extent-tree.c
+> +++ b/fs/btrfs/extent-tree.c
+> @@ -4361,6 +4361,9 @@ static int find_free_extent_update_loop(struct btrfs_fs_info *fs_info,
+>  	    (!ffe_ctl->orig_have_caching_bg && full_search))
+>  		ffe_ctl->loop++;
+>  	ffe_ctl->loop++;
+> +	/* Relaxing the size class cannot help if no block group was skipped for it. */
+> +	if (ffe_ctl->loop == LOOP_UNSET_SIZE_CLASS && !ffe_ctl->size_class_skipped)
+> +		ffe_ctl->loop++;
+>  
+>  	if (ffe_ctl->loop == LOOP_ALLOC_CHUNK) {
+>  		struct btrfs_trans_handle *trans;
+> @@ -4400,6 +4403,9 @@ static int find_free_extent_update_loop(struct btrfs_fs_info *fs_info,
+>  			return ret;
+>  	}
+>  
+> +	if (ffe_ctl->loop == LOOP_WRONG_SIZE_CLASS && !ffe_ctl->size_class_skipped)
+> +		ffe_ctl->loop++;
+> +
+>  	if (ffe_ctl->loop == LOOP_NO_EMPTY_SIZE) {
+>  		if (ffe_ctl->policy != BTRFS_EXTENT_ALLOC_CLUSTERED)
+>  			return -ENOSPC;
+> @@ -4414,6 +4420,7 @@ static int find_free_extent_update_loop(struct btrfs_fs_info *fs_info,
+>  		ffe_ctl->empty_cluster = 0;
+>  	}
+>  
+> +	ffe_ctl->size_class_skipped = false;
+>  	return 1;
+>  }
+
+[ ... ]
+
+> @@ -4738,8 +4746,10 @@ static noinline int find_free_extent(struct btrfs_root *root,
+>  			goto loop;
+>  		}
+>  
+> -		if (!find_free_extent_check_size_class(ffe_ctl, block_group))
+> +		if (!find_free_extent_check_size_class(ffe_ctl, block_group)) {
+> +			ffe_ctl->size_class_skipped = true;
+>  			goto loop;
+> +		}
+>  
+>  		bg_ret = NULL;
+>  		ret = do_allocation(block_group, ffe_ctl, &bg_ret);
+
+[Severity: High]
+Can this cause find_free_extent_update_loop() to skip LOOP_WRONG_SIZE_CLASS
+and return a premature -ENOSPC when concurrent allocations of different size
+classes race?
+
+During LOOP_UNSET_SIZE_CLASS or LOOP_ALLOC_CHUNK, ffe_ctl->size_class_skipped
+has been reset to false at the end of the previous
+find_free_extent_update_loop() call. A block group with bg->size_class set to
+BTRFS_BG_SZ_NONE passes the lockless find_free_extent_check_size_class()
+check, leaving ffe_ctl->size_class_skipped as false.
+
+If two concurrent allocations with different size classes race on that
+BTRFS_BG_SZ_NONE block group, both pass find_free_extent_check_size_class()
+and allocate space in do_allocation(). In btrfs_add_reserved_bytes() ->
+btrfs_use_block_group_size_class(), the first task to acquire bg->lock sets
+bg->size_class, while the second task fails with -EAGAIN because
+force_wrong_size_class (ffe_ctl->loop >= LOOP_WRONG_SIZE_CLASS) is false:
+
+fs/btrfs/block-group.c:btrfs_use_block_group_size_class() {
+	...
+	if (bg->size_class != BTRFS_BG_SZ_NONE) {
+		if (force_wrong_size_class)
+			return 0;
+		return -EAGAIN;
+	}
+	bg->size_class = size_class;
+	return 0;
+}
+
+In find_free_extent(), the -EAGAIN path returns the free space and jumps to
+loop without setting ffe_ctl->size_class_skipped = true:
+
+fs/btrfs/extent-tree.c:find_free_extent() {
+		...
+		ret = btrfs_add_reserved_bytes(block_group, ffe_ctl->ram_bytes,
+					       ffe_ctl->num_bytes,
+					       ffe_ctl->delalloc,
+					       ffe_ctl->loop >= LOOP_WRONG_SIZE_CLASS);
+		if (ret == -EAGAIN) {
+			btrfs_add_free_space_unused(block_group,
+					ffe_ctl->found_offset,
+					ffe_ctl->num_bytes);
+			goto loop;
+		}
+}
+
+A similar situation can also happen in find_free_extent_update_loop() when a
+previous loop finishes with ffe_ctl->size_class_skipped == false (for
+instance, all existing block groups matched ffe_ctl->size_class and were
+full) while a concurrent task allocates the last remaining chunk on the
+device and assigns it a different size class. When
+find_free_extent_update_loop() skips LOOP_UNSET_SIZE_CLASS and enters
+LOOP_ALLOC_CHUNK, btrfs_chunk_alloc() returns -ENOSPC and advances
+ffe_ctl->loop directly to LOOP_WRONG_SIZE_CLASS without a search pass to set
+ffe_ctl->size_class_skipped:
+
+fs/btrfs/extent-tree.c:find_free_extent_update_loop() {
+		...
+		ret = btrfs_chunk_alloc(trans, space_info, ffe_ctl->flags,
+					CHUNK_ALLOC_FORCE_FOR_EXTENT);
+
+		/* Do not bail out on ENOSPC since we can do more. */
+		if (ret == -ENOSPC) {
+			ret = 0;
+			ffe_ctl->loop++;
+		}
+}
+
+In both cases, find_free_extent_update_loop() then sees
+ffe_ctl->loop == LOOP_WRONG_SIZE_CLASS && !ffe_ctl->size_class_skipped, skips
+LOOP_WRONG_SIZE_CLASS, and advances to LOOP_NO_EMPTY_SIZE, returning -ENOSPC
+when empty_size == 0 and empty_cluster == 0 even though a block group with a
+different size class has free space available.
+
+Should the -EAGAIN path in find_free_extent() set
+ffe_ctl->size_class_skipped = true, and should LOOP_WRONG_SIZE_CLASS still
+run when transitioning straight from a failed LOOP_ALLOC_CHUNK?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1792688736.git.boris@bur.io?part=1
+

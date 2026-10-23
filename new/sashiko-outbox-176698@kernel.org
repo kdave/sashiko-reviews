@@ -1,0 +1,63 @@
+From sashiko-bot@kernel.org Mon Oct 19 08:45:00 2026
+Message-ID: <sashiko-outbox-176698@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 5/9] btrfs: add a new 'stripe_len' parameter to
+ btrfs_stripe_nr_to_offset()
+Date: Mon, 19 Oct 2026 06:44:56 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] btrfs: missing stripe_len arg in btrfs_check_chunk_valid()
+--
+
+commit a49365cd7798457f7f4054227ba4637b04ccd8a5
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: add a new 'stripe_len' parameter to btrfs_stripe_nr_to_offset()
+
+This commit adds a stripe_len parameter to btrfs_stripe_nr_to_offset() instead
+of using the fixed BTRFS_STRIPE_LEN constant, and updates its callers across
+the btrfs subsystem.
+
+> diff --git a/fs/btrfs/volumes.h b/fs/btrfs/volumes.h
+> index 9356cec00a900..75b1179776c80 100644
+> --- a/fs/btrfs/volumes.h
+> +++ b/fs/btrfs/volumes.h
+> @@ -722,9 +722,10 @@ static inline unsigned long btrfs_chunk_item_size(int num_stripes)
+>   * @stripe_nr is u32, with left shift it can overflow u32 for chunks larger
+>   * than 4G.  This does the proper type cast to avoid overflow.
+>   */
+> -static inline u64 btrfs_stripe_nr_to_offset(u32 stripe_nr)
+> +static inline u64 btrfs_stripe_nr_to_offset(u32 stripe_nr, u32 stripe_len)
+>  {
+> -	return (u64)stripe_nr << BTRFS_STRIPE_LEN_SHIFT;
+> +	ASSERT(is_power_of_2(stripe_len) && stripe_len <= BTRFS_STRIPE_LEN);
+> +	return (u64)stripe_nr << ilog2(stripe_len);
+>  }
+>  
+>  void btrfs_get_bioc(struct btrfs_io_context *bioc);
+
+[Severity: Low]
+Does this break the build in fs/btrfs/tree-checker.c?
+
+In btrfs_check_chunk_valid(), there are still two calls to
+btrfs_stripe_nr_to_offset() passing only a single argument:
+
+fs/btrfs/tree-checker.c:btrfs_check_chunk_valid() {
+	...
+	if (unlikely(length >= btrfs_stripe_nr_to_offset(U32_MAX))) {
+		chunk_err(fs_info, leaf, chunk, logical,
+			  "chunk length too large: have %llu limit %llu",
+			  length, btrfs_stripe_nr_to_offset(U32_MAX));
+		return -EUCLEAN;
+	}
+	...
+}
+
+Should those two call sites also be updated to pass stripe_len as the second
+argument?
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1792391732.git.wqu@suse.com?part=5
+

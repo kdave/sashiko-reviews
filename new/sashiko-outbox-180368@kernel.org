@@ -1,0 +1,289 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:26:01 2026
+Message-ID: <sashiko-outbox-180368@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 20/25] btrfs: zoned: return finished relocation block
+ groups to the data space_info
+Date: Wed, 21 Oct 2026 14:25:54 +0000
+
+Thank you for your contribution! Sashiko AI review found 4 potential issue(s) to consider:
+- [High] btrfs: zoned: race when returning populated relocation block groups
+- [High] btrfs: zoned: premature clearing of BLOCK_GROUP_FLAG_ZONED_DATA_RELOC in btrfs_zoned_return_data_reloc_bgs()
+- [Medium] btrfs: zoned: finished relocation block groups left stranded in reloc_sinfo
+- [Medium] btrfs: zoned: unused reloc bg not marked unused in btrfs_zoned_return_data_reloc_bgs()
+--
+
+commit 52dab213cfce7d0fa4d279e6b1bd7d642f11fe79
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: return finished relocation block groups to the data space_info
+
+This patch adds btrfs_zoned_return_data_reloc_bgs() to move quiescent,
+non-active data relocation block groups from the data relocation
+sub-space_info back to the primary data space_info after block group
+reclaim, and reserves a new data relocation block group if needed.
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 396783c49a88f..47143c64d7637 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -2161,6 +2161,10 @@ void btrfs_reclaim_block_groups(struct btrfs_fs_info *fs_info, unsigned int limi
+>  	spin_lock(&fs_info->unused_bgs_lock);
+>  	list_splice_tail(&retry_list, &fs_info->reclaim_bgs);
+>  	spin_unlock(&fs_info->unused_bgs_lock);
+> +
+> +	btrfs_zoned_return_data_reloc_bgs(fs_info);
+
+[Severity: Medium]
+Can finished relocation block groups still be left stranded in reloc_sinfo
+when btrfs_zoned_return_data_reloc_bgs() is only called here at the end of
+btrfs_reclaim_block_groups()?
+
+First, non-reclaim data relocation paths such as btrfs_balance() ->
+__btrfs_balance(), btrfs_shrink_device(), btrfs_rm_device(), and
+btrfs_relocate_zone_kthread() also relocate data chunks via
+btrfs_relocate_chunk() -> btrfs_relocate_block_group(), allocating into
+BTRFS_SUB_GROUP_DATA_RELOC without calling
+btrfs_zoned_return_data_reloc_bgs() or btrfs_zoned_reserve_data_reloc_bg().
+
+Second, btrfs_reclaim_block_groups() returns early when
+!btrfs_should_reclaim(fs_info) (for example, when device usage is below
+fs_info->bg_reclaim_threshold or bg_reclaim_threshold is 0), and
+btrfs_reclaim_bgs() only schedules reclaim_bgs_work when
+!list_empty(&fs_info->reclaim_bgs).
+
+Third, in fs/btrfs/space-info.c:flush_space() under RECLAIM_ZONES, the
+transaction is committed only after btrfs_reclaim_block_groups() returns:
+
+	case RECLAIM_ZONES:
+		if (btrfs_is_zoned(fs_info)) {
+			flush_work(&fs_info->reclaim_bgs_work);
+			btrfs_reclaim_sweep(fs_info);
+			btrfs_delete_unused_bgs(fs_info);
+			btrfs_reclaim_block_groups(fs_info,
+						   BTRFS_ZONED_SYNC_RECLAIM_BATCH);
+			ASSERT(current->journal_info == NULL);
+			ret = btrfs_commit_current_transaction(root);
+		}
+
+If an extent in a finished relocation block group was freed or overwritten
+in the running transaction, bg->pinned is non-zero when
+btrfs_zoned_return_data_reloc_bgs() runs, so it is skipped. While stranded
+in reloc_sinfo, its remaining free space cannot be used by regular data
+allocations, BLOCK_GROUP_FLAG_ZONED_DATA_RELOC prevents
+btrfs_zone_finish_one_bg() from finishing its zone, and btrfs_statfs()
+omits its disk_used and free space.
+
+Should finished relocation block groups also be returned from non-reclaim
+relocation paths, when btrfs_should_reclaim() is false, and after
+transaction commit unpins extents?
+
+> +	btrfs_zoned_reserve_data_reloc_bg(fs_info);
+> +
+>  	btrfs_exclop_finish(fs_info);
+>  }
+>  
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 331313cf01f03..74cebb23e6ce8 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -3155,6 +3155,54 @@ void btrfs_zoned_reserve_data_reloc_bg(struct btrfs_fs_info *fs_info)
+>  	}
+>  }
+>  
+> +void btrfs_zoned_return_data_reloc_bgs(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct btrfs_space_info *data_sinfo = fs_info->data_sinfo;
+> +	struct btrfs_space_info *reloc_sinfo;
+> +
+> +	if (!btrfs_is_zoned(fs_info) || !data_sinfo)
+> +		return;
+> +
+> +	reloc_sinfo = data_sinfo->sub_group[0];
+> +	if (!reloc_sinfo || reloc_sinfo->subgroup_id != BTRFS_SUB_GROUP_DATA_RELOC)
+> +		return;
+> +
+> +again:
+> +	for (int raid = 0; raid < BTRFS_NR_RAID_TYPES; raid++) {
+> +		struct btrfs_block_group *bg;
+> +		struct btrfs_block_group *found = NULL;
+> +
+> +		down_write(&reloc_sinfo->groups_sem);
+> +		list_for_each_entry(bg, &reloc_sinfo->block_groups[raid], list) {
+> +			spin_lock(&bg->lock);
+> +			/*
+> +			 * Only return block groups that are no longer the active
+> +			 * relocation destination and are quiescent (no in-flight
+> +			 * reservations or pinned extents), so the accounting
+> +			 * transfer is exact.
+> +			 */
+> +			if (!bg->ro && !bg->reserved && !bg->pinned &&
+> +			    bg->start != READ_ONCE(fs_info->data_reloc_bg)) {
+> +				found = bg;
+> +				btrfs_get_block_group(bg);
+> +				list_del_init(&bg->list);
+> +				clear_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC,
+> +					  &bg->runtime_flags);
+
+[Severity: High]
+Is it safe to unconditionally clear BLOCK_GROUP_FLAG_ZONED_DATA_RELOC here
+on a non-empty relocation block group (bg->alloc_offset > 0)?
+
+Normally, btrfs_zoned_release_data_reloc_bg() only clears
+BLOCK_GROUP_FLAG_ZONED_DATA_RELOC when ordered-extent writeback reaches the
+end of the preallocated range:
+
+	/* All relocation extents are written. */
+	if (block_group->start + block_group->alloc_offset == logical + length) {
+		clear_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC,
+			  &block_group->runtime_flags);
+	}
+
+During relocate_file_extent_cluster() -> prealloc_file_extent_cluster() ->
+btrfs_prealloc_file_range(), do_allocation_zoned() sets
+BLOCK_GROUP_FLAG_ZONED_DATA_RELOC and advances block_group->alloc_offset,
+while btrfs_prealloc_file_range() inserts BTRFS_FILE_EXTENT_PREALLOC items
+and decrements block_group->reservations before any folio in rc->data_inode
+is dirtied or written.
+
+If a subsequent extent in the cluster does not fit in the remaining zone
+capacity, do_allocation_zoned() clears fs_info->data_reloc_bg = 0 (or
+switches to a new relocation block group). If prealloc_file_extent_cluster(),
+setup_relocation_extent_mapping(), relocate_one_folio(), or
+btrfs_fdatawrite_range() then fails or is canceled before all preallocated
+extents up to bg->alloc_offset complete writeback,
+btrfs_zoned_release_data_reloc_bg() never clears
+BLOCK_GROUP_FLAG_ZONED_DATA_RELOC on that block group.
+
+However, relocate_block_group() still commits the transaction via
+btrfs_commit_current_transaction(), which moves the preallocated bytes from
+bg->reserved to bg->used (making bg->reserved == 0), and iput(rc->data_inode)
+only queues delayed refs (which later move those bytes to bg->zone_unusable
+without resetting bg->alloc_offset).
+
+When btrfs_zoned_return_data_reloc_bgs() then sees !bg->ro && !bg->reserved
+&& !bg->pinned && bg->start != READ_ONCE(fs_info->data_reloc_bg), clearing
+BLOCK_GROUP_FLAG_ZONED_DATA_RELOC and moving bg to data_sinfo exposes a zone
+whose physical write pointer is still behind bg->alloc_offset to regular
+REQ_OP_ZONE_APPEND allocations or btrfs_zone_finish_one_bg(), causing
+btrfs_record_physical_zoned() / btrfs_rewrite_logical_zoned() to rewrite new
+extents into the unwritten preallocated range (-EEXIST) or triggering zone
+IO errors.
+
+Should non-empty block groups require
+!test_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC, &bg->runtime_flags) before
+being returned to data_sinfo?
+
+> +				spin_unlock(&bg->lock);
+> +				break;
+> +			}
+> +			spin_unlock(&bg->lock);
+> +		}
+> +		up_write(&reloc_sinfo->groups_sem);
+> +
+> +		if (found) {
+> +			zoned_move_bg_to_space_info(fs_info, found, data_sinfo);
+
+[Severity: High]
+Can migrating a populated block group via zoned_move_bg_to_space_info()
+after dropping bg->lock and reloc_sinfo->groups_sem race with concurrent
+extent freeing, zone finishing, or zone resetting and corrupt space_info
+accounting?
+
+Unlike btrfs_set_data_reloc_bg(), which only moves completely empty block
+groups (alloc_offset == 0 && used == 0), btrfs_zoned_return_data_reloc_bgs()
+moves block groups that already contain extents and remain reachable via
+fs_info->block_group_cache_tree, fs_info->zone_active_bgs, and
+fs_info->unused_bgs after list_del_init(&bg->list):
+
+1. In fs/btrfs/block-group.c:btrfs_update_block_group(), freeing an extent
+   via delayed refs looks up cache in block_group_cache_tree without
+   groups_sem and reads space_info = cache->space_info before locking:
+
+	space_info = cache->space_info;
+	factor = btrfs_bg_type_to_factor(cache->flags);
+	...
+	spin_lock(&space_info->lock);
+	spin_lock(&cache->lock);
+
+   If btrfs_update_block_group(..., alloc=false) runs after bg->lock is
+   dropped in btrfs_zoned_return_data_reloc_bgs() and before
+   zoned_move_bg_to_space_info() locks from->lock, it increments bg->pinned
+   and reloc_sinfo->bytes_pinned. Because zoned_move_bg_to_space_info()
+   does not transfer bg->pinned, unpin_extent_range() at transaction commit
+   reads cache->space_info (now data_sinfo) and decrements
+   data_sinfo->bytes_pinned, triggering WARN_ON(1) on underflow in
+   btrfs_space_info_update_bytes_pinned() and leaking
+   reloc_sinfo->bytes_pinned. Similarly, if btrfs_update_block_group() runs
+   between spin_unlock(&from->lock) in zoned_move_bg_to_space_info() and
+   spin_lock(&space_info->lock) in btrfs_add_bg_to_space_info(), bg->used
+   changes between being subtracted from reloc_sinfo and added to
+   data_sinfo.
+
+2. If found is still on fs_info->zone_active_bgs, clearing
+   BLOCK_GROUP_FLAG_ZONED_DATA_RELOC before zoned_move_bg_to_space_info()
+   allows a concurrent btrfs_zone_finish_one_bg() -> do_zone_finish() to
+   call btrfs_inc_block_group_ro() while bg->space_info is reloc_sinfo
+   (adding to reloc_sinfo->bytes_readonly, zeroing bg->zone_unusable, and
+   linking bg->ro_list into reloc_sinfo->ro_bgs) and then call
+   btrfs_dec_block_group_ro() after bg->space_info is changed to data_sinfo
+   (unlinking bg->ro_list under data_sinfo->lock and underflowing
+   data_sinfo->bytes_readonly).
+
+3. In fs/btrfs/zoned.c:zoned_reset_bg_in_place(), called from
+   btrfs_reset_unused_block_groups(), space_info = bg->space_info is cached
+   before sleeping in blkdev_zone_mgmt() without holding bg->lock or setting
+   bg->ro. If btrfs_zoned_return_data_reloc_bgs() moves bg to data_sinfo
+   while the zone reset is in flight, zoned_reset_bg_in_place() subtracts
+   *reclaimed from the stale reloc_sinfo->bytes_zone_unusable (underflowing
+   it and triggering WARN_ON(1)) while leaving
+   data_sinfo->bytes_zone_unusable inflated.
+
+> +			btrfs_put_block_group(found);
+
+[Severity: Medium]
+What happens if found is already completely unused (found->used == 0) when
+it is moved back to data_sinfo?
+
+When all extents in a retired relocation block group in reloc_sinfo are
+freed, bg->used drops to 0 while bg->pinned > 0, so
+btrfs_zoned_return_data_reloc_bgs() cannot move it until the transaction
+commits and unpin_extent_range() / __btrfs_add_free_space_zoned() (or
+btrfs_update_block_group()) queues bg on fs_info->unused_bgs via
+btrfs_mark_bg_unused().
+
+However, in cleaner_kthread(), flush_space() (RECLAIM_ZONES), and the loop
+in btrfs_reclaim_block_groups(), btrfs_delete_unused_bgs() runs before
+btrfs_zoned_return_data_reloc_bgs(). When btrfs_delete_unused_bgs() pops bg
+from fs_info->unused_bgs while bg is still the sole block group on
+reloc_sinfo->block_groups[raid], list_is_singular(&block_group->list) is
+true:
+
+		if (btrfs_is_block_group_used(block_group) ||
+		    (block_group->ro && !(block_group->flags & BTRFS_BLOCK_GROUP_REMAPPED)) ||
+		    list_is_singular(&block_group->list) ||
+
+so btrfs_delete_unused_bgs() skips bg without re-adding it to
+fs_info->unused_bgs.
+
+When btrfs_zoned_return_data_reloc_bgs() then moves found to data_sinfo, it
+is no longer singular on data_sinfo->block_groups[raid], but nothing calls
+btrfs_mark_bg_unused(found). Since found already has used == 0,
+pinned == 0, and reserved == 0, no further extent free or unpin will
+re-trigger btrfs_mark_bg_unused(found), leaving it off fs_info->unused_bgs
+so btrfs_delete_unused_bgs() and btrfs_reset_unused_block_groups() never
+reclaim it.
+
+Should btrfs_zoned_return_data_reloc_bgs() call btrfs_mark_bg_unused(found)
+when !btrfs_is_block_group_used(found)?
+
+> +			goto again;
+> +		}
+> +	}
+> +}
+> +
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=20
+

@@ -1,0 +1,175 @@
+From sashiko-bot@kernel.org Wed Oct 21 22:39:39 2026
+Message-ID: <sashiko-outbox-180644@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: send: fix missing hole punching during
+ incremental send
+Date: Wed, 21 Oct 2026 20:39:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: send: out-of-bounds read on inline extent in maybe_send_hole()
+- [High] btrfs: send: error from send_hole() overwritten in maybe_send_hole()
+- [High] btrfs: send: missing hole punch in maybe_send_hole() when num_bytes == ram_bytes
+--
+
+commit 1a9b394be254f6f4835ee215b543d01653eadf0a
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: send: fix missing hole punching during incremental send
+
+This commit teaches maybe_send_hole() to detect when the last file extent
+item in a leaf had a hole punched at its tail and the subsequent leaf is
+unchanged and shared with the parent snapshot.
+
+Link: https://lore.kernel.org/linux-btrfs/CAFoLKK+aErV4p6ZJPnVeH5SHQ5++0f=8ZgxPWe-E-CkeKBs8PA@mail.gmail.com/
+
+> diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+> index c523bf950c898..3a4d86af9ee25 100644
+> --- a/fs/btrfs/send.c
+> +++ b/fs/btrfs/send.c
+
+[ ... ]
+
+> @@ -6405,6 +6410,66 @@ static int maybe_send_hole(struct send_ctx *sctx, struct btrfs_path *path,
+>  			ret = 0;
+>  	}
+>  	sctx->cur_inode_last_extent = btrfs_file_extent_end(path);
+> +
+> +	/*
+> +	 * If we are the last file extent item in a leaf, we may have had a tail
+> +	 * section that got a hole punched, and if there is no change in the
+> +	 * next leaf, we must find out if we have such a hole and punch it.
+> +	 */
+> +	if (path->slots[0] != btrfs_header_nritems(path->nodes[0]) - 1)
+> +		return ret;
+
+[Severity: High]
+If the earlier send_hole(sctx, key->offset) call in maybe_send_hole() in
+fs/btrfs/send.c returns a negative error code:
+
+fs/btrfs/send.c:maybe_send_hole() {
+	if (sctx->cur_inode_last_extent < key->offset) {
+		ret = range_is_hole_in_parent(sctx,
+					      sctx->cur_inode_last_extent,
+					      key->offset);
+		if (ret < 0)
+			return ret;
+		else if (ret == 0)
+			ret = send_hole(sctx, key->offset);
+		else
+			ret = 0;
+	}
+	sctx->cur_inode_last_extent = btrfs_file_extent_end(path);
+
+when path->slots[0] is the last slot in the leaf and num_bytes != ram_bytes,
+execution falls through without returning that error and overwrites ret in
+btrfs_search_slot(NULL, sctx->send_root, key, next_path, 0, 0).
+
+Should maybe_send_hole() return immediately when send_hole(sctx, key->offset)
+fails with ret < 0?
+
+> +
+> +	ei = btrfs_item_ptr(path->nodes[0], path->slots[0],
+> +			    struct btrfs_file_extent_item);
+> +	num_bytes = btrfs_file_extent_num_bytes(path->nodes[0], ei);
+
+[Severity: High]
+Can ei be an inline extent when it is the last item in a leaf in
+maybe_send_hole() in fs/btrfs/send.c?
+
+In struct btrfs_file_extent_item, inline extent headers end at disk_bytenr
+(offset 21), where the inline file data payload begins, so the num_bytes
+field (at offset 45..52) does not exist for inline extents. By comparison,
+btrfs_file_extent_end() checks the extent type before reading num_bytes:
+
+fs/btrfs/file-item.c:btrfs_file_extent_end() {
+	if (btrfs_file_extent_type(leaf, fi) == BTRFS_FILE_EXTENT_INLINE)
+		end = leaf->fs_info->sectorsize;
+	else
+		end = key.offset + btrfs_file_extent_num_bytes(leaf, fi);
+
+When btrfs_file_extent_num_bytes(path->nodes[0], ei) is called on an inline
+extent in maybe_send_hole():
+
+- If the inline data is 32 bytes or larger, it reads bytes 24..31 of the
+  file data payload as num_bytes, and if that value differs from ram_bytes,
+  maybe_send_hole() proceeds and overwrites sctx->cur_inode_last_extent with
+  next_offset.
+
+- If the inline data is smaller than 32 bytes (item size < 53) and the leaf
+  has more than one item, the read goes out of bounds past the item into the
+  preceding slot's item data.
+
+- If the inline extent is the only item in the leaf (slot 0) and the item
+  size is smaller than 45 bytes (inline data < 24 bytes), member_offset is
+  at or beyond eb->len in btrfs_get_64() in fs/btrfs/accessors.c, which
+  indexes eb->folios[idx] before checking member_offset + sizeof(u64) >
+  eb->len:
+
+fs/btrfs/accessors.c:DEFINE_BTRFS_SETGET_BITS() {
+	const unsigned long member_offset = (unsigned long)ptr + off;
+	const unsigned long idx = get_eb_folio_index(eb, member_offset);
+	const unsigned long oif = get_eb_offset_in_folio(eb,
+							 member_offset);
+	char *kaddr = folio_address(eb->folios[idx]) + oif;
+	const int part = eb->folio_size - oif;
+	u8 lebytes[sizeof(u##bits)];
+
+	if (unlikely(member_offset + sizeof(u##bits) > eb->len)) {
+		report_setget_bounds(eb, ptr, off, sizeof(u##bits));
+		return 0;
+	}
+
+Should maybe_send_hole() check btrfs_file_extent_type(path->nodes[0], ei)
+and return early for inline extents before reading num_bytes?
+
+> +	ram_bytes = btrfs_file_extent_ram_bytes(path->nodes[0], ei);
+> +	if (num_bytes == ram_bytes)
+> +		return ret;
+
+[Severity: High]
+Could a hole before an unmodified shared next leaf still be missed in
+maybe_send_hole() in fs/btrfs/send.c when num_bytes == ram_bytes?
+
+Suppose in parent_root, the first leaf ends with a file extent item at
+offset 1M covering [1M, 3M), and the next leaf starts with a file extent
+item at offset 3M covering [3M, 4M).
+
+If in send_root (with no-holes) [1M, 2M) is overwritten or cloned with a new
+1M extent and [2M, 3M) is hole-punched (or [1M, 3M) is hole-punched and
+[1M, 2M) is written), btrfs_drop_extents() and insert_reserved_file_extent()
+replace the last item of the first leaf at offset 1M with a new extent
+covering [1M, 2M) that has num_bytes == 1M and ram_bytes == 1M, while the
+next leaf remains unmodified and shared with parent_root.
+
+During incremental send, btrfs_compare_trees() compares the last item of the
+first leaf in both roots (cmp == 0) and calls:
+
+  changed_cb()
+    -> changed_extent()
+      -> process_extent()
+        -> maybe_send_hole()
+
+Because num_bytes == ram_bytes on the new [1M, 2M) extent, maybe_send_hole()
+returns early without punching the hole in [2M, 3M). Then
+btrfs_compare_trees() advances both left_path and right_path out of the
+first leaf, skips the shared next leaf, and finish_inode_if_needed() calls
+get_last_extent(sctx, (u64)-1), which finds [3M, 4M) and sets
+sctx->cur_inode_last_extent = 4M, leaving the hole in [2M, 3M) unsent.
+
+> +
+> +	next_path = alloc_path_for_send();
+> +	if (!next_path)
+> +		return -ENOMEM;
+> +
+> +	ret = btrfs_search_slot(NULL, sctx->send_root, key, next_path, 0, 0);
+
+[ ... ]
+
+> +	sctx->cur_inode_last_extent = next_offset;
+> +
+>  	return ret;
+>  }
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/25a6b104e8af433508c425cd7470426470f811f2.1792613378.git.fdmanana@suse.com?part=1
+

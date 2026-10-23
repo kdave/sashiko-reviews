@@ -1,0 +1,281 @@
+From sashiko-bot@kernel.org Wed Oct 21 18:58:10 2026
+Message-ID: <sashiko-outbox-180475@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: force a transaction commit when fsyncing stripe
+ tree extents
+Date: Wed, 21 Oct 2026 16:58:06 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: missing stripe tree check in copy_items() during full-sync logging
+--
+
+commit 6ce76d55816552ec28449ba68211a5472b37a511
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: force a transaction commit when fsyncing stripe tree extents
+
+This commit forces a full transaction commit in log_one_extent() when
+logging an extent that belongs to a block group using the RAID stripe
+tree, since the RAID stripe tree is only written out during transaction
+commit and is not logged in the log tree.
+
+> diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+> index 1d9dfb63fc5a4..b758eea6ee5b4 100644
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+
+[ ... ]
+
+> @@ -5107,6 +5109,24 @@ static int log_extent_csums(struct btrfs_trans_handle *trans,
+>  	return ret;
+>  }
+>  
+> +static bool log_extent_needs_stripe_tree(struct btrfs_fs_info *fs_info,
+> +					 const struct extent_map *em)
+> +{
+> +	struct btrfs_chunk_map *map __free(btrfs_free_chunk_map) = NULL;
+> +
+> +	if (!btrfs_fs_incompat(fs_info, RAID_STRIPE_TREE))
+> +		return false;
+> +
+> +	if (em->disk_bytenr >= EXTENT_MAP_LAST_BYTE)
+> +		return false;
+> +
+> +	map = btrfs_find_chunk_map(fs_info, em->disk_bytenr, 1);
+> +	if (!map)
+> +		return false;
+> +
+> +	return btrfs_need_stripe_tree_update(fs_info, map->type);
+> +}
+> +
+>  static int log_one_extent(struct btrfs_trans_handle *trans,
+>  			  struct btrfs_inode *inode,
+>  			  const struct extent_map *em,
+> @@ -5124,6 +5144,9 @@ static int log_one_extent(struct btrfs_trans_handle *trans,
+>  	u64 block_len;
+>  	int ret;
+>  
+> +	if (log_extent_needs_stripe_tree(inode->root->fs_info, em))
+> +		return BTRFS_LOG_FORCE_COMMIT;
+> +
+
+[Severity: High]
+Does checking for RAID stripe tree extents only in log_one_extent() miss
+extents logged through copy_items()?
+
+In btrfs_log_inode(), log_one_extent() is only reached via
+btrfs_log_changed_extents() when fast_search is true. When
+BTRFS_INODE_NEEDS_FULL_SYNC is set on the inode (for example, on every
+newly created inode via btrfs_create_new_inode(), or after truncate, hole
+punching, or reflink), fast_search remains false:
+
+fs/btrfs/tree-log.c:btrfs_log_inode() {
+	...
+		if (test_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+			     &inode->runtime_flags)) {
+			if (log_mode == LOG_INODE_EXISTS) {
+				max_key.type = BTRFS_XATTR_ITEM_KEY;
+				if (ctx->logged_before)
+					ret = drop_inode_items(trans, log, path,
+							       inode, max_key.type);
+			} else {
+				clear_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+					  &inode->runtime_flags);
+				clear_bit(BTRFS_INODE_COPY_EVERYTHING,
+					  &inode->runtime_flags);
+				if (ctx->logged_before)
+					ret = truncate_inode_items(trans, log,
+								   inode, 0, 0);
+			}
+		}
+	...
+	ret = copy_inode_items_to_log(trans, inode, &min_key, &max_key,
+				      path, dst_path, logged_isize,
+				      log_mode, ctx, &need_log_inode_item);
+	...
+	if (fast_search) {
+		ret = btrfs_log_changed_extents(trans, inode, dst_path, ctx);
+		if (ret)
+			goto out_unlock;
+	} else if (log_mode == LOG_INODE_ALL) {
+		struct extent_map *em, *n;
+
+		write_lock(&em_tree->lock);
+		list_for_each_entry_safe(em, n, &em_tree->modified_extents, list)
+			list_del_init(&em->list);
+		write_unlock(&em_tree->lock);
+	}
+}
+
+In that full-sync path, btrfs_sync_file() waits for ordered extents to
+complete into the uncommitted subvolume tree and uncommitted
+fs_info->stripe_root, and then btrfs_log_inode() ->
+copy_inode_items_to_log() -> copy_items() copies new
+BTRFS_EXTENT_DATA_KEY items directly from the subvolume tree into the log
+tree without checking if the extent requires a RAID stripe tree update.
+Similarly, preallocated extents starting at or beyond i_size are skipped
+in btrfs_log_changed_extents() and logged via
+btrfs_log_prealloc_extents() -> copy_items().
+
+When btrfs_log_dentry_safe() returns 0, btrfs_sync_file() only syncs the
+log tree via btrfs_sync_log() and calls btrfs_end_transaction() without
+committing the transaction:
+
+fs/btrfs/file.c:btrfs_sync_file() {
+	...
+	if (!ret) {
+		ret = btrfs_sync_log(trans, root, &ctx);
+		if (!ret) {
+			ret = btrfs_end_transaction(trans);
+			goto out;
+		}
+	}
+}
+
+Would a crash before the transaction commits still leave those logged file
+extents without their RAID stripe tree mappings after log replay?
+
+>  	btrfs_set_stack_file_extent_generation(&fi, trans->transid);
+>  	if (em->flags & EXTENT_FLAG_PREALLOC)
+>  		btrfs_set_stack_file_extent_type(&fi, BTRFS_FILE_EXTENT_PREALLOC);
+
+[ ... ]
+
+>
+> 
+
+完美! Let's emit the final text cleanly.commit 6ce76d55816552ec28449ba68211a5472b37a511
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: force a transaction commit when fsyncing stripe tree extents
+
+This commit forces a full transaction commit in log_one_extent() when
+logging an extent that belongs to a block group using the RAID stripe
+tree, since the RAID stripe tree is only written out during transaction
+commit and is not logged in the log tree.
+
+> diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+> index 1d9dfb63fc5a4..b758eea6ee5b4 100644
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+
+[ ... ]
+
+> @@ -5107,6 +5109,24 @@ static int log_extent_csums(struct btrfs_trans_handle *trans,
+>  	return ret;
+>  }
+>  
+> +static bool log_extent_needs_stripe_tree(struct btrfs_fs_info *fs_info,
+> +					 const struct extent_map *em)
+> +{
+> +	struct btrfs_chunk_map *map __free(btrfs_free_chunk_map) = NULL;
+> +
+> +	if (!btrfs_fs_incompat(fs_info, RAID_STRIPE_TREE))
+> +		return false;
+> +
+> +	if (em->disk_bytenr >= EXTENT_MAP_LAST_BYTE)
+> +		return false;
+> +
+> +	map = btrfs_find_chunk_map(fs_info, em->disk_bytenr, 1);
+> +	if (!map)
+> +		return false;
+> +
+> +	return btrfs_need_stripe_tree_update(fs_info, map->type);
+> +}
+> +
+>  static int log_one_extent(struct btrfs_trans_handle *trans,
+>  			  struct btrfs_inode *inode,
+>  			  const struct extent_map *em,
+> @@ -5124,6 +5144,9 @@ static int log_one_extent(struct btrfs_trans_handle *trans,
+>  	u64 block_len;
+>  	int ret;
+>  
+> +	if (log_extent_needs_stripe_tree(inode->root->fs_info, em))
+> +		return BTRFS_LOG_FORCE_COMMIT;
+> +
+
+[Severity: High]
+Does checking for RAID stripe tree extents only in log_one_extent() miss
+extents logged through copy_items()?
+
+In btrfs_log_inode(), log_one_extent() is only reached via
+btrfs_log_changed_extents() when fast_search is true. When
+BTRFS_INODE_NEEDS_FULL_SYNC is set on the inode (for example, on every
+newly created inode via btrfs_create_new_inode(), or after truncate, hole
+punching, or reflink), fast_search remains false:
+
+fs/btrfs/tree-log.c:btrfs_log_inode() {
+	...
+		if (test_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+			     &inode->runtime_flags)) {
+			if (log_mode == LOG_INODE_EXISTS) {
+				max_key.type = BTRFS_XATTR_ITEM_KEY;
+				if (ctx->logged_before)
+					ret = drop_inode_items(trans, log, path,
+							       inode, max_key.type);
+			} else {
+				clear_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+					  &inode->runtime_flags);
+				clear_bit(BTRFS_INODE_COPY_EVERYTHING,
+					  &inode->runtime_flags);
+				if (ctx->logged_before)
+					ret = truncate_inode_items(trans, log,
+								   inode, 0, 0);
+			}
+		}
+	...
+	ret = copy_inode_items_to_log(trans, inode, &min_key, &max_key,
+				      path, dst_path, logged_isize,
+				      log_mode, ctx, &need_log_inode_item);
+	...
+	if (fast_search) {
+		ret = btrfs_log_changed_extents(trans, inode, dst_path, ctx);
+		if (ret)
+			goto out_unlock;
+	} else if (log_mode == LOG_INODE_ALL) {
+		struct extent_map *em, *n;
+
+		write_lock(&em_tree->lock);
+		list_for_each_entry_safe(em, n, &em_tree->modified_extents, list)
+			list_del_init(&em->list);
+		write_unlock(&em_tree->lock);
+	}
+}
+
+In that full-sync path, btrfs_sync_file() waits for ordered extents to
+complete into the uncommitted subvolume tree and uncommitted
+fs_info->stripe_root, and then btrfs_log_inode() ->
+copy_inode_items_to_log() -> copy_items() copies new
+BTRFS_EXTENT_DATA_KEY items directly from the subvolume tree into the log
+tree without checking if the extent requires a RAID stripe tree update.
+Similarly, preallocated extents starting at or beyond i_size are skipped
+in btrfs_log_changed_extents() and logged via
+btrfs_log_prealloc_extents() -> copy_items().
+
+When btrfs_log_dentry_safe() returns 0, btrfs_sync_file() only syncs the
+log tree via btrfs_sync_log() and calls btrfs_end_transaction() without
+committing the transaction:
+
+fs/btrfs/file.c:btrfs_sync_file() {
+	...
+	if (!ret) {
+		ret = btrfs_sync_log(trans, root, &ctx);
+		if (!ret) {
+			ret = btrfs_end_transaction(trans);
+			goto out;
+		}
+	}
+}
+
+Would a crash before the transaction commits still leave those logged file
+extents without their RAID stripe tree mappings after log replay?
+
+>  	btrfs_set_stack_file_extent_generation(&fi, trans->transid);
+>  	if (em->flags & EXTENT_FLAG_PREALLOC)
+>  		btrfs_set_stack_file_extent_type(&fi, BTRFS_FILE_EXTENT_PREALLOC);
+
+[ ... ]
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021164452.2439333-1-johannes.thumshirn@wdc.com?part=1
+

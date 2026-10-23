@@ -1,0 +1,123 @@
+From sashiko-bot@kernel.org Wed Oct 21 16:43:04 2026
+Message-ID: <sashiko-outbox-180355@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 05/25] btrfs: zoned: use the regular allocator for
+ conventional metadata block groups
+Date: Wed, 21 Oct 2026 14:14:39 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: premature ENOSPC in find_free_extent_update_loop() for empty_size
+--
+
+commit 75a18afc5a952ae39850f7f5ebd7bc6727577527
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: use the regular allocator for conventional metadata block groups
+
+This patch switches metadata and system block groups backed solely by
+conventional zones on zoned filesystems to use the regular free space cache
+and unclustered allocator instead of the sequential append-only allocator. It
+replaces filesystem-wide btrfs_is_zoned() checks in space accounting, free
+space tracking, and extent allocation with btrfs_zoned_bg_is_append_only().
+
+> diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+> index 9b0a5c6b96f3c..4539a775cdcc8 100644
+> --- a/fs/btrfs/extent-tree.c
+> +++ b/fs/btrfs/extent-tree.c
+
+[ ... ]
+
+> @@ -4191,11 +4191,28 @@ static int do_allocation_zoned(struct btrfs_block_group *block_group,
+>  	return ret;
+>  }
+>  
+> +/*
+> + * On a zoned filesystem ffe_ctl->policy is BTRFS_EXTENT_ALLOC_ZONED, but block
+> + * groups that are not append only are allocated from with the regular free
+> + * space cache. As prepare_allocation_zoned() does not set up a cluster, this
+> + * always ends up in find_free_extent_unclustered().
+> + */
+> +static enum btrfs_extent_allocation_policy
+> +bg_alloc_policy(const struct find_free_extent_ctl *ffe_ctl,
+> +		const struct btrfs_block_group *block_group)
+> +{
+> +	if (ffe_ctl->policy == BTRFS_EXTENT_ALLOC_ZONED &&
+> +	    !btrfs_zoned_bg_is_append_only(block_group))
+> +		return BTRFS_EXTENT_ALLOC_CLUSTERED;
+> +
+> +	return ffe_ctl->policy;
+> +}
+> +
+>  static int do_allocation(struct btrfs_block_group *block_group,
+>  			 struct find_free_extent_ctl *ffe_ctl,
+>  			 struct btrfs_block_group **bg_ret)
+>  {
+> -	switch (ffe_ctl->policy) {
+> +	switch (bg_alloc_policy(ffe_ctl, block_group)) {
+>  	case BTRFS_EXTENT_ALLOC_CLUSTERED:
+>  		return do_allocation_clustered(block_group, ffe_ctl, bg_ret);
+>  	case BTRFS_EXTENT_ALLOC_ZONED:
+
+[Severity: Medium]
+Can this cause a premature -ENOSPC when allocating metadata with a non-zero
+empty_size hint (for example during directory defragmentation via
+btrfs_ioctl_defrag() -> btrfs_defrag_root() -> btrfs_defrag_leaves() ->
+btrfs_realloc_node() -> btrfs_force_cow_block())?
+
+For conventional metadata block groups on a zoned filesystem,
+bg_alloc_policy() routes do_allocation() to do_allocation_clustered() ->
+find_free_extent_unclustered(), which requires num_bytes + empty_size of free
+space and searches for a contiguous hole of that size:
+
+fs/btrfs/extent-tree.c:find_free_extent_unclustered() {
+	...
+		if (free_space_ctl->free_space <
+		    ffe_ctl->num_bytes + ffe_ctl->empty_cluster +
+		    ffe_ctl->empty_size) {
+			ffe_ctl->total_free_space = max_t(u64,
+					ffe_ctl->total_free_space,
+					free_space_ctl->free_space);
+			spin_unlock(&free_space_ctl->tree_lock);
+			return 1;
+		}
+		spin_unlock(&free_space_ctl->tree_lock);
+	}
+
+	offset = btrfs_find_space_for_alloc(bg, ffe_ctl->search_start,
+			ffe_ctl->num_bytes, ffe_ctl->empty_size,
+			&ffe_ctl->max_extent_size);
+	...
+}
+
+However, ffe_ctl->policy itself remains BTRFS_EXTENT_ALLOC_ZONED. If the free
+space in the conventional metadata block groups is fragmented into holes
+smaller than num_bytes + empty_size (even though holes of size num_bytes are
+available) and no new metadata chunk can be allocated at LOOP_ALLOC_CHUNK,
+find_free_extent_update_loop() advances to LOOP_NO_EMPTY_SIZE and checks
+ffe_ctl->policy directly:
+
+fs/btrfs/extent-tree.c:find_free_extent_update_loop() {
+	...
+	if (ffe_ctl->loop == LOOP_NO_EMPTY_SIZE) {
+		if (ffe_ctl->policy != BTRFS_EXTENT_ALLOC_CLUSTERED)
+			return -ENOSPC;
+
+		/*
+		 * Don't loop again if we already have no empty_size and
+		 * no empty_cluster.
+		 */
+		if (ffe_ctl->empty_size == 0 && ffe_ctl->empty_cluster == 0)
+			return -ENOSPC;
+		ffe_ctl->empty_size = 0;
+		ffe_ctl->empty_cluster = 0;
+	}
+	...
+}
+
+Because ffe_ctl->policy is BTRFS_EXTENT_ALLOC_ZONED, does
+find_free_extent_update_loop() return -ENOSPC immediately instead of clearing
+ffe_ctl->empty_size to 0 and retrying the allocation for just num_bytes?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261021134124.2338902-1-johannes.thumshirn@wdc.com?part=5
+
