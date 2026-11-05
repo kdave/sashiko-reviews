@@ -1,0 +1,245 @@
+From sashiko-bot@kernel.org Wed Oct 28 19:52:25 2026
+Message-ID: <sashiko-outbox-188317@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 02/25] btrfs: zoned: don't activate conventional
+ zones of mixed block groups
+Date: Wed, 28 Oct 2026 18:52:22 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: zoned: double counting of missing stripe in active zone check
+- [High] btrfs: zoned: WP_MISSING_DEV counted as sequential in btrfs_load_block_group_zone_info()
+- [High] btrfs: zoned: active bg left on zone_active_bgs on load error
+--
+
+commit 6d88dcfd50c621f9b281305cd6ec61ae6e1fb1d3
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't activate conventional zones of mixed block groups
+
+This commit skips conventional stripes when accounting for active zones and
+reservations in btrfs_zone_activate(), call_zone_finish(), and
+btrfs_check_active_zone_reservation(). It also updates block group zone
+loading to unify active zone handling across RAID types and avoids picking
+purely conventional data block groups in btrfs_zone_finish_one_bg().
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 939206d459458..b4f92c1719aa5 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -1861,27 +1824,35 @@ int btrfs_load_block_group_by_raid_type(struct btrfs_block_group *bg,
+>  					unsigned long *active, u64 last_alloc)
+>  {
+>  	struct btrfs_fs_info *fs_info = bg->fs_info;
+> +	const unsigned int nr_active = bitmap_weight(active, map->num_stripes);
+> +	unsigned int nr_missing = 0;
+>  	u64 profile;
+>  	int ret;
+>  
+> +	/* Missing stripes are never active, ignore them when activating. */
+> +	for (int i = 0; i < map->num_stripes; i++) {
+> +		if (zone_info[i].alloc_offset == WP_MISSING_DEV)
+> +			nr_missing++;
+> +	}
+
+[Severity: High]
+Can a stripe with WP_MISSING_DEV still have its bit set in the active bitmap
+here, causing it to be counted in both nr_active and nr_missing?
+
+In btrfs_load_zone_info(), if device->bdev is present and
+device->zone_info->max_active_zones is 0, the bit is set in active before
+querying the zone state:
+
+fs/btrfs/zoned.c:btrfs_load_zone_info() {
+	...
+	/* Consider a zone as active if we can allow any number of active zones. */
+	if (!device->zone_info->max_active_zones)
+		__set_bit(zone_idx, active);
+	...
+	ret = btrfs_get_dev_zone(device, info->physical, &zone);
+	...
+	if (ret) {
+		up_read(&dev_replace->rwsem);
+		if (ret != -EIO && ret != -EOPNOTSUPP)
+			return ret;
+		info->alloc_offset = WP_MISSING_DEV;
+		return 0;
+	}
+	...
+	switch (zone.cond) {
+	case BLK_ZONE_COND_OFFLINE:
+	case BLK_ZONE_COND_READONLY:
+		...
+		info->alloc_offset = WP_MISSING_DEV;
+		break;
+}
+
+If btrfs_get_dev_zone() fails with -EIO or -EOPNOTSUPP, or if zone.cond is
+BLK_ZONE_COND_OFFLINE or BLK_ZONE_COND_READONLY, info->alloc_offset is set to
+WP_MISSING_DEV while zone_idx remains set in active.
+
+When btrfs_load_block_group_by_raid_type() subsequently checks
+nr_active + nr_missing == map->num_stripes, that stripe is counted twice. In
+a 2-stripe RAID1 block group where the other stripe is an inactive sequential
+zone, nr_active (1) + nr_missing (1) equals map->num_stripes (2), which sets
+BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE without calling btrfs_zone_activate() on the
+remaining stripe. Conversely, if the other stripe is already active,
+nr_active (2) + nr_missing (1) will not equal map->num_stripes (2).
+
+>  	profile = map->type & BTRFS_BLOCK_GROUP_PROFILE_MASK;
+>  	switch (profile) {
+>  	case 0: /* single */
+> -		ret = btrfs_load_block_group_single(bg, &zone_info[0], active);
+> +		ret = btrfs_load_block_group_single(bg, &zone_info[0]);
+>  		break;
+>  	case BTRFS_BLOCK_GROUP_DUP:
+> -		ret = btrfs_load_block_group_dup(bg, map, zone_info, active, last_alloc);
+> +		ret = btrfs_load_block_group_dup(bg, map, zone_info, last_alloc);
+>  		break;
+>  	case BTRFS_BLOCK_GROUP_RAID1:
+>  	case BTRFS_BLOCK_GROUP_RAID1C3:
+>  	case BTRFS_BLOCK_GROUP_RAID1C4:
+> -		ret = btrfs_load_block_group_raid1(bg, map, zone_info, active, last_alloc);
+> +		ret = btrfs_load_block_group_raid1(bg, map, zone_info, last_alloc);
+>  		break;
+>  	case BTRFS_BLOCK_GROUP_RAID0:
+> -		ret = btrfs_load_block_group_raid0(bg, map, zone_info, active, last_alloc);
+> +		ret = btrfs_load_block_group_raid0(bg, map, zone_info, last_alloc);
+>  		break;
+>  	case BTRFS_BLOCK_GROUP_RAID10:
+> -		ret = btrfs_load_block_group_raid10(bg, map, zone_info, active, last_alloc);
+> +		ret = btrfs_load_block_group_raid10(bg, map, zone_info, last_alloc);
+>  		break;
+>  	case BTRFS_BLOCK_GROUP_RAID5:
+>  	case BTRFS_BLOCK_GROUP_RAID6:
+> @@ -1891,6 +1862,16 @@ int btrfs_load_block_group_by_raid_type(struct btrfs_block_group *bg,
+>  		return -EINVAL;
+>  	}
+>  
+> +	if (!ret && nr_active) {
+> +		if (nr_active + nr_missing == map->num_stripes) {
+> +			set_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &bg->runtime_flags);
+> +		} else if (bg->alloc_offset < bg->zone_capacity) {
+> +			bg->meta_write_pointer = bg->start;
+> +			if (!btrfs_zone_activate(bg))
+> +				ret = -EIO;
+> +		}
+> +	}
+
+[Severity: High]
+What happens if btrfs_zone_activate(bg) succeeds here, and then one of the
+post-load checks in btrfs_load_block_group_zone_info() fails?
+
+btrfs_zone_activate() sets BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, increments the
+block group reference count, and adds bg->active_bg_list to
+fs_info->zone_active_bgs. Control then returns to
+btrfs_load_block_group_zone_info(), which runs additional checks under the
+out label:
+
+fs/btrfs/zoned.c:btrfs_load_block_group_zone_info() {
+	...
+	ret = btrfs_load_block_group_by_raid_type(cache, map, zone_info, active, last_alloc);
+
+out:
+	/* Reject non SINGLE data profiles without RST */
+	if ((map->type & BTRFS_BLOCK_GROUP_DATA) &&
+	    (map->type & BTRFS_BLOCK_GROUP_PROFILE_MASK) &&
+	    !fs_info->stripe_root) {
+		...
+		ret = -EINVAL;
+	}
+
+	if (unlikely(cache->alloc_offset > cache->zone_capacity)) {
+		...
+		ret = -EIO;
+	}
+
+	/* An extent is allocated after the write pointer */
+	if (!ret && num_conventional && last_alloc > cache->alloc_offset) {
+		...
+		ret = -EIO;
+	}
+	...
+	if (!ret) {
+		...
+	} else {
+		btrfs_free_chunk_map(cache->physical_map);
+		cache->physical_map = NULL;
+	}
+}
+
+For example, on a degraded mount with a RAID1C3 block group having an empty
+sequential stripe 0 (alloc_offset == 0, inactive), a partially written
+sequential stripe 1 (active), and a conventional stripe 2 with last_alloc > 0,
+btrfs_load_block_group_raid1() skips the write pointer mismatch check under
+DEGRADED and sets bg->alloc_offset to 0. btrfs_load_block_group_by_raid_type()
+then activates bg via btrfs_zone_activate(), after which the check
+last_alloc > cache->alloc_offset in btrfs_load_block_group_zone_info() fails
+with -EIO.
+
+In the error branch, cache->physical_map is freed and set to NULL, but cache
+remains linked on fs_info->zone_active_bgs with its active zone reservation
+and extra reference intact, which can lead to a NULL pointer dereference of
+cache->physical_map in btrfs_check_active_zone_reservation() or
+do_zone_finish().
+
+[ ... ]
+
+> @@ -1966,6 +1947,23 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	if (num_sequential > 0)
+>  		set_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &cache->runtime_flags);
+>  
+> +	if (num_conventional > 0 && num_sequential > 0) {
+> +		bool any_active = false;
+> +
+> +		for (i = 0; i < map->num_stripes; i++) {
+> +			if (zone_info[i].alloc_offset != WP_CONVENTIONAL &&
+> +			    test_bit(i, active)) {
+> +				any_active = true;
+> +				break;
+> +			}
+> +		}
+> +
+> +		for (i = 0; i < map->num_stripes; i++) {
+> +			if (zone_info[i].alloc_offset == WP_CONVENTIONAL)
+> +				assign_bit(i, active, any_active);
+> +		}
+> +	}
+
+[Severity: High]
+Does counting WP_MISSING_DEV stripes toward num_sequential misclassify a
+degraded conventional block group as a mixed block group?
+
+Just above this hunk in btrfs_load_block_group_zone_info(), every stripe whose
+alloc_offset is not WP_CONVENTIONAL increments num_sequential:
+
+	for (i = 0; i < map->num_stripes; i++) {
+		ret = btrfs_load_zone_info(fs_info, i, &zone_info[i], active, map, new);
+		if (ret)
+			goto out;
+
+		if (zone_info[i].alloc_offset == WP_CONVENTIONAL)
+			num_conventional++;
+		else
+			num_sequential++;
+	}
+
+When a block group has only conventional stripes on present devices and
+WP_MISSING_DEV on a missing device (or offline/readonly zone), num_sequential
+is incremented for the missing stripe. This sets
+BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE on cache->runtime_flags and enters the
+num_conventional > 0 && num_sequential > 0 block above.
+
+Because the WP_MISSING_DEV stripe is not marked active in the active bitmap,
+any_active evaluates to false and assign_bit() clears the active bits on the
+conventional stripes. Furthermore, because BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE is
+set on this block group, if it is activated and placed on
+fs_info->zone_active_bgs, btrfs_zone_finish_one_bg() can pick it and finish
+it even though finishing its conventional and missing stripes frees no active
+zones.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261028182111.160492-1-johannes.thumshirn@wdc.com?part=2
+

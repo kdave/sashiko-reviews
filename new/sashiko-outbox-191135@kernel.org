@@ -1,0 +1,115 @@
+From sashiko-bot@kernel.org Fri Oct 30 15:59:32 2026
+Message-ID: <sashiko-outbox-191135@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/5] btrfs: make fsync wait after pre-submission errors
+Date: Fri, 30 Oct 2026 14:59:28 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Critical] btrfs: folio writeback cleared before setting BTRFS_INODE_COW_WRITE_ERROR
+--
+
+commit 2975d96da38df5baa456ff678bf716bcebf61214
+Author: Josef Bacik <josef@toxicpanda.com>
+
+btrfs: make fsync wait after pre-submission errors
+
+This commit moves the setting of BTRFS_INODE_COW_WRITE_ERROR from
+btrfs_finish_ordered_extent() into can_finish_ordered_extent() so that
+buffered write errors occurring before bio submission also cause fast fsync
+to wait for ordered extent completion.
+
+> diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+> index df74c75d6c299..6543e99055f20 100644
+> --- a/fs/btrfs/ordered-data.c
+> +++ b/fs/btrfs/ordered-data.c
+> @@ -401,6 +401,37 @@ static bool can_finish_ordered_extent(struct btrfs_ordered_extent *ordered,
+>  	if (!uptodate)
+>  		btrfs_mark_ordered_extent_error(ordered);
+>  
+> +	/*
+> +	 * If this is a COW write it means we created new extent maps for the
+> +	 * range and they point to unwritten locations if we got an error either
+> +	 * before submitting a bio or during IO.
+> +	 *
+> +	 * We have marked the ordered extent with BTRFS_ORDERED_IOERR, and we
+> +	 * are queuing its completion once all its IO is done. During completion,
+> +	 * at btrfs_finish_one_ordered(), we will drop the extent maps for the
+> +	 * unwritten extents.
+> +	 *
+> +	 * However because completion runs in a work queue we can end up having
+> +	 * a fast fsync running before that. In the case of direct IO, once we
+> +	 * unlock the inode the fsync might start, and we queue the completion
+> +	 * before unlocking the inode. In the case of buffered IO when writeback
+> +	 * finishes (end_bbio_data_write()) we queue the completion, so if the
+> +	 * writeback was triggered by a fast fsync, the fsync might start
+> +	 * logging before ordered extent completion runs in the work queue.
+> +	 *
+> +	 * The fast fsync will log file extent items based on the extent maps it
+> +	 * finds, so if by the time it collects extent maps the ordered extent
+> +	 * completion didn't happen yet, it will log file extent items that
+> +	 * point to unwritten extents, resulting in a corruption if a crash
+> +	 * happens and the log tree is replayed. Note that a fast fsync does not
+> +	 * wait for completion of ordered extents in order to reduce latency.
+> +	 *
+> +	 * Set a flag in the inode so that the next fast fsync will wait for
+> +	 * ordered extents to complete before starting to log.
+> +	 */
+> +	if (!uptodate && !test_bit(BTRFS_ORDERED_NOCOW, &ordered->flags))
+> +		set_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags);
+
+[Severity: Critical]
+Can a concurrent fast fsync in btrfs_sync_file() still race past this check
+and log unwritten extent maps because folio writeback is cleared before
+can_finish_ordered_extent() sets BTRFS_INODE_COW_WRITE_ERROR?
+
+In fs/btrfs/file.c:btrfs_sync_file(), fast fsync waits for folio writeback
+to complete and then immediately checks BTRFS_INODE_COW_WRITE_ERROR:
+
+	ret = filemap_fdatawait_range(inode->vfs_inode.i_mapping, start, end);
+	if (ret)
+		goto out_release_extents;
+
+	if (test_and_clear_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags))
+		ret = btrfs_wait_ordered_range(inode, start, len);
+
+However, in the callers that reach can_finish_ordered_extent() on error,
+btrfs_folio_clear_writeback() is called before btrfs_mark_ordered_io_finished()
+or btrfs_finish_ordered_extent().
+
+For example, in fs/btrfs/extent_io.c:writepage_delalloc():
+
+	btrfs_folio_clear_dirty(fs_info, folio, start, len);
+	btrfs_folio_set_writeback(fs_info, folio, start, len);
+	btrfs_folio_clear_writeback(fs_info, folio, start, len);
+	btrfs_mark_ordered_io_finished(inode, start, len, false);
+
+And in fs/btrfs/extent_io.c:submit_write_sector():
+
+	btrfs_folio_clear_dirty(fs_info, folio, filepos, sectorsize);
+	btrfs_folio_set_writeback(fs_info, folio, filepos, sectorsize);
+	btrfs_folio_clear_writeback(fs_info, folio, filepos, sectorsize);
+
+	btrfs_mark_ordered_io_finished(inode, filepos, fs_info->sectorsize,
+				       false);
+
+And in fs/btrfs/extent_io.c:end_bbio_data_write():
+
+		btrfs_folio_clear_writeback(fs_info, folio, start, len);
+	}
+
+	if (error)
+		mapping_set_error(bbio->inode->vfs_inode.i_mapping, error);
+
+	btrfs_finish_ordered_extent(bbio->ordered, bbio->file_offset, bio_size, !error);
+
+Once btrfs_folio_clear_writeback() clears writeback on the folio, a
+concurrent btrfs_sync_file() can return 0 from start_ordered_ops() and
+filemap_fdatawait_range() and test BTRFS_INODE_COW_WRITE_ERROR before
+can_finish_ordered_extent() sets the mapping error and
+BTRFS_INODE_COW_WRITE_ERROR. Wouldn't btrfs_sync_file() then skip
+btrfs_wait_ordered_range() and call btrfs_log_changed_extents() while the
+unwritten extent map is still present?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261030-b4-btrfs-data-integrity-v1-0-f4d4196731e6@toxicpanda.com?part=3
+

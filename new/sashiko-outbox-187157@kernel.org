@@ -1,0 +1,168 @@
+From sashiko-bot@kernel.org Tue Oct 27 23:25:13 2026
+Message-ID: <sashiko-outbox-187157@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC PATCH 1/2] vfs: add provenance time (ptime)
+Date: Tue, 27 Oct 2026 22:25:09 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] vfs: missing immutable and append-only check for FS_XFLAG_PTIME in fileattr_set_prepare()
+- [Medium] vfs: file_attr_to_fileattr() passes unhandled FS_XFLAG_PTIME to filesystems
+- [Medium] vfs: missing timestamp_truncate() for fsx_ptime in fileattr_set_prepare()
+--
+
+commit 20e6f8abb59b281c2bb9bf462056f455a7bd764f
+Author: koraynilay <koray.fra@gmail.com>
+
+vfs: add provenance time (ptime)
+
+This commit adds provenance time (ptime) to represent when a file's contents
+were created, making it user-settable via file_setattr() with FS_XFLAG_PTIME
+and retrievable via statx() with STATX_PTIME or file_getattr().
+
+> diff --git a/fs/file_attr.c b/fs/file_attr.c
+> index 833e03810b24c..14dddd4599696 100644
+> --- a/fs/file_attr.c
+> +++ b/fs/file_attr.c
+
+[ ... ]
+
+> @@ -141,15 +143,20 @@ EXPORT_SYMBOL(copy_fsxattr_to_user);
+>  static int file_attr_to_fileattr(const struct file_attr *fattr,
+>  				 struct file_kattr *fa)
+>  {
+> -	__u64 mask = FS_XFLAGS_MASK;
+> +	__u64 mask = FS_FILE_ATTR_XFLAGS_MASK;
+>  
+>  	if (fattr->fa_xflags & ~mask)
+>  		return -EINVAL;
+>  
+> +	if (fattr->fa_pad != 0)
+> +		return -EINVAL;
+> +
+>  	fileattr_fill_xflags(fa, fattr->fa_xflags & ~FS_XFLAG_RDONLY_MASK);
+>  	fa->fsx_extsize = fattr->fa_extsize;
+>  	fa->fsx_projid = fattr->fa_projid;
+>  	fa->fsx_cowextsize = fattr->fa_cowextsize;
+> +	fa->fsx_ptime.tv_sec = fattr->fa_ptime_sec;
+> +	fa->fsx_ptime.tv_nsec = fattr->fa_ptime_nsec;
+>  
+>  	return 0;
+>  }
+
+[Severity: Medium]
+What happens when userspace calls file_setattr() with FS_XFLAG_PTIME on a
+filesystem that implements .fileattr_set() but does not support provenance
+time?
+
+In file_attr_to_fileattr(), FS_XFLAG_PTIME is allowed into fa->fsx_xflags via
+FS_FILE_ATTR_XFLAGS_MASK, and fileattr_fill_xflags() sets fa->fsx_valid = true
+and fa->flags_valid = false. When vfs_fileattr_set() then invokes
+inode->i_op->fileattr_set():
+
+1. In XFS (xfs_fileattr_set() -> xfs_ioctl_setattr_xflags()),
+   xfs_flags2diflags() and xfs_flags2diflags2() only check known XFS flags:
+
+   fs/xfs/xfs_ioctl.c:xfs_ioctl_setattr_xflags() {
+       ...
+       i_flags2 = xfs_flags2diflags2(ip, fa->fsx_xflags);
+       if (i_flags2 && !xfs_has_v3inodes(mp))
+           return -EINVAL;
+
+       ip->i_diflags = xfs_flags2diflags(ip, fa->fsx_xflags);
+       ip->i_diflags2 = i_flags2;
+       ...
+   }
+
+   This ignores FS_XFLAG_PTIME, commits the transaction (updating ctime and
+   stripping S_ISUID/S_ISGID if the caller lacks CAP_FSETID), and returns 0
+   without setting ptime.
+
+2. In ext4 (ext4_fileattr_set()) and f2fs (f2fs_fileattr_set()), only
+   fa->flags and fa->fsx_projid are inspected, so the call also succeeds and
+   silently drops fa_ptime_sec and fa_ptime_nsec.
+
+3. In FUSE, fuse_fileattr_set() takes the !fa->flags_valid branch and packs
+   fa->fsx_xflags (including FS_XFLAG_PTIME) into struct fsxattr for a
+   legacy FS_IOC_FSSETXATTR request that has no ptime field:
+
+   fs/fuse/ioctl.c:fuse_fileattr_set() {
+       ...
+       } else {
+           memset(&xfa, 0, sizeof(xfa));
+           xfa.fsx_xflags = fa->fsx_xflags;
+           xfa.fsx_extsize = fa->fsx_extsize;
+           xfa.fsx_nextents = fa->fsx_nextents;
+           xfa.fsx_projid = fa->fsx_projid;
+           xfa.fsx_cowextsize = fa->fsx_cowextsize;
+
+           err = fuse_priv_ioctl(inode, ff, FS_IOC_FSSETXATTR,
+                                 &xfa, sizeof(xfa));
+       }
+   }
+
+Should filesystems that do not support FS_XFLAG_PTIME reject it with
+-EOPNOTSUPP instead of silently succeeding or forwarding the flag over
+FS_IOC_FSSETXATTR?
+
+> @@ -232,6 +239,11 @@ static int fileattr_set_prepare(struct inode *inode,
+>  	    !S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
+>  		return -EINVAL;
+>  
+> +	/* Check provenance time's nanoseconds */
+> +	if ((fa->fsx_xflags & FS_XFLAG_PTIME) &&
+> +	    (unsigned long)fa->fsx_ptime.tv_nsec >= NSEC_PER_SEC)
+> +		return -EINVAL;
+
+[Severity: High]
+Can an unprivileged file owner bypass immutable or append-only restrictions
+to modify ptime via file_setattr()?
+
+In may_setattr(), setting explicit timestamps (ATTR_TIMES_SET) via
+utimensat() on an immutable or append-only inode is rejected with -EPERM.
+However, in fileattr_set_prepare(), the existing check only verifies whether
+FS_APPEND_FL or FS_IMMUTABLE_FL is being toggled:
+
+fs/file_attr.c:fileattr_set_prepare() {
+	if ((fa->flags ^ old_ma->flags) & (FS_APPEND_FL | FS_IMMUTABLE_FL) &&
+	    !capable(CAP_LINUX_IMMUTABLE))
+		return -EPERM;
+}
+
+If the owner of an immutable or append-only file calls file_setattr() and
+keeps the file's existing FS_XFLAG_IMMUTABLE or FS_XFLAG_APPEND flag in
+fa_xflags while also passing FS_XFLAG_PTIME, fileattr_set_prepare() allows
+the operation to proceed and update ptime (as well as ctime/iversion) on the
+inode.
+
+Should fileattr_set_prepare() reject FS_XFLAG_PTIME with -EPERM when
+IS_IMMUTABLE(inode) or IS_APPEND(inode) is true?
+
+[Severity: Medium]
+Should fileattr_set_prepare() also normalize fa->fsx_ptime with
+timestamp_truncate(fa->fsx_ptime, inode) when FS_XFLAG_PTIME is set?
+
+In fs/attr.c:notify_change(), user-supplied timestamps are clamped to the
+superblock's supported range [sb->s_time_min, sb->s_time_max] and truncated
+to sb->s_time_gran via timestamp_truncate():
+
+fs/attr.c:notify_change() {
+    ...
+	if (ia_valid & ATTR_ATIME_SET)
+		attr->ia_atime = timestamp_truncate(attr->ia_atime, inode);
+	else
+		attr->ia_atime = now;
+	if (ia_valid & ATTR_CTIME_SET)
+		attr->ia_ctime = timestamp_truncate(attr->ia_ctime, inode);
+	else
+		attr->ia_ctime = now;
+	if (ia_valid & ATTR_MTIME_SET)
+		attr->ia_mtime = timestamp_truncate(attr->ia_mtime, inode);
+}
+
+Without calling timestamp_truncate() in fileattr_set_prepare(), fa->fsx_ptime
+is passed directly to inode->i_op->fileattr_set() without being clamped to
+the filesystem's timestamp bounds or granularity.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027220532.736352-1-koray.fra@gmail.com?part=1
+

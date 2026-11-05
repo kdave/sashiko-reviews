@@ -1,0 +1,114 @@
+From sashiko-bot@kernel.org Sun Nov  1 07:42:30 2026
+Message-ID: <sashiko-outbox-192293@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: reject refs=0 subvolume without DEAD in
+ SUBVOL_SYNC_WAIT
+Date: Sun, 01 Nov 2026 06:42:28 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: missing BTRFS_FS_ERROR() check in btrfs_ioctl_subvol_sync()
+--
+
+commit f00fc3778b8359b9d241572719fa32cdd4269fe1
+Author: Cheng Yongkang <teel4res@gmail.com>
+
+btrfs: reject refs=0 subvolume without DEAD in SUBVOL_SYNC_WAIT
+
+This commit replaces the BTRFS_ROOT_SUBVOL_DEAD assertion in
+btrfs_ioctl_subvol_sync() with a read-only filesystem check returning -EROFS
+and an explicit check for missing BTRFS_ROOT_SUBVOL_DEAD returning -EUCLEAN.
+
+Link: https://lore.kernel.org/linux-btrfs/dd97efe9-91ec-495b-b698-acff1447421c@gmx.com/
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 9857d6a9d4560..5a1f2edfd8317 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -5166,8 +5166,14 @@ static int btrfs_ioctl_subvol_sync(struct btrfs_fs_info *fs_info, void __user *a
+>  			return -ENOENT;
+>  
+>  		wait_for_deletion = true;
+> -		ASSERT(root_flags & BTRFS_ROOT_SUBVOL_DEAD, "root_flags=0x%llx",
+> -		       root_flags);
+> +		if (unlikely(test_bit(BTRFS_FS_STATE_RO, &fs_info->fs_state)))
+> +			return -EROFS;
+> +		if (unlikely(!(root_flags & BTRFS_ROOT_SUBVOL_DEAD))) {
+> +			btrfs_err(fs_info,
+> +				  "subvol %llu has refs 0 without DEAD flag",
+> +				  args.subvolid);
+> +			return -EUCLEAN;
+> +		}
+
+[Severity: Medium]
+As reported by Qu Wenruo on v1 [1], is checking only BTRFS_FS_STATE_RO here
+sufficient when a concurrent filesystem error or emergency shutdown occurs, or
+should this also check BTRFS_FS_ERROR(fs_info)?
+
+In fs/btrfs/inode.c:btrfs_delete_subvolume(), after zeroing dest->root_item
+refs under fs_info->subvol_sem, it ends the transaction and clears
+BTRFS_ROOT_SUBVOL_DEAD on error before releasing subvol_sem:
+
+	ret = btrfs_end_transaction(trans);
+	inode->i_flags |= S_DEAD;
+out_release:
+	btrfs_block_rsv_release(fs_info, &block_rsv, (u64)-1, NULL);
+	if (qgroup_reserved)
+		btrfs_qgroup_free_meta_prealloc(root, qgroup_reserved);
+out_undead:
+	if (ret) {
+		spin_lock(&dest->root_item_lock);
+		root_flags = btrfs_root_flags(&dest->root_item);
+		btrfs_set_root_flags(&dest->root_item,
+				root_flags & ~BTRFS_ROOT_SUBVOL_DEAD);
+		spin_unlock(&dest->root_item_lock);
+	}
+out_up_write:
+	up_write(&fs_info->subvol_sem);
+
+However, fs/btrfs/transaction.c:__btrfs_end_transaction() returns -EROFS when
+BTRFS_FS_ERROR(info) is set without calling btrfs_set_sb_rdonly():
+
+	if (unlikely(TRANS_ABORTED(trans) || BTRFS_FS_ERROR(info))) {
+		wake_up_process(info->transaction_kthread);
+		if (TRANS_ABORTED(trans))
+			ret = trans->aborted;
+		else
+			ret = -EROFS;
+	}
+
+There are two paths where BTRFS_FS_ERROR(fs_info) is set while
+BTRFS_FS_STATE_RO is not yet set (or never set):
+
+1. In fs/btrfs/messages.c:__btrfs_handle_fs_error(), fs_info->fs_error is
+written before sleeping in btrfs_discard_stop() and before calling
+btrfs_set_sb_rdonly():
+
+	WRITE_ONCE(fs_info->fs_error, error);
+	...
+	btrfs_discard_stop(fs_info);
+
+	/* Handle error by forcing the filesystem readonly. */
+	btrfs_set_sb_rdonly(sb);
+
+2. In fs/btrfs/fs.h:btrfs_force_shutdown(), fs_info->fs_error is set to -EIO
+and BTRFS_FS_STATE_EMERGENCY_SHUTDOWN is set without setting
+BTRFS_FS_STATE_RO.
+
+If btrfs_delete_subvolume() hits BTRFS_FS_ERROR(fs_info) in
+btrfs_end_transaction() during either window, it clears BTRFS_ROOT_SUBVOL_DEAD
+and drops subvol_sem while BTRFS_FS_STATE_RO is still 0. A caller in
+btrfs_ioctl_subvol_sync() can then observe refs == 0 without
+BTRFS_ROOT_SUBVOL_DEAD while BTRFS_FS_STATE_RO is false, log a false metadata
+corruption error via btrfs_err(), and return -EUCLEAN instead of -EROFS.
+
+Additionally, if btrfs_force_shutdown() is called while
+btrfs_ioctl_subvol_sync() is waiting on an already-deleted subvolume, the
+cleaner thread cannot drop the subvolume because btrfs_start_transaction()
+fails with -EROFS when BTRFS_FS_ERROR(fs_info) is set, leaving
+btrfs_ioctl_subvol_sync() sleeping in the loop until interrupted.
+
+[1] https://lore.kernel.org/r/dd97efe9-91ec-495b-b698-acff1447421c@gmx.com
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261101062539.1744605-1-teel4res@gmail.com?part=1
+

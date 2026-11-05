@@ -1,0 +1,96 @@
+From sashiko-bot@kernel.org Tue Nov  3 20:59:42 2026
+Message-ID: <sashiko-outbox-195950@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 RESEND 5/6] btrfs: add btrfs_compress_typelevel2str()
+ helper
+Date: Tue, 03 Nov 2026 19:59:37 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Low] btrfs: uninitialized prop_compress_level passed in prop_compression_extract()
+--
+
+commit be5f73da768c71f7e601c6ad0f69ef632183cee8
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: add btrfs_compress_typelevel2str() helper
+
+This commit introduces the btrfs_compress_typelevel2str() helper to format a
+compression type and level into a string and updates
+prop_compression_extract() to use it.
+
+> diff --git a/fs/btrfs/props.c b/fs/btrfs/props.c
+> index 9427be2f28e02..3edda1f11a741 100644
+> --- a/fs/btrfs/props.c
+> +++ b/fs/btrfs/props.c
+> @@ -414,22 +414,9 @@ static bool prop_compression_ignore(const struct btrfs_inode *inode)
+>  static const char *prop_compression_extract(const struct btrfs_inode *inode,
+>  					    char *buf, size_t len)
+>  {
+> -	switch (inode->prop_compress) {
+> -	case BTRFS_COMPRESS_ZLIB:
+> -	case BTRFS_COMPRESS_LZO:
+> -	case BTRFS_COMPRESS_ZSTD:
+> -		if (inode->prop_compress_level) {
+> -			snprintf(buf, len, "%s:%d",
+> -				 btrfs_compress_type2str(inode->prop_compress),
+> -				 inode->prop_compress_level);
+> -			return buf;
+> -		}
+> -		return btrfs_compress_type2str(inode->prop_compress);
+> -	default:
+> -		break;
+> -	}
+> -
+> -	return NULL;
+> +	return btrfs_compress_typelevel2str(inode->prop_compress,
+> +					    inode->prop_compress_level,
+> +					    buf, len);
+>  }
+
+[Severity: Low]
+Can passing inode->prop_compress_level unconditionally by value to
+btrfs_compress_typelevel2str() read an uninitialized field when
+inode->prop_compress is BTRFS_COMPRESS_NONE?
+
+In fs/btrfs/inode.c, btrfs_alloc_inode() allocates struct btrfs_inode from
+btrfs_inode_cachep (whose init_once constructor only initializes
+ei->vfs_inode) and sets ei->prop_compress without initializing
+ei->prop_compress_level:
+
+	ei->runtime_flags = 0;
+	ei->prop_compress = BTRFS_COMPRESS_NONE;
+	ei->defrag_compress = BTRFS_COMPRESS_NONE;
+
+Similarly, in fs/btrfs/props.c, when the btrfs.compression property is set to
+"no" or "none" (or reset with len == 0), prop_compression_apply() sets
+inode->prop_compress to BTRFS_COMPRESS_NONE without initializing
+inode->prop_compress_level:
+
+	/* Set NOCOMPRESS flag */
+	if ((len == 2 && strncmp("no", value, 2) == 0) ||
+	    (len == 4 && strncmp("none", value, 4) == 0)) {
+		inode->flags |= BTRFS_INODE_NOCOMPRESS;
+		inode->flags &= ~BTRFS_INODE_COMPRESS;
+		inode->prop_compress = BTRFS_COMPRESS_NONE;
+
+		return 0;
+	}
+
+When a directory has btrfs.compression set to "no" or "none",
+BTRFS_INODE_HAS_PROPS is set on the directory inode. Creating a child inode
+in that directory calls btrfs_inode_inherit_props() ->
+prop_compression_extract(), which now unconditionally loads the uninitialized
+parent->prop_compress_level and passes it by value to
+btrfs_compress_typelevel2str() (and the follow-up commit "btrfs: preserve
+btrfs.compression when setting inode flags" similarly passes
+inode->prop_compress_level from btrfs_fileattr_set() on inodes that never had
+a compression property set).
+
+While btrfs_compress_typelevel2str() switches on type first and ignores level
+for BTRFS_COMPRESS_NONE in normal builds, won't passing an uninitialized
+value as a function argument trigger a KMSAN uninit-value warning when
+CONFIG_KMSAN_CHECK_PARAM_RETVAL=y is enabled?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261103194734.598182-1-koray.fra@gmail.com?part=5
+

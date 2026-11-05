@@ -1,0 +1,99 @@
+From sashiko-bot@kernel.org Sun Nov  1 08:28:18 2026
+Message-ID: <sashiko-outbox-192309@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: handle zero num_stripes in
+ btrfs_chunk_item_size()
+Date: Sun, 01 Nov 2026 07:28:14 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: zero-stripe remapped sys chunk bypasses btrfs_check_chunk_valid()
+--
+
+commit 5e8049bba37e9ceb94665135ba96e9fac60798b9
+Author: Cheng Yongkang <teel4res@gmail.com>
+
+btrfs: handle zero num_stripes in btrfs_chunk_item_size()
+
+This commit removes ASSERT(num_stripes) from btrfs_chunk_item_size() and
+computes the chunk item size from offsetof(struct btrfs_chunk, stripe) so
+that zero-stripe system chunks in validate_sys_chunk_array() reach
+btrfs_check_chunk_valid() instead of triggering an assertion failure.
+
+Link: https://lore.kernel.org/linux-btrfs/d2ee0cc1-674e-4447-88da-d346122a43a4@suse.com/
+
+> diff --git a/fs/btrfs/volumes.h b/fs/btrfs/volumes.h
+> index d5fe5cba0c35a..891bc2432870a 100644
+> --- a/fs/btrfs/volumes.h
+> +++ b/fs/btrfs/volumes.h
+> @@ -711,9 +711,8 @@ static inline enum btrfs_map_op btrfs_op(const struct bio *bio)
+>  
+>  static inline unsigned long btrfs_chunk_item_size(int num_stripes)
+>  {
+> -	ASSERT(num_stripes);
+> -	return sizeof(struct btrfs_chunk) +
+> -		sizeof(struct btrfs_stripe) * (num_stripes - 1);
+> +	return offsetof(struct btrfs_chunk, stripe) +
+> +		sizeof(struct btrfs_stripe) * num_stripes;
+>  }
+
+[Severity: High]
+Does btrfs_check_chunk_valid() reject a zero-stripe system chunk if
+BTRFS_BLOCK_GROUP_REMAPPED is also set?
+
+In validate_sys_chunk_array(), after btrfs_chunk_item_size(0) returns 48,
+validation relies on btrfs_check_chunk_valid():
+
+fs/btrfs/disk-io.c:validate_sys_chunk_array() {
+	...
+		num_stripes = btrfs_stack_chunk_num_stripes(chunk);
+		if (unlikely(cur + btrfs_chunk_item_size(num_stripes) > sys_array_size))
+			goto short_read;
+		type = btrfs_stack_chunk_type(chunk);
+		if (unlikely(!(type & BTRFS_BLOCK_GROUP_SYSTEM))) {
+			...
+			return -EUCLEAN;
+		}
+		ret = btrfs_check_chunk_valid(fs_info, NULL, chunk, key.offset,
+					      sectorsize);
+	...
+}
+
+However, in btrfs_check_chunk_valid(), the zero-stripe checks are skipped
+when BTRFS_BLOCK_GROUP_REMAPPED is set (with
+BTRFS_FEATURE_INCOMPAT_REMAP_TREE enabled in the superblock), and neither
+validate_sys_chunk_array() nor btrfs_check_chunk_valid() forbids
+BTRFS_BLOCK_GROUP_REMAPPED on BTRFS_BLOCK_GROUP_SYSTEM (or
+BTRFS_BLOCK_GROUP_METADATA_REMAP) chunks:
+
+fs/btrfs/tree-checker.c:btrfs_check_chunk_valid() {
+	...
+	remapped = (type & BTRFS_BLOCK_GROUP_REMAPPED);
+
+	if (unlikely(!remapped && !num_stripes)) {
+		chunk_err(fs_info, leaf, chunk, logical,
+			  "invalid chunk num_stripes, have %u", num_stripes);
+		return -EUCLEAN;
+	}
+	...
+}
+
+If a crafted image has a 0-stripe system chunk with
+BTRFS_BLOCK_GROUP_SYSTEM | BTRFS_BLOCK_GROUP_REMAPPED in
+sb->sys_chunk_array, validate_sys_chunk_array() and btrfs_read_sys_array()
+accept it. When open_ctree() then calls load_super_root(chunk_root, ...)
+before init_tree_roots() -> load_important_roots() has loaded
+fs_info->remap_root->node, btrfs_map_block() calls
+btrfs_translate_remap() -> btrfs_search_slot() ->
+btrfs_read_lock_root_node() -> btrfs_root_node(), dereferencing a NULL
+root->node. Even after remap_root is loaded, a 0-stripe remapped chunk
+hitting a BTRFS_IDENTITY_REMAP_KEY entry in btrfs_translate_remap() will
+proceed in btrfs_map_block() to map_blocks_single() or map_blocks_raid0()
+and divide by map->num_stripes (0).
+
+Should btrfs_check_chunk_valid() reject BTRFS_BLOCK_GROUP_REMAPPED on
+BTRFS_BLOCK_GROUP_SYSTEM and BTRFS_BLOCK_GROUP_METADATA_REMAP chunks, or
+should validate_sys_chunk_array() also reject !num_stripes?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261101071444.1853699-1-teel4res@gmail.com?part=1
+

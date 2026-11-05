@@ -1,0 +1,167 @@
+From sashiko-bot@kernel.org Fri Oct 23 23:47:21 2026
+Message-ID: <sashiko-outbox-183264@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix race between device add and chunk allocation
+ leading to transaction abort
+Date: Fri, 23 Oct 2026 21:47:16 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] btrfs: race with btrfs_remove_bdev() in btrfs_init_new_device()
+- [High] btrfs: premature rw_devices/total_rw_bytes update in btrfs_init_new_device()
+--
+
+commit 85105820400ab48c9d256b252d4791e4922ce7a9
+Author: Stanislav Zubenko <zubenkos@external.gene.com>
+
+btrfs: fix race between device add and chunk allocation leading to transaction abort
+
+This commit defers adding a newly initialized device to fs_devices->alloc_list
+and updating free_chunk_space, space_info full flags, and per_profile_avail
+until after btrfs_add_dev_item() has inserted the device item into the chunk
+tree, preventing concurrent chunk allocations from failing with -ENOENT in
+btrfs_update_device().
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 6574939e1295b..bc8ffa7bb95dc 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -3066,15 +3066,12 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  
+>  	mutex_lock(&fs_info->chunk_mutex);
+>  	list_add_rcu(&device->dev_list, &fs_devices->devices);
+> -	list_add(&device->dev_alloc_list, &fs_devices->alloc_list);
+>  	fs_devices->num_devices++;
+>  	fs_devices->open_devices++;
+>  	fs_devices->rw_devices++;
+>  	fs_devices->total_devices++;
+>  	fs_devices->total_rw_bytes += device->total_bytes;
+
+[Severity: High]
+Should updating fs_devices->rw_devices and fs_devices->total_rw_bytes also be
+deferred along with adding the device to fs_devices->alloc_list when
+!seeding_dev?
+
+Leaving fs_devices->rw_devices incremented here while device->dev_alloc_list
+is not yet on fs_devices->alloc_list makes rw_devices equal N + 1 while
+alloc_list still has only N devices between unlocking chunk_mutex and
+re-locking it after btrfs_add_dev_item().
+
+If a filesystem is mounted in degraded mode with N == devs_min - 1 writable
+devices (for example, a 2-device raid1 filesystem with 1 writable device),
+btrfs_reduce_alloc_profile() checks fs_info->fs_devices->rw_devices:
+
+fs/btrfs/block-group.c:btrfs_reduce_alloc_profile() {
+	u64 num_devices = fs_info->fs_devices->rw_devices;
+...
+	for (raid_type = 0; raid_type < BTRFS_NR_RAID_TYPES; raid_type++) {
+		if (num_devices >= btrfs_raid_array[raid_type].devs_min)
+			allowed |= btrfs_raid_array[raid_type].bg_flag;
+	}
+}
+
+Because rw_devices is already N + 1, btrfs_reduce_alloc_profile() will not
+reduce the allocation profile. If a chunk allocation runs in this window (via
+btrfs_add_dev_item() -> btrfs_reserve_chunk_metadata() ->
+reserve_chunk_space(), a concurrent btrfs_chunk_alloc() -> do_chunk_alloc(),
+or the -ENOSPC system chunk fallback in do_chunk_alloc()),
+btrfs_create_chunk() -> gather_device_info() only finds N devices on
+fs_devices->alloc_list, causing decide_dev_extent_size() to fail with
+-ENOSPC:
+
+fs/btrfs/volumes.c:decide_dev_extent_size() {
+	if (ctl->ndevs < ctl->devs_min) {
+		...
+		return -ENOSPC;
+	}
+}
+
+That -ENOSPC failure then causes do_chunk_alloc() or btrfs_init_new_device()
+to call btrfs_abort_transaction().
+
+In the same window, calc_available_free_space() uses the unreduced profile to
+query btrfs_get_per_profile_avail(), which still reads 0 from
+per_profile_avail[] because btrfs_update_per_profile_avail() was deferred, and
+subtracts calc_effective_data_chunk_size() (which already includes the new
+device in fs_devices->total_rw_bytes) from the old available space:
+
+fs/btrfs/space-info.c:calc_available_free_space() {
+	has_per_profile = btrfs_get_per_profile_avail(fs_info, profile, &avail);
+	...
+	data_chunk_size = calc_effective_data_chunk_size(fs_info);
+	...
+	if (avail <= data_chunk_size)
+		return 0;
+	avail -= data_chunk_size;
+}
+
+Can this cause premature -ENOSPC or zeroed metadata overcommit space while
+btrfs_sysfs_add_device() and btrfs_add_dev_item() are running?
+
+[ ... ]
+
+> @@ -3134,6 +3139,13 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  		 * its fsid has been changed by btrfs_sprout_splice().
+>  		 */
+>  		btrfs_sysfs_update_sprout_fsid(fs_devices);
+> +	} else {
+> +		mutex_lock(&fs_info->chunk_mutex);
+> +		list_add(&device->dev_alloc_list, &fs_devices->alloc_list);
+> +		atomic64_add(device->total_bytes, &fs_info->free_chunk_space);
+> +		btrfs_clear_space_info_full(fs_info);
+> +		btrfs_update_per_profile_avail(fs_info);
+> +		mutex_unlock(&fs_info->chunk_mutex);
+>  	}
+
+[Severity: Critical]
+What happens if the block device is hot-removed after device_list_mutex is
+unlocked for btrfs_add_dev_item(), before reaching this else branch?
+
+Earlier in btrfs_init_new_device(), the device was added to
+fs_devices->devices with BTRFS_DEV_STATE_WRITEABLE set and
+fs_devices->rw_devices incremented from N to N + 1, while
+device->dev_alloc_list was left empty. Once device_list_mutex is dropped, a
+concurrent device removal triggers fs_bdev_mark_dead() ->
+btrfs_remove_bdev():
+
+fs/btrfs/super.c:btrfs_remove_bdev() {
+	...
+	if (test_and_clear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state)) {
+		list_del_init(&device->dev_alloc_list);
+		WARN_ON(device->fs_devices->rw_devices < 1);
+		device->fs_devices->rw_devices--;
+	}
+	...
+}
+
+Because device->dev_alloc_list was not on fs_devices->alloc_list yet,
+list_del_init(&device->dev_alloc_list) is a no-op, while
+fs_devices->rw_devices is decremented back to N and
+BTRFS_DEV_STATE_WRITEABLE is cleared.
+
+If btrfs_add_dev_item() succeeds (operating on in-memory extent buffers in the
+chunk tree), this else block then unconditionally adds device->dev_alloc_list
+to fs_devices->alloc_list without holding device_list_mutex or checking
+BTRFS_DEV_STATE_WRITEABLE. That leaves N + 1 devices on
+fs_devices->alloc_list while fs_devices->rw_devices is N.
+
+Immediately afterwards, btrfs_update_per_profile_avail() ->
+calc_one_profile_avail() allocates devices_info sized to
+fs_devices->rw_devices (N) and calls alloc_virtual_chunk():
+
+fs/btrfs/volumes.c:calc_one_profile_avail() {
+	devices_info = kzalloc_objs(*devices_info, fs_devices->rw_devices, GFP_NOFS);
+	...
+	while (!alloc_virtual_chunk(fs_info, devices_info, type, &allocated))
+		result += allocated;
+}
+
+Since alloc_virtual_chunk() iterates over fs_devices->alloc_list and writes to
+devices_info[ndevs] without checking BTRFS_DEV_STATE_WRITEABLE or bounding
+ndevs by fs_devices->rw_devices, wouldn't this write past the end of
+devices_info[] (and similarly corrupt error_unwind_device if
+btrfs_add_dev_item() fails after btrfs_remove_bdev() already decremented
+rw_devices)?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261023-btrfs-device-add-race-v1-1-90cf05e8128f@external.gene.com?part=1
+

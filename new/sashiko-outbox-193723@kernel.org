@@ -1,0 +1,235 @@
+From sashiko-bot@kernel.org Mon Nov  2 17:03:07 2026
+Message-ID: <sashiko-outbox-193723@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: zoned: reset leaked zones on read-write mount
+Date: Mon, 02 Nov 2026 16:03:04 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: zoned: unpropagated commit error in btrfs_reset_unreferenced_zones()
+- [Medium] btrfs: zoned: state desync on partial reset in btrfs_reset_unreferenced_zones()
+- [Medium] btrfs: zoned: btrfs_reset_unreferenced_zones() runs after mount allocations
+--
+
+commit 6101c4266d7924804464f3e1a05b712c0302a627
+Author: Mark Korenberg <socketpair@gmail.com>
+
+btrfs: zoned: reset leaked zones on read-write mount
+
+This commit resets non-empty sequential zones that are neither superblock log
+zones nor allocated to any chunk during read-write mount on zoned filesystems.
+It commits the current transaction under reclaim_bgs_lock before scanning
+alloc_list under chunk_mutex, and skips the pass if a device replace is
+ongoing.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index c45cda4290d5a..f3e15c575e8a4 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -3059,6 +3059,8 @@ int btrfs_start_pre_rw_mount(struct btrfs_fs_info *fs_info)
+>  	int ret;
+>  	bool rebuild_free_space_tree = false;
+>  
+> +	btrfs_reset_unreferenced_zones(fs_info);
+
+[Severity: Medium]
+Is calling btrfs_reset_unreferenced_zones() at the start of
+btrfs_start_pre_rw_mount() too late for allocations that happen earlier in
+open_ctree(), and too early for free space tree recovery?
+
+In open_ctree(), both btrfs_zoned_reserve_data_reloc_bg() and
+btrfs_replay_log() run before btrfs_start_pre_rw_mount():
+
+fs/btrfs/disk-io.c:open_ctree() {
+    ...
+	btrfs_zoned_reserve_data_reloc_bg(fs_info);
+    ...
+	if (btrfs_super_log_root(disk_super) != 0 &&
+	    !btrfs_test_opt(fs_info, NOLOGREPLAY)) {
+		btrfs_info(fs_info, "start tree-log replay");
+		ret = btrfs_replay_log(fs_info, fs_devices);
+		if (ret)
+			goto fail_qgroup;
+	}
+    ...
+	ret = btrfs_start_pre_rw_mount(fs_info);
+}
+
+If leaked zones have exhausted the remaining empty or active zones on the
+device, btrfs_zoned_reserve_data_reloc_bg() can fail to activate a zone or
+fail btrfs_chunk_alloc() on data_sinfo->sub_group[0]:
+
+fs/btrfs/zoned.c:btrfs_zoned_reserve_data_reloc_bg() {
+    ...
+	space_info = data_sinfo->sub_group[0];
+	...
+	ret = btrfs_chunk_alloc(trans, space_info, alloc_flags, CHUNK_ALLOC_FORCE);
+}
+
+When btrfs_chunk_alloc() fails due to lack of allocatable zones, it sets
+space_info->full = true on data_sinfo->sub_group[0]. Because
+btrfs_reset_unreferenced_zones() does not clear space_info->full (and
+btrfs_clear_space_info_full() only walks fs_info->space_info, not
+sub_group[]), data_sinfo->sub_group[0]->full stays latched for the rest of
+the mount and causes subsequent data relocation allocations to fail.
+Similarly, btrfs_replay_log() can fail the mount for lack of space before
+the leaked zones are reset.
+
+Conversely, when btrfs_zoned_reserve_data_reloc_bg() allocates a new chunk
+and leaves fs_info->running_transaction open, calling
+btrfs_commit_current_transaction() inside btrfs_reset_unreferenced_zones() at
+the very top of btrfs_start_pre_rw_mount() commits that transaction before
+btrfs_rebuild_free_space_tree() or btrfs_delete_free_space_tree() runs,
+flushing delayed refs against an invalid or to-be-deleted free space tree.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 1cda88332284e..56940eaf1594d 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> +void btrfs_reset_unreferenced_zones(struct btrfs_fs_info *fs_info)
+> +{
+[ ... ]
+> +	/*
+> +	 * Chunks are only removed under reclaim_bgs_lock, and their zones must
+> +	 * not be reset before the removal is committed. A relocating repair,
+> +	 * started by a read error during mount, may already have removed one in
+> +	 * the running transaction, so commit it before looking for leaked zones.
+> +	 */
+> +	mutex_lock(&fs_info->reclaim_bgs_lock);
+> +	ret = btrfs_commit_current_transaction(fs_info->tree_root);
+> +	if (ret) {
+> +		btrfs_warn(fs_info,
+> +			   "zoned: failed to commit transaction, not resetting leaked zones: %pe",
+> +			   ERR_PTR(ret));
+> +		goto out;
+> +	}
+
+[Severity: High]
+Should btrfs_reset_unreferenced_zones() propagate the error from
+btrfs_commit_current_transaction() to btrfs_start_pre_rw_mount()?
+
+If a transaction was started earlier in open_ctree() (for example by
+btrfs_zoned_reserve_data_reloc_bg() or a read-error repair) and
+btrfs_commit_current_transaction() fails here, btrfs_commit_transaction()
+aborts the transaction and calls __btrfs_handle_fs_error(), setting
+fs_info->fs_error. During initial mount, the superblock is not yet born, so
+__btrfs_handle_fs_error() returns before marking the superblock read-only:
+
+fs/btrfs/messages.c:__btrfs_handle_fs_error() {
+    ...
+	if (!(sb->s_flags & SB_BORN))
+		return;
+}
+
+If btrfs_reset_unreferenced_zones() swallows ret and none of the remaining
+steps in btrfs_start_pre_rw_mount() need to start a transaction,
+btrfs_start_pre_rw_mount() returns 0. In open_ctree(), that allows the
+read-write mount to succeed on an aborted filesystem, and in
+btrfs_remount_rw(), it proceeds to call btrfs_clear_sb_rdonly(fs_info->sb)
+after fs_info->fs_error was set:
+
+fs/btrfs/super.c:btrfs_remount_rw() {
+    ...
+	ret = btrfs_start_pre_rw_mount(fs_info);
+	if (ret)
+		return ret;
+
+	btrfs_clear_sb_rdonly(fs_info->sb);
+}
+
+> +
+> +	/*
+> +	 * Hold chunk_mutex, which also protects alloc_list, so that no chunk can
+> +	 * be allocated between checking a zone and resetting it.
+> +	 */
+> +	mutex_lock(&fs_info->chunk_mutex);
+> +	list_for_each_entry(device, &fs_devices->alloc_list, dev_alloc_list) {
+> +		struct btrfs_zoned_device_info *zinfo = device->zone_info;
+> +		u32 nr_zones;
+> +
+> +		if (!device->bdev || !zinfo || !bdev_is_zoned(device->bdev))
+> +			continue;
+> +
+> +		/* Nothing is ever allocated beyond total_bytes, leave it alone. */
+> +		nr_zones = min_t(u64, zinfo->nr_zones,
+> +				 device->total_bytes >> zinfo->zone_size_shift);
+> +
+> +		for (u32 zno = 0; zno < nr_zones; zno++) {
+> +			u32 first = zno;
+> +			u64 reset_bytes;
+> +
+> +			cond_resched();
+> +
+> +			while (zno < nr_zones && is_leaked_zone(device, zno))
+> +				zno++;
+> +			if (zno == first)
+> +				continue;
+> +
+> +			ret = btrfs_reset_device_zone(device,
+> +						      (u64)first << zinfo->zone_size_shift,
+> +						      (u64)(zno - first) << zinfo->zone_size_shift,
+> +						      &reset_bytes);
+
+[Severity: Medium]
+What happens to zinfo->empty_zones and zinfo->active_zones when a coalesced
+run of leaked zones contains both healthy leaked zones and an offline or
+read-only zone?
+
+Because is_leaked_zone() returns true for offline and read-only sequential
+zones, the inner while loop merges them with any adjacent healthy leaked
+zones into a single btrfs_reset_device_zone() call. Inside
+btrfs_reset_device_zone(), blkdev_zone_mgmt() submits a separate chained
+reset bio for each zone in the range:
+
+block/blk-zoned.c:blkdev_zone_mgmt() {
+    ...
+	while (sector < end_sector) {
+		bio = blk_next_bio(bio, bdev, 0, op | REQ_SYNC, GFP_KERNEL);
+		bio->bi_iter.bi_sector = sector;
+		sector += zone_sectors;
+
+		/* This may take a while, so be nice to others */
+		cond_resched();
+	}
+
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+}
+
+The healthy leaked zones in the run are reset on the device, while the bio
+for the offline or read-only zone fails in submit_bio_noacct() when
+!bdev_zone_mgmt_allowed() sets bi_status. When submit_bio_wait() returns an
+error for the chain, btrfs_reset_device_zone() returns early before updating
+zinfo->empty_zones and zinfo->active_zones:
+
+fs/btrfs/zoned.c:btrfs_reset_device_zone() {
+    ...
+	ret = blkdev_zone_mgmt(device->bdev, REQ_OP_ZONE_RESET,
+			       physical >> SECTOR_SHIFT, length >> SECTOR_SHIFT);
+	memalloc_nofs_restore(nofs_flags);
+	if (ret)
+		return ret;
+
+	*bytes = length;
+	while (length) {
+		btrfs_dev_set_zone_empty(device, physical);
+		btrfs_dev_clear_active_zone(device, physical);
+		physical += device->zone_info->zone_size;
+		length -= device->zone_info->zone_size;
+	}
+}
+
+In addition, when a zone bio in the chain fails synchronously in
+submit_bio_noacct(), __bio_chain_endio() propagates bi_status to the next
+bio in the chain before it completes, which causes blk_zone_mgmt_bio_endio()
+to skip blk_zone_reset_bio_endio() for the subsequent zone.
+
+Won't this leave the healthy zones in that run physically empty on the drive
+while their bits remain cleared in zinfo->empty_zones and set in
+zinfo->active_zones (leaking active_zones_left and keeping those zones
+unusable in btrfs_find_allocatable_zones()), whereas resetting one zone at a
+time would isolate any failed reset to the offline or read-only zone itself?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261102-b4-btrfs-zoned-reset-leaked-zones-v3-1-7979bda654ff@gmail.com?part=1
+

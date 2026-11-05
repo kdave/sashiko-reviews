@@ -1,0 +1,143 @@
+From sashiko-bot@kernel.org Sun Nov  1 03:10:06 2026
+Message-ID: <sashiko-outbox-192243@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC PATCH v3 4/5] exfat: make crtime user-settable using ptime
+Date: Sun, 01 Nov 2026 02:10:02 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] exfat: broken flag validation and unconditional dirtying in exfat_fileattr_set()
+- [Medium] exfat: missing exfat_forced_shutdown() check in exfat_fileattr_set()
+--
+
+commit 0f60bb24dafee9a67514d1939eca3ba221aa5276
+Author: koraynilay <koray.fra@gmail.com>
+
+exfat: make crtime user-settable using ptime
+
+This commit maps provenance time (ptime) to the exFAT file creation timestamp
+(crtime) by implementing exfat_fileattr_set() and wiring it up alongside
+updates to exfat_fileattr_get() and exfat_getattr().
+
+> diff --git a/fs/exfat/file.c b/fs/exfat/file.c
+> index 1386149916bbe..70e226cb4ab78 100644
+> --- a/fs/exfat/file.c
+> +++ b/fs/exfat/file.c
+
+[ ... ]
+
+> @@ -384,15 +384,20 @@ int exfat_getattr(const struct mnt_idmap *idmap, const struct path *path,
+
+[ ... ]
+
+>  int exfat_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+>  {
+> +	struct inode *inode = d_backing_inode(dentry);
+> +	struct exfat_inode_info *ei = EXFAT_I(inode);
+> +
+>  	/*
+>  	 * exFAT compares filenames through an upcase table, so lookup
+>  	 * is always case-insensitive. Long names are stored in UTF-16
+>  	 * with case intact; CASENONPRESERVING stays clear.
+>  	 */
+>  	fa->fsx_xflags |= FS_XFLAG_CASEFOLD;
+>  	fa->flags |= FS_CASEFOLD_FL;
+> +
+> +	fa->fsx_ptime.tv_sec = ei->i_crtime.tv_sec;
+> +	fa->fsx_ptime.tv_nsec = ei->i_crtime.tv_nsec;
+> +	fa->fsx_xflags |= FS_XFLAG_PTIME;
+> +
+>  	return 0;
+>  }
+>  
+> @@ -485,6 +495,29 @@ int exfat_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
+>  	return error;
+>  }
+>  
+> +int exfat_fileattr_set(const struct mnt_idmap *idmap, struct dentry *dentry,
+> +		      struct file_kattr *fa)
+> +{
+> +	struct inode *inode = d_backing_inode(dentry);
+> +	struct exfat_inode_info *ei = EXFAT_I(inode);
+
+[Severity: Medium]
+Should exfat_fileattr_set() check for forced shutdown before modifying the
+inode?
+
+Unlike SB_RDONLY, EXFAT_FLAGS_SHUTDOWN is stored in EXFAT_SB(sb)->s_exfat_flags
+and is not checked by the VFS in mnt_want_write(). Other mutating callbacks in
+fs/exfat/file.c, such as exfat_setattr() immediately above, check:
+
+	if (unlikely(exfat_forced_shutdown(inode->i_sb)))
+		return -EIO;
+
+Without this check, calling file_setattr(), FS_IOC_SETFLAGS, or
+FS_IOC_FSSETXATTR after EXFAT_IOC_SHUTDOWN or device removal will still return
+0, update ei->i_crtime and ctime in memory, and dirty the inode, only for
+subsequent writeback in exfat_write_inode() to fail with -EIO.
+
+> +
+> +	if (fileattr_has_fsx_mask(fa, FS_XFLAG_PTIME))
+> +		return -EOPNOTSUPP;
+> +
+> +	if (fa->flags & ~FS_CASEFOLD_FL)
+> +		return -EOPNOTSUPP;
+> +
+> +	if (fa->fsx_xflags & FS_XFLAG_PTIME) {
+> +		ei->i_crtime.tv_sec = fa->fsx_ptime.tv_sec;
+> +		ei->i_crtime.tv_nsec = fa->fsx_ptime.tv_nsec;
+> +	}
+> +
+> +	inode_set_ctime_current(inode);
+> +	mark_inode_dirty(inode);
+> +
+> +	return 0;
+> +}
+
+[Severity: Medium]
+Can exfat_fileattr_set() mishandle FS_IOC_SETFLAGS and no-op attribute updates
+here?
+
+Looking at how vfs_fileattr_set() in fs/file_attr.c prepares fa after calling
+exfat_fileattr_get():
+
+	if (fa->flags_valid) {
+		fa->fsx_xflags |= old_ma.fsx_xflags & ~FS_XFLAG_COMMON;
+		fa->fsx_extsize = old_ma.fsx_extsize;
+		fa->fsx_nextents = old_ma.fsx_nextents;
+		fa->fsx_projid = old_ma.fsx_projid;
+		fa->fsx_cowextsize = old_ma.fsx_cowextsize;
+		fa->fsx_ptime = old_ma.fsx_ptime;
+	} else {
+		fa->flags |= old_ma.flags & ~FS_COMMON_FL;
+	}
+
+There seem to be three related issues when exfat_fileattr_set() runs:
+
+1. Because exfat_fileattr_get() always reports FS_CASEFOLD_FL, if a caller
+invokes ioctl_setflags() (FS_IOC_SETFLAGS) with flags = 0 to clear
+FS_CASEFOLD_FL (for example, chattr -F), vfs_fileattr_set() leaves
+fa->flags == 0. Checking (fa->flags & ~FS_CASEFOLD_FL) only rejects unknown
+flag bits and evaluates to false when fa->flags is 0, so clearing the
+immutable FS_CASEFOLD_FL flag silently succeeds instead of returning
+-EOPNOTSUPP (i.e. fa->flags != FS_CASEFOLD_FL).
+
+2. On an FS_IOC_SETFLAGS call (fa->flags_valid is true), vfs_fileattr_set()
+copies old_ma.fsx_xflags (which always includes FS_XFLAG_PTIME from
+exfat_fileattr_get()) and old_ma.fsx_ptime into fa, and then truncates
+fa->fsx_ptime with timestamp_truncate(). Because exfat_fileattr_set() does not
+check fa->fsx_valid before testing (fa->fsx_xflags & FS_XFLAG_PTIME), a legacy
+FS_IOC_SETFLAGS call will unexpectedly overwrite ei->i_crtime.
+
+3. When FS_IOC_SETFLAGS, FS_IOC_FSSETXATTR, or file_setattr() is called
+without FS_XFLAG_PTIME set, no exFAT attributes are modified, yet
+exfat_fileattr_set() unconditionally calls inode_set_ctime_current(inode) and
+mark_inode_dirty(inode), triggering unnecessary volume dirtying and directory
+entry writeback in __exfat_write_inode().
+
+Should exfat_fileattr_set() verify that FS_CASEFOLD_FL is not being cleared,
+and only update ei->i_crtime, ctime, and dirty state when fa->fsx_valid is set
+with FS_XFLAG_PTIME?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261101015551.786044-1-koray.fra@gmail.com?part=4
+

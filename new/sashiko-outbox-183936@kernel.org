@@ -1,0 +1,105 @@
+From sashiko-bot@kernel.org Sun Oct 25 01:05:10 2026
+Message-ID: <sashiko-outbox-183936@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: validate but do not set bdev blocksize
+Date: Sat, 24 Oct 2026 23:04:58 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: TOCTOU race on blocksize validation in btrfs_open_device_deny_freeze()
+--
+
+commit 76947828930b75ce2db1a452114840d8ccf5cd2d
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: validate but do not set bdev blocksize
+
+This commit replaces set_blocksize() calls with bdev_validate_blocksize()
+when opening block devices in btrfs, avoiding inode lock acquisitions on the
+block device while still rejecting devices with logical block sizes larger
+than BTRFS_BDEV_BLOCKSIZE.
+
+Link: https://lore.kernel.org/linux-btrfs/6adcb3be.4ce6c07b.2dfc0c.0005.GAE@google.com/
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index f1305f68b1f8a..1a14554e3b7e6 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+[ ... ]
+> @@ -2935,6 +2935,14 @@ struct file *btrfs_open_device_deny_freeze(const char *path,
+>  	if (IS_ERR(probe_file))
+>  		return probe_file;
+>  
+> +	ret = bdev_validate_blocksize(file_bdev(probe_file), BTRFS_BDEV_BLOCKSIZE);
+> +	if (ret < 0) {
+> +		btrfs_err(fs_info, "device %s doesn't support blocksize %u",
+> +			  path, BTRFS_BDEV_BLOCKSIZE);
+> +		bdev_fput(probe_file);
+> +		return ERR_PTR(ret);
+> +	}
+> +
+>  	ret = bdev_deny_freeze(file_bdev(probe_file));
+>  	if (ret) {
+>  		bdev_fput(probe_file);
+> @@ -2942,7 +2950,7 @@ struct file *btrfs_open_device_deny_freeze(const char *path,
+>  	}
+>  
+>  	bdev_file = fs_bdev_file_open_by_dev(file_bdev(probe_file)->bd_dev,
+> -					     BLK_OPEN_WRITE, sb, sb);
+> +					     BLK_OPEN_WRITE, fs_info->sb, fs_info->sb);
+
+[Severity: Medium]
+In btrfs_open_device_deny_freeze(), bdev_validate_blocksize() is called on
+probe_file (which is opened with a NULL holder) before
+fs_bdev_file_open_by_dev() acquires the exclusive holder claim on the device.
+
+Previously, set_blocksize() was called in btrfs_init_new_device() and
+btrfs_init_dev_replace_tgtdev() after btrfs_open_device_deny_freeze() had
+already claimed the device with fs_info->sb as the holder.
+
+Block device logical block size reconfiguration (such as loop_set_block_size()
+via LOOP_SET_BLOCK_SIZE or loop_configure() via LOOP_CONFIGURE) serializes
+against exclusive owners using bd_prepare_to_claim():
+
+drivers/block/loop.c:loop_set_block_size() {
+	...
+	if (!(mode & BLK_OPEN_EXCL)) {
+		err = bd_prepare_to_claim(bdev, loop_set_block_size, NULL);
+		if (err)
+			return err;
+	}
+	...
+	lim = queue_limits_start_update(lo->lo_queue);
+	loop_update_limits(lo, &lim, arg);
+
+	memflags = blk_mq_freeze_queue(lo->lo_queue);
+	err = queue_limits_commit_update(lo->lo_queue, &lim);
+	loop_update_dio(lo);
+	blk_mq_unfreeze_queue(lo->lo_queue, memflags);
+
+unlock:
+	mutex_unlock(&lo->lo_mutex);
+abort_claim:
+	if (!(mode & BLK_OPEN_EXCL))
+		bd_abort_claiming(bdev, loop_set_block_size);
+	...
+}
+
+Because probe_file does not hold bdev->bd_holder, can a concurrent
+LOOP_SET_BLOCK_SIZE ioctl increase logical_block_size past
+BTRFS_BDEV_BLOCKSIZE (4096) in the window between bdev_validate_blocksize()
+and fs_bdev_file_open_by_dev()?
+
+If that happens, the device is claimed with a logical_block_size larger than
+4096, causing subsequent 4096-byte superblock writes in write_dev_supers() to
+be rejected by blk_mq_submit_bio() via bio_unaligned(). During device replace
+on a single-device filesystem in btrfs_dev_replace_start(), write_all_supers()
+will then fail with -EIO, abort the transaction, and trigger WARN_ON(ret) in
+btrfs_dev_replace_finishing(), while device addition or multi-device replace
+can commit the new device without a valid superblock on disk.
+
+Should bdev_validate_blocksize() be performed after fs_bdev_file_open_by_dev()
+has claimed the device?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/3960faa4b91ff80bc20efa9e1eb90fde2a953628.1792880281.git.wqu@suse.com?part=1
+

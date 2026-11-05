@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Wed Oct 28 19:43:08 2026
+Message-ID: <sashiko-outbox-188306@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 13/25] btrfs: zoned: wait for a running block group
+ reclaim in RECLAIM_ZONES
+Date: Wed, 28 Oct 2026 18:43:05 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: zoned: freeze_super() deadlock in flush_space() RECLAIM_ZONES
+--
+
+commit 076d9f2003fff499eb8eb51f3b4e0942458ed664
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: wait for a running block group reclaim in RECLAIM_ZONES
+
+This commit adds a flush_work(&fs_info->reclaim_bgs_work) call in
+flush_space() during the RECLAIM_ZONES flush state on zoned filesystems so
+that space reclaim waits for an in-progress background block group reclaim
+instead of bailing out early and failing reservation tickets.
+
+> diff --git a/fs/btrfs/space-info.c b/fs/btrfs/space-info.c
+> index d5a84fa97462c..bb08294cbf9af 100644
+> --- a/fs/btrfs/space-info.c
+> +++ b/fs/btrfs/space-info.c
+> @@ -913,6 +913,7 @@ static void flush_space(struct btrfs_space_info *space_info, u64 num_bytes,
+>  		break;
+>  	case RECLAIM_ZONES:
+>  		if (btrfs_is_zoned(fs_info)) {
+> +			flush_work(&fs_info->reclaim_bgs_work);
+
+[Severity: High]
+Can waiting on fs_info->reclaim_bgs_work here deadlock with freeze_super()
+when flush_space() is called from btrfs_async_reclaim_data_space()?
+
+When a zoned filesystem is under data space pressure, a buffered write or
+fallocate holds SB_FREEZE_WRITE, or a write fault in btrfs_page_mkwrite()
+holds SB_FREEZE_PAGEFAULT, and waits for a data reservation ticket while
+fs_info->async_data_reclaim_work runs:
+
+  vfs_write() / vfs_fallocate() [holds SB_FREEZE_WRITE]
+  or btrfs_page_mkwrite() [holds SB_FREEZE_PAGEFAULT]
+    -> btrfs_check_data_free_space() / btrfs_alloc_data_chunk_ondemand()
+      -> btrfs_reserve_data_bytes(..., BTRFS_RESERVE_FLUSH_DATA)
+        -> reserve_bytes()
+          -> queues fs_info->async_data_reclaim_work
+          -> wait_reserve_ticket()
+
+Meanwhile, fs_info->reclaim_bgs_work runs btrfs_reclaim_bgs_work() ->
+btrfs_reclaim_block_groups() in fs/btrfs/block-group.c, which acquires
+SB_FREEZE_WRITE unconditionally:
+
+  void btrfs_reclaim_block_groups(struct btrfs_fs_info *fs_info,
+                                  unsigned int limit)
+  {
+          ...
+          if (!btrfs_should_reclaim(fs_info))
+                  return;
+
+          guard(super_write)(fs_info->sb);
+
+          if (!btrfs_exclop_start(fs_info, BTRFS_EXCLOP_BALANCE))
+                  return;
+
+If freeze_super() runs concurrently, it waits in sb_wait_write(sb,
+SB_FREEZE_WRITE) or sb_wait_write(sb, SB_FREEZE_PAGEFAULT) for the writer or
+page fault blocked in wait_reserve_ticket() to finish, while blocking new
+sb_start_write(fs_info->sb) callers.
+
+When btrfs_async_reclaim_data_space() -> do_async_reclaim_data_space() ->
+flush_space(..., RECLAIM_ZONES, false) runs, calling
+flush_work(&fs_info->reclaim_bgs_work) (and subsequently calling
+btrfs_reclaim_block_groups() directly) before btrfs_delete_unused_bgs() has a
+chance to free unused block groups and satisfy the ticket will block in
+guard(super_write)(fs_info->sb) inside btrfs_reclaim_block_groups(). Because
+btrfs_async_reclaim_data_space() cannot complete or wake the ticket, the
+task in wait_reserve_ticket() never releases SB_FREEZE_WRITE or
+SB_FREEZE_PAGEFAULT, and freeze_super() hangs forever.
+
+Should the block group reclaim path avoid blocking on sb_start_write() when
+invoked from or waited on by async space reclaim, or use a non-blocking
+freeze protection check?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261028182111.160492-1-johannes.thumshirn@wdc.com?part=13
+

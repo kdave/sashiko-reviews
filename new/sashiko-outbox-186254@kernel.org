@@ -1,0 +1,244 @@
+From sashiko-bot@kernel.org Tue Oct 27 09:01:46 2026
+Message-ID: <sashiko-outbox-186254@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 02/25] btrfs: zoned: don't activate conventional
+ zones of mixed block groups
+Date: Tue, 27 Oct 2026 08:01:37 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: zoned: degraded mount fails when activating already-active RAID1/10 bg
+- [High] btrfs: zoned: btrfs_zone_activate() activates full sequential zones on load
+- [High] btrfs: zoned: leaked active bg on btrfs_load_block_group_zone_info() error
+--
+
+commit 7a5c2d4ff27322c14b156539ee111a20c56afa8a
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't activate conventional zones of mixed block groups
+
+This commit skips conventional stripes when activating, finishing, and
+accounting reserved active zones for zoned block groups, and centralizes
+block group activation during zone info loading. It also prevents
+btrfs_zone_finish_one_bg() from selecting data block groups that have no
+sequential zones.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index e4d173caee982..2572b3811018d 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -1558,15 +1546,6 @@ static int btrfs_load_block_group_raid1(struct btrfs_block_group *bg,
+>  				  btrfs_bg_type_to_raid_name(map->type));
+>  			return -EIO;
+>  		}
+> -		if (test_bit(0, active) != test_bit(i, active)) {
+> -			if (unlikely(!btrfs_test_opt(fs_info, DEGRADED) &&
+> -				     !btrfs_zone_activate(bg))) {
+> -				return -EIO;
+> -			}
+> -		} else {
+> -			if (test_bit(0, active))
+> -				set_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &bg->runtime_flags);
+> -		}
+>  	}
+
+[ ... ]
+
+> @@ -1891,6 +1854,16 @@ int btrfs_load_block_group_by_raid_type(struct btrfs_block_group *bg,
+>  		return -EINVAL;
+>  	}
+>  
+> +	if (!ret && !bitmap_empty(active, map->num_stripes)) {
+> +		if (bitmap_full(active, map->num_stripes)) {
+> +			set_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &bg->runtime_flags);
+> +		} else if (bg->alloc_offset < bg->zone_capacity) {
+> +			bg->meta_write_pointer = bg->start;
+> +			if (!btrfs_zone_activate(bg))
+> +				ret = -EIO;
+> +		}
+> +	}
+> +
+
+[Severity: High]
+Could this cause degraded RAID1 or RAID10 mounts to fail with -EIO when a
+surviving device has reached max_active_zones?
+
+During mount in open_ctree() -> btrfs_get_dev_zone_info_all_devices() ->
+btrfs_get_dev_zone_info(), hardware zones that are already open or closed on
+a present device are recorded in zinfo->active_zones and subtracted from
+zinfo->active_zones_left.
+
+When btrfs_read_block_groups() -> read_one_block_group() ->
+btrfs_load_block_group_zone_info() -> btrfs_load_zone_info() loads a block
+group with a missing device (or an offline/readonly zone), that stripe gets
+info->alloc_offset = WP_MISSING_DEV and its bit in the active bitmap stays 0,
+while the surviving active sequential stripe has its bit set to 1.
+
+Previously, btrfs_load_block_group_raid1() skipped WP_MISSING_DEV stripes
+before comparing active bits and also guarded btrfs_zone_activate() with
+!btrfs_test_opt(fs_info, DEGRADED):
+
+	for (i = 0; i < map->num_stripes; i++) {
+		if (zone_info[i].alloc_offset == WP_MISSING_DEV)
+			continue;
+		...
+		if (test_bit(0, active) != test_bit(i, active)) {
+			if (unlikely(!btrfs_test_opt(fs_info, DEGRADED) &&
+				     !btrfs_zone_activate(bg))) {
+				return -EIO;
+			}
+		}
+
+With the centralized check in btrfs_load_block_group_by_raid_type(),
+!bitmap_empty(active, map->num_stripes) is true and
+bitmap_full(active, map->num_stripes) is false whenever a stripe is
+WP_MISSING_DEV, so btrfs_zone_activate(bg) is called even on a DEGRADED
+mount.
+
+In btrfs_zone_activate(), atomic_read(&zinfo->active_zones_left) <= reserved
+is checked before btrfs_dev_set_active_zone() tests whether the zone is
+already marked active in zinfo->active_zones:
+
+		if (atomic_read(&zinfo->active_zones_left) <= reserved) {
+			ret = false;
+			goto out_unlock;
+		}
+
+		if (!btrfs_dev_set_active_zone(device, physical, &new)) {
+
+If the surviving device already has max_active_zones active on disk
+(active_zones_left == 0), btrfs_zone_activate() returns false even though
+the surviving stripe's zone is already active and needs no additional active
+zone slot. In addition, if WP_MISSING_DEV came from an offline or readonly
+zone on a present device (device->bdev != NULL), btrfs_zone_activate() will
+call btrfs_dev_set_active_zone() on that broken zone and consume an active
+zone slot.
+
+>  	if (ret == -EIO && profile != 0 && profile != BTRFS_BLOCK_GROUP_RAID0 &&
+>  	    profile != BTRFS_BLOCK_GROUP_RAID10) {
+>  		/*
+> @@ -1966,6 +1939,23 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	if (num_sequential > 0)
+>  		set_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &cache->runtime_flags);
+>  
+> +	if (num_conventional > 0 && num_sequential > 0) {
+> +		bool any_active = false;
+> +
+> +		for (i = 0; i < map->num_stripes; i++) {
+> +			if (zone_info[i].alloc_offset != WP_CONVENTIONAL &&
+> +			    test_bit(i, active)) {
+> +				any_active = true;
+> +				break;
+> +			}
+> +		}
+> +
+> +		for (i = 0; i < map->num_stripes; i++) {
+> +			if (zone_info[i].alloc_offset == WP_CONVENTIONAL)
+> +				assign_bit(i, active, any_active);
+> +		}
+> +	}
+> +
+>  	if (num_conventional > 0) {
+>  		ret = calculate_alloc_pointer(cache, &last_alloc, new);
+>  		if (ret) {
+> @@ -2009,6 +1999,13 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  		ret = -EIO;
+>  	}
+>  
+> +	if (!ret && num_conventional && num_sequential &&
+> +	    cache->alloc_offset > 0 && cache->alloc_offset < cache->zone_capacity) {
+> +		cache->meta_write_pointer = cache->start;
+> +		if (!btrfs_zone_activate(cache))
+> +			ret = -EIO;
+> +	}
+> +
+>  	if (!ret) {
+>  		cache->meta_write_pointer = cache->alloc_offset + cache->start;
+>  		if (test_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &cache->runtime_flags)) {
+
+[Severity: High]
+What happens to cache->active_bg_list and the active zone accounting if
+btrfs_zone_activate() succeeds in btrfs_load_block_group_by_raid_type(),
+and then a subsequent validation check under out: in
+btrfs_load_block_group_zone_info() fails?
+
+For example, on a degraded RAID1C3 or RAID1C4 mount with an active sequential
+stripe, a missing or empty sequential stripe, and a conventional stripe where
+calculate_alloc_pointer() finds last_alloc > cache->alloc_offset,
+btrfs_load_block_group_raid1() ignores the write pointer mismatch under
+DEGRADED and returns 0.
+
+Then btrfs_load_block_group_by_raid_type() sees active bits {1, 0, 1} and
+calls btrfs_zone_activate(cache), which sets active bits in
+zinfo->active_zones, decrements active_zones_left (and
+reserved_active_zones), sets BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, takes a
+reference via btrfs_get_block_group(cache), and links cache->active_bg_list
+onto fs_info->zone_active_bgs.
+
+Back in btrfs_load_block_group_zone_info() under out:, the check:
+
+	/* An extent is allocated after the write pointer */
+	if (!ret && num_conventional && last_alloc > cache->alloc_offset) {
+		btrfs_err(fs_info,
+			  "zoned: got wrong write pointer in BG %llu: %llu > %llu",
+			  logical, last_alloc, cache->alloc_offset);
+		ret = -EIO;
+	}
+
+sets ret = -EIO, and the error branch frees and zeroes cache->physical_map:
+
+	} else {
+		btrfs_free_chunk_map(cache->physical_map);
+		cache->physical_map = NULL;
+	}
+
+without removing cache from fs_info->zone_active_bgs, dropping its block
+group reference, or reverting the active zone accounting. If mounted with
+-o rescue=ibadroots, btrfs_read_block_groups() continues via fill_dummy_bgs()
+and open_ctree() then calls btrfs_check_active_zone_reservation(), which
+walks fs_info->zone_active_bgs and dereferences block_group->physical_map
+when it is NULL.
+
+> @@ -2458,6 +2455,9 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+>  		if (!device->bdev)
+>  			continue;
+>  
+> +		if (!btrfs_dev_is_sequential(device, physical))
+> +			continue;
+> +
+>  		if (zinfo->max_active_zones == 0)
+>  			continue;
+
+[Severity: High]
+Won't btrfs_zone_activate() also activate sequential stripes whose hardware
+zones are already in BLK_ZONE_COND_FULL when loading a mixed or striped
+block group?
+
+In btrfs_get_dev_zone_info(), zones in BLK_ZONE_COND_FULL are not counted as
+active in zinfo->active_zones, and btrfs_load_zone_info() leaves their bit in
+the active bitmap as 0 while setting info->alloc_offset = info->capacity.
+
+In a mixed RAID0 or RAID10 block group where a sequential stripe precedes a
+conventional stripe, the sequential stripe can already be BLK_ZONE_COND_FULL
+while the conventional stripe still has space remaining in the final stripe
+row (or after btrfs_zone_finish() / do_zone_finish() finished the sequential
+stripe on disk, leaving cache->alloc_offset at
+cache->zone_capacity - stripe_len on next mount). Similarly, in a RAID0 or
+RAID10 block group in its last stripe row, an earlier sequential stripe can
+be BLK_ZONE_COND_FULL (active bit 0) while a later sequential stripe is still
+open (active bit 1).
+
+In both cases, 0 < cache->alloc_offset < cache->zone_capacity, so
+btrfs_load_block_group_by_raid_type() or btrfs_load_block_group_zone_info()
+calls btrfs_zone_activate(). Because btrfs_zone_activate() only checks
+btrfs_dev_is_sequential(device, physical) and does not skip full sequential
+zones, it calls btrfs_dev_set_active_zone() on the BLK_ZONE_COND_FULL zone,
+either failing mount with -EIO if active_zones_left <= reserved or consuming
+zinfo->active_zones_left and zinfo->reserved_active_zones for a zone that is
+already full on hardware.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027072232.419318-1-johannes.thumshirn@wdc.com?part=2
+

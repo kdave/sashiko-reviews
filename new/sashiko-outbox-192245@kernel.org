@@ -1,0 +1,102 @@
+From sashiko-bot@kernel.org Sun Nov  1 03:19:35 2026
+Message-ID: <sashiko-outbox-192245@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC PATCH v3 1/5] vfs: add provenance time (ptime)
+Date: Sun, 01 Nov 2026 02:19:32 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] vfs: vfs_fileattr_set() sets FS_XFLAG_PTIME during FS_IOC_SETFLAGS
+--
+
+commit 64d05ef1a4ac9adaf1b611e2854bb59ee60aa4f0
+Author: koraynilay <koray.fra@gmail.com>
+
+vfs: add provenance time (ptime)
+
+This commit adds provenance time (ptime) to represent a user-settable file
+creation timestamp, exposing it via statx(2) with STATX_PTIME and through
+the file_getattr() and file_setattr() syscalls with FS_XFLAG_PTIME.
+
+> diff --git a/fs/file_attr.c b/fs/file_attr.c
+> index 833e03810b24c..c0645cb22bf35 100644
+> --- a/fs/file_attr.c
+> +++ b/fs/file_attr.c
+
+[ ... ]
+
+> @@ -232,6 +239,20 @@ static int fileattr_set_prepare(struct inode *inode,
+>  	    !S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
+>  		return -EINVAL;
+>  
+> +	if (fa->fsx_xflags & FS_XFLAG_PTIME) {
+> +		if (!(old_ma->fsx_xflags & FS_XFLAG_PTIME))
+> +			return -EOPNOTSUPP;
+> +
+> +		if ((unsigned long)fa->fsx_ptime.tv_nsec >= NSEC_PER_SEC)
+> +			return -EINVAL;
+> +
+> +		fa->fsx_ptime = timestamp_truncate(fa->fsx_ptime, inode);
+> +
+> +		if (!timespec64_equal(&old_ma->fsx_ptime, &fa->fsx_ptime) &&
+> +		    (fa->flags & old_ma->flags) & (FS_APPEND_FL | FS_IMMUTABLE_FL))
+> +			return -EPERM;
+> +	}
+> +
+>  	/*
+>  	 * It is only valid to set the DAX flag on regular files and
+>  	 * directories on filesystems.
+> @@ -293,6 +314,7 @@ int vfs_fileattr_set(const struct mnt_idmap *idmap, struct dentry *dentry,
+>  			fa->fsx_nextents = old_ma.fsx_nextents;
+>  			fa->fsx_projid = old_ma.fsx_projid;
+>  			fa->fsx_cowextsize = old_ma.fsx_cowextsize;
+> +			fa->fsx_ptime = old_ma.fsx_ptime;
+>  		} else {
+>  			fa->flags |= old_ma.flags & ~FS_COMMON_FL;
+>  		}
+
+[Severity: Medium]
+When a caller invokes FS_IOC_SETFLAGS via ioctl_setflags(),
+fileattr_fill_flags() sets fa->flags_valid = true. In vfs_fileattr_set(),
+vfs_fileattr_get() populates old_ma.fsx_xflags with FS_XFLAG_PTIME and
+old_ma.fsx_ptime with the current on-disk timestamp on filesystems that
+support ptime:
+
+	if (fa->flags_valid) {
+		fa->fsx_xflags |= old_ma.fsx_xflags & ~FS_XFLAG_COMMON;
+		...
+		fa->fsx_ptime = old_ma.fsx_ptime;
+	}
+
+Because FS_XFLAG_PTIME is not in FS_XFLAG_COMMON, this copies FS_XFLAG_PTIME
+into fa->fsx_xflags even though FS_IOC_SETFLAGS did not request a ptime
+update.
+
+As a result, fileattr_set_prepare() enters the FS_XFLAG_PTIME validation and
+truncation block on every FS_IOC_SETFLAGS call:
+
+1. On ntfs3 (introduced in "ntfs3: make crtime user-settable using ptime"),
+   nt2kernel() computes tv_sec and tv_nsec via div_s64_rem(), which yields a
+   negative tv_nsec for pre-1970 on-disk cr_time values with a non-zero
+   sub-second remainder. Unrelated FS_IOC_SETFLAGS calls on such files will
+   fail with -EINVAL at the (unsigned long)fa->fsx_ptime.tv_nsec >=
+   NSEC_PER_SEC check.
+
+2. If old_ma.fsx_ptime is modified by timestamp_truncate(fa->fsx_ptime, inode)
+   (for instance when tv_sec is at sb->s_time_min or sb->s_time_max with a
+   non-zero tv_nsec, or on exfat when timezone adjustment shifts tv_sec below
+   EXFAT_MIN_TIMESTAMP_SECS), !timespec64_equal(&old_ma->fsx_ptime,
+   &fa->fsx_ptime) becomes true. On immutable or append-only files (such as
+   when toggling FS_NODUMP_FL with CAP_LINUX_IMMUTABLE while keeping
+   FS_IMMUTABLE_FL or FS_APPEND_FL set), fileattr_set_prepare() rejects the
+   FS_IOC_SETFLAGS call with -EPERM. On mutable files, filesystem callbacks
+   that do not check !fa->flags_valid (such as ntfs_fileattr_set() and
+   exfat_fileattr_set()) will overwrite the on-disk creation time with the
+   truncated timestamp.
+
+Should vfs_fileattr_set() avoid setting FS_XFLAG_PTIME in fa->fsx_xflags (or
+should fileattr_set_prepare() and filesystem callbacks ignore FS_XFLAG_PTIME)
+when fa->flags_valid is true?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261101015551.786044-1-koray.fra@gmail.com?part=1
+

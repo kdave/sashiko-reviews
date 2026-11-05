@@ -1,0 +1,167 @@
+From sashiko-bot@kernel.org Wed Oct 28 19:48:48 2026
+Message-ID: <sashiko-outbox-188314@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 03/25] btrfs: zoned: skip the append only metadata
+ writeback path for conventional block groups
+Date: Wed, 28 Oct 2026 18:48:45 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [High] btrfs: zoned: stale append-only state for metadata bgs across dev-replace
+- [Medium] btrfs: zoned: leaked meta bg counter in btrfs_load_block_group_zone_info()
+--
+
+commit 28fa5ee2677660e3af25a3a6214b2885df392012
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: skip the append only metadata writeback path for conventional block groups
+
+This patch introduces btrfs_zoned_bg_is_append_only() and
+btrfs_zoned_meta_is_append_only() to bypass sequential metadata writeback
+serialization, active zone tracking, and freed tree block zeroout for
+metadata block groups backed only by conventional zones. It also tracks
+the number of sequential and conventional metadata block groups in
+fs_info so that btrfs_zoned_meta_is_append_only() only performs a block
+group lookup when both types are present.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index b4f92c1719aa5..8d7f05fb9942a 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2015,6 +2015,7 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	}
+>  
+>  	if (!ret) {
+> +		btrfs_zoned_account_meta_bg(cache, 1);
+>  		cache->meta_write_pointer = cache->alloc_offset + cache->start;
+>  		if (test_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &cache->runtime_flags)) {
+>  			spin_lock(&fs_info->zone_active_bgs_lock);
+
+[Severity: Medium]
+Does calling btrfs_zoned_account_meta_bg(cache, 1) here leak the counter
+in fs_info->zoned_seq_meta_bgs or fs_info->zoned_conv_meta_bgs if the
+caller fails before inserting the block group into
+fs_info->block_group_cache_tree?
+
+In both btrfs_make_block_group() (called via btrfs_chunk_alloc() ->
+do_chunk_alloc() -> create_chunk()) and read_one_block_group(), steps
+after btrfs_load_block_group_zone_info() can still fail before the block
+group is added to the cache tree:
+
+fs/btrfs/block-group.c:btrfs_make_block_group() {
+	ret = btrfs_load_block_group_zone_info(cache, true);
+	if (ret) {
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+
+	ret = exclude_super_stripes(cache);
+	if (ret) {
+		/* We may have excluded something, so call this just in case */
+		btrfs_free_excluded_extents(cache);
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+	...
+	ret = btrfs_add_new_free_space(cache, chunk_offset, chunk_offset + size, NULL);
+	btrfs_free_excluded_extents(cache);
+	if (ret) {
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+}
+
+Because the matching btrfs_zoned_account_meta_bg(block_group, -1) is only
+called in btrfs_remove_block_group() when erasing the block group from
+fs_info->block_group_cache_tree, an error in exclude_super_stripes(),
+btrfs_add_new_free_space(), or btrfs_add_block_group_cache() frees cache
+without decrementing the counter. Since create_chunk() recovers from
+btrfs_make_block_group() failure without aborting the transaction, the
+counter remains skewed for the lifetime of the mount and disables the
+fast path in btrfs_zoned_meta_is_append_only().
+
+Would it be safer to account the block group when inserting it into
+fs_info->block_group_cache_tree in btrfs_add_block_group_cache() to match
+the removal in btrfs_remove_block_group()?
+
+> diff --git a/fs/btrfs/zoned.h b/fs/btrfs/zoned.h
+> index 8e21a836f8585..3a2ca8bd68e5b 100644
+> --- a/fs/btrfs/zoned.h
+> +++ b/fs/btrfs/zoned.h
+
+[ ... ]
+
+> @@ -432,4 +439,31 @@ static inline bool btrfs_zoned_bg_is_full(const struct btrfs_block_group *bg)
+>  	return (bg->alloc_offset == bg->zone_capacity);
+>  }
+>  
+> +/*
+> + * Data is always allocated append only, even on conventional zones. Metadata
+> + * only has to be, if the block group has at least one sequential zone.
+> + */
+> +static inline bool btrfs_zoned_bg_is_append_only(const struct btrfs_block_group *bg)
+> +{
+> +	if (!btrfs_is_zoned(bg->fs_info))
+> +		return false;
+> +	if (bg->flags & BTRFS_BLOCK_GROUP_DATA)
+> +		return true;
+> +
+> +	return test_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &bg->runtime_flags);
+> +}
+
+[Severity: High]
+Can btrfs_zoned_bg_is_append_only() and btrfs_zoned_meta_is_append_only()
+return false for a metadata block group that is written to a sequential
+zone on a device-replace target device?
+
+On a zoned filesystem, btrfs_init_dev_replace_tgtdev() validates tgtdev
+via btrfs_check_device_zone_type(), which allows replacing a regular
+block device (emulated conventional zones) or a zoned device with
+conventional zones at a given offset with a zoned device that has
+sequential write required zones at that offset.
+
+However, btrfs_load_block_group_zone_info() only inspects
+map->stripes[i].dev when setting BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE and
+updating fs_info->zoned_seq_meta_bgs and fs_info->zoned_conv_meta_bgs:
+
+fs/btrfs/zoned.c:btrfs_load_block_group_zone_info() {
+	for (i = 0; i < map->num_stripes; i++) {
+		ret = btrfs_load_zone_info(fs_info, i, &zone_info[i], active, map, new);
+		if (ret)
+			goto out;
+
+		if (zone_info[i].alloc_offset == WP_CONVENTIONAL)
+			num_conventional++;
+		else
+			num_sequential++;
+	}
+
+	if (num_sequential > 0)
+		set_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &cache->runtime_flags);
+}
+
+And when device replace finishes,
+btrfs_dev_replace_update_device_in_mapping_tree() swaps srcdev with
+tgtdev in map->stripes[i].dev without updating
+BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE on the affected block groups or
+adjusting fs_info->zoned_seq_meta_bgs and fs_info->zoned_conv_meta_bgs:
+
+fs/btrfs/dev-replace.c:btrfs_dev_replace_update_device_in_mapping_tree() {
+		for (int i = 0; i < map->num_stripes; i++)
+			if (srcdev == map->stripes[i].dev)
+				map->stripes[i].dev = tgtdev;
+}
+
+If a metadata block group was backed only by conventional zones on srcdev
+but maps to a sequential zone on tgtdev, both during write duplication in
+handle_ops_on_dev_replace() and after btrfs_dev_replace_finishing()
+completes, btrfs_zoned_bg_is_append_only() and
+btrfs_zoned_meta_is_append_only() will treat the block group as
+non-append-only. As a result, btrfs_clear_buffer_dirty() will skip
+setting EXTENT_BUFFER_ZONED_ZEROOUT on freed dirty tree blocks and
+write_meta_extent_buffer() / btrfs_check_meta_write_pointer() will issue
+out-of-order writes to the sequential zone on tgtdev, causing -EIO and a
+transaction abort.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261028182111.160492-1-johannes.thumshirn@wdc.com?part=3
+

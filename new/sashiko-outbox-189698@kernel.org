@@ -1,0 +1,132 @@
+From sashiko-bot@kernel.org Thu Oct 29 17:58:17 2026
+Message-ID: <sashiko-outbox-189698@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix deadlocks with transaction commit when
+ cloning inline extents
+Date: Thu, 29 Oct 2026 16:58:10 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: unmapped gap and stuck disk_i_size when deferred inline clone fails
+--
+
+commit 29f957d3b63257a1eed807f70acf7fd56c7326b6
+Author: Melon Liu <melon1335@163.com>
+
+btrfs: fix deadlocks with transaction commit when cloning inline extents
+
+This commit avoids starting a transaction after dirtying an inline extent
+folio while the destination range is locked by starting the transaction in
+copy_inline_to_page() before creating and dirtying the folio, and updating
+i_size while the folio is locked. When the clone range extends past an inline
+extent, it defers cloning the inline extent to a second and final pass.
+
+> diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+> index d2a4101912bdb..13cf23bd9d579 100644
+> --- a/fs/btrfs/reflink.c
+> +++ b/fs/btrfs/reflink.c
+
+[ ... ]
+
+> @@ -581,6 +557,17 @@ static int btrfs_clone(struct btrfs_inode *src, struct btrfs_inode *inode,
+>  				goto out;
+>  			}
+>  
+> +			if (inline_state == CLONE_INLINE_NONE) {
+> +				const u64 inline_end = ALIGN(new_key.offset + datal,
+> +							     fs_info->sectorsize);
+> +
+> +				if (inline_end < destoff + len) {
+> +					inline_state = CLONE_INLINE_DEFERRED;
+> +					last_dest_end = inline_end;
+> +					goto next_extent;
+> +				}
+> +			}
+> +
+>  			ret = clone_copy_inline_extent(inode, path, &new_key,
+>  						       drop_start, datal, size,
+>  						       comp, buf, &trans);
+> @@ -614,6 +601,9 @@ static int btrfs_clone(struct btrfs_inode *src, struct btrfs_inode *inode,
+>  						destoff, olen, no_time_update);
+>  		if (ret)
+>  			goto out;
+> +		if (inline_state == CLONE_INLINE_LAST)
+> +			goto out;
+> +next_extent:
+>  		if (new_key.offset + datal >= destoff + len)
+>  			break;
+>  
+> @@ -663,6 +653,16 @@ static int btrfs_clone(struct btrfs_inode *src, struct btrfs_inode *inode,
+>  		ret = clone_finish_inode_update(trans, inode, destoff + len,
+>  						destoff, olen, no_time_update);
+>  	}
+> +	if (ret)
+> +		goto out;
+> +
+> +	if (inline_state == CLONE_INLINE_DEFERRED) {
+> +		inline_state = CLONE_INLINE_LAST;
+> +		btrfs_release_path(path);
+> +		last_dest_end = destoff;
+> +		prev_extent_end = off;
+> +		goto clone_extents;
+> +	}
+
+[Severity: High]
+When deferring the inline extent to a second pass while cloning into or
+beyond EOF, could a failure after later extents have been committed leave an
+unmapped gap at [destoff, inline_end) and a permanently stuck disk_i_size on
+filesystems without NO_HOLES?
+
+In the first pass (inline_state == CLONE_INLINE_NONE), btrfs_clone() skips
+[destoff, inline_end) by setting last_dest_end = inline_end without inserting
+an extent or hole item in the subvolume tree and without marking [destoff,
+inline_end) as EXTENT_DIRTY in inode->file_extent_tree.
+
+As the first pass processes the remaining range [inline_end, destoff + len),
+btrfs_replace_file_extents() inserts extent items starting at inline_end and
+clone_finish_inode_update() advances inode->vfs_inode.i_size up to
+destoff + olen:
+
+    if (endoff > vfs_inode->i_size) {
+        i_size_write(vfs_inode, endoff);
+        btrfs_inode_safe_disk_i_size_write(inode, 0);
+    }
+
+In the second pass (inline_state == CLONE_INLINE_LAST), because
+i_size_read(&inode->vfs_inode) > datal now holds in
+clone_copy_inline_extent(), it always takes the copy_to_page path into
+copy_inline_to_page(), which must reserve data and metadata space via
+btrfs_delalloc_reserve_space() and allocate a folio via
+__filemap_get_folio().
+
+If the first pass exits early after committing an extent (for example,
+returning -EINTR on fatal_signal_pending(current) or failing on a subsequent
+extent) or if the second pass fails in copy_inline_to_page() (such as -ENOSPC
+or -EDQUOT in btrfs_delalloc_reserve_space(), or -ENOMEM in
+__filemap_get_folio()), vfs_inode->i_size has already been increased past
+inline_end while [destoff, inline_end) was never populated.
+
+On filesystems without NO_HOLES (where inode->file_extent_tree is used),
+btrfs_inode_safe_disk_i_size_write() requires a contiguous EXTENT_DIRTY range
+starting at offset 0:
+
+    found = btrfs_find_contiguous_extent_bit(inode->file_extent_tree, 0, &start,
+                                             &end, EXTENT_DIRTY);
+    if (found && start == 0)
+        i_size = min(i_size, end + 1);
+    else
+        i_size = 0;
+    inode->disk_i_size = i_size;
+
+Because [destoff, inline_end) is neither backed by a hole extent item on disk
+nor marked EXTENT_DIRTY in inode->file_extent_tree, inode->disk_i_size
+remains stuck at or below destoff even though vfs_inode->i_size and extent
+items exist beyond inline_end. Subsequent expanding writes or truncates
+beyond vfs_inode->i_size pass oldsize = vfs_inode->i_size to
+btrfs_cont_expand(), which only fills holes starting from
+ALIGN(oldsize, sectorsize) and never populates [destoff, inline_end), causing
+data past destoff to be lost across inode eviction or unmount, and leaving a
+missing hole extent item after fsync log replay.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/wndmkt6m2ccakcefhqatxacusi5wypmz6rb2tvtmya4zgl6cms@ckd3pks5ikrl?part=1
+

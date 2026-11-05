@@ -1,0 +1,131 @@
+From sashiko-bot@kernel.org Wed Nov  4 10:26:18 2026
+Message-ID: <sashiko-outbox-196886@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix delayed_refs_rsv leak when realloc shrinks
+ an extent
+Date: Wed, 04 Nov 2026 08:42:10 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: delayed_refs_rsv.size underflow in update_existing_head_ref()
+--
+
+commit c26c255e167e3616e7feacd2eb252fd50bbff246
+Author: Shunbo Shi <shishunbo@cmss.chinamobile.com>
+
+btrfs: fix delayed_refs_rsv leak when realloc shrinks an extent
+
+This commit adjusts pending_csums and delayed_refs_rsv csum leaf
+reservations in update_existing_head_ref() when a freed data extent is
+reallocated with a different size before its delayed refs are processed.
+
+Link: https://lore.kernel.org/linux-btrfs/6ae88b9e.64e51036.15cf6a.0027.GAE@google.com/
+
+> diff --git a/fs/btrfs/delayed-ref.c b/fs/btrfs/delayed-ref.c
+> index 8bc1929237f70..a3e32f08dacc7 100644
+> --- a/fs/btrfs/delayed-ref.c
+> +++ b/fs/btrfs/delayed-ref.c
+> @@ -694,6 +694,34 @@ static noinline void update_existing_head_ref(struct btrfs_trans_handle *trans,
+>  		existing->must_insert_reserved = update->must_insert_reserved;
+>  		existing->owning_root = update->owning_root;
+>  
+> +		/*
+> +		 * The extent may have been reallocated with a different
+> +		 * size before its delayed refs were processed.  The csum
+> +		 * reservation was made for the old size (see
+> +		 * add_delayed_ref_head()), so adjust the accounting to the
+> +		 * new size here; otherwise the release done when
+> +		 * total_ref_mod turns non-negative below releases less than
+> +		 * what was reserved and delayed_refs_rsv leaks the
+> +		 * difference.
+> +		 */
+> +		if (existing->is_data && existing->total_ref_mod < 0 &&
+> +		    existing->num_bytes != update->num_bytes) {
+> +			u64 old_leaves = btrfs_csum_bytes_to_leaves(fs_info,
+> +							   existing->num_bytes);
+> +			u64 new_leaves = btrfs_csum_bytes_to_leaves(fs_info,
+> +							    update->num_bytes);
+> +
+> +			if (new_leaves < old_leaves)
+> +				btrfs_delayed_refs_rsv_release(fs_info, 0,
+> +						old_leaves - new_leaves);
+> +			else if (new_leaves > old_leaves)
+> +				trans->delayed_ref_csum_deletions +=
+> +					new_leaves - old_leaves;
+> +
+> +			delayed_refs->pending_csums += update->num_bytes;
+> +			delayed_refs->pending_csums -= existing->num_bytes;
+> +		}
+
+[Severity: High]
+Can this underflow fs_info->delayed_refs_rsv.size and leak
+delayed_refs_rsv.reserved when a freed data extent is reallocated at the
+same bytenr with a larger size spanning more csum leaves (new_leaves >
+old_leaves)?
+
+When btrfs_alloc_reserved_file_extent() reallocates a freed extent where
+existing->total_ref_mod == -1, init_delayed_ref_head() sets
+update->must_insert_reserved = true and update->ref_mod = 1.
+
+In update_existing_head_ref(), the new check runs before
+existing->total_ref_mod is updated:
+
+  existing->total_ref_mod == -1 (< 0)
+  new_leaves > old_leaves
+  trans->delayed_ref_csum_deletions += new_leaves - old_leaves;
+  existing->num_bytes = update->num_bytes;
+
+However, trans->delayed_ref_csum_deletions is not added to
+fs_info->delayed_refs_rsv.size until btrfs_update_delayed_refs_rsv() runs at
+the end of add_delayed_ref() after dropping delayed_refs->lock.
+
+Before update_existing_head_ref() returns, existing->total_ref_mod is
+updated from -1 to 0, which immediately triggers the release path using the
+newly updated existing->num_bytes:
+
+fs/btrfs/delayed-ref.c:update_existing_head_ref() {
+	...
+	old_ref_mod = existing->total_ref_mod;
+	existing->ref_mod += update->ref_mod;
+	existing->total_ref_mod += update->ref_mod;
+	...
+	if (existing->is_data) {
+		u64 csum_leaves =
+			btrfs_csum_bytes_to_leaves(fs_info,
+						   existing->num_bytes);
+
+		if (existing->total_ref_mod >= 0 && old_ref_mod < 0) {
+			delayed_refs->pending_csums -= existing->num_bytes;
+			btrfs_delayed_refs_rsv_release(fs_info, 0, csum_leaves);
+		}
+}
+
+Because only old_leaves was added to delayed_refs_rsv.size for this head
+ref, calling btrfs_delayed_refs_rsv_release() with new_leaves subtracts more
+bytes than were added. In block_rsv_release_bytes():
+
+fs/btrfs/block-rsv.c:block_rsv_release_bytes() {
+	...
+	block_rsv->size -= num_bytes;
+	if (block_rsv->reserved >= block_rsv->size) {
+		num_bytes = block_rsv->reserved - block_rsv->size;
+		block_rsv->reserved = block_rsv->size;
+		block_rsv->full = true;
+	} else {
+		num_bytes = 0;
+	}
+}
+
+If delayed_refs_rsv.size is smaller than the byte size of new_leaves,
+block_rsv->size wraps around as an unsigned u64, causing
+(block_rsv->reserved >= block_rsv->size) to evaluate to false and releasing
+0 bytes from delayed_refs_rsv.reserved. When btrfs_update_delayed_refs_rsv()
+then runs at the end of add_delayed_ref(), it wraps delayed_refs_rsv.size
+back around and migrates additional reserved bytes from trans->delayed_rsv
+into delayed_refs_rsv.reserved without releasing them, leaving
+delayed_refs_rsv.reserved leaked (or if other pending delayed refs prevent
+the u64 wrap-around, prematurely releasing reservations belonging to other
+delayed refs).
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261104082834.25047-1-shishunbo@cmss.chinamobile.com?part=1
+

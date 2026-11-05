@@ -1,0 +1,113 @@
+From sashiko-bot@kernel.org Tue Oct 27 09:02:58 2026
+Message-ID: <sashiko-outbox-186255@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 17/25] btrfs: zoned: factor out resetting a block
+ group in place
+Date: Tue, 27 Oct 2026 08:02:54 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: space_info mismatch in btrfs_reset_unused_block_groups()
+--
+
+commit da56a623e686d549313a2cd23030d08303b15e33
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: factor out resetting a block group in place
+
+This commit extracts the logic that resets the zones of an unused block
+group and returns its space to the space_info from
+btrfs_reset_unused_block_groups() into a zoned_reset_bg_in_place() helper.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 186f22aff4b1b..7176df0a50336 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2907,6 +2907,72 @@ void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg)
+>  	spin_unlock(&fs_info->relocation_bg_lock);
+>  }
+>  
+> +static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+> +{
+> +	struct btrfs_fs_info *fs_info = bg->fs_info;
+> +	struct btrfs_space_info *space_info = bg->space_info;
+
+[ ... ]
+
+> +	bg->free_space_ctl->free_space += *reclaimed;
+> +	btrfs_space_info_update_bytes_zone_unusable(space_info, -*reclaimed);
+> +	spin_unlock(&bg->lock);
+> +	btrfs_return_free_space(space_info, *reclaimed);
+> +	spin_unlock(&space_info->lock);
+> +
+> +	return 0;
+> +}
+
+[ ... ]
+
+> @@ -3293,65 +3357,9 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		list_del_init(&bg->bg_list);
+>  		spin_unlock(&fs_info->unused_bgs_lock);
+>  
+> -		/*
+> -		 * Since the block group is fully zone_unusable and we cannot
+> -		 * allocate from this block group anymore, we don't need to set
+> -		 * this block group read-only.
+> -		 */
+
+[ ... ]
+
+> -		bg->free_space_ctl->free_space += reclaimed;
+> -		btrfs_space_info_update_bytes_zone_unusable(space_info, -reclaimed);
+> -		spin_unlock(&bg->lock);
+> -		btrfs_return_free_space(space_info, reclaimed);
+> -		spin_unlock(&space_info->lock);
+> +		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+> +		if (ret || !reclaimed)
+>  			goto requeue;
+
+[Severity: Medium]
+Can this cause btrfs_reset_unused_block_groups() to stop reclaiming early
+without freeing space for the caller's space_info?
+
+On zoned filesystems, create_space_info() creates sub-group space_info
+instances for data relocation and tree-log that share the same
+space_info->flags as their parent primary space_info, and block groups from
+both are placed on the shared fs_info->unused_bgs list.
+
+In fs/btrfs/zoned.c, btrfs_reset_unused_block_groups() selects candidates
+from fs_info->unused_bgs by comparing flags rather than matching
+bg->space_info:
+
+	spin_lock(&fs_info->unused_bgs_lock);
+	list_for_each_entry(bg, &fs_info->unused_bgs, bg_list) {
+		if ((bg->flags & BTRFS_BLOCK_GROUP_TYPE_MASK) != space_info->flags)
+			continue;
+
+Previously, btrfs_reset_unused_block_groups() updated bytes_zone_unusable and
+called btrfs_return_free_space() on the caller-provided space_info, whereas
+zoned_reset_bg_in_place() now uses bg->space_info:
+
+	ret = zoned_reset_bg_in_place(bg, &reclaimed);
+	if (ret || !reclaimed)
+		goto requeue;
+
+	btrfs_put_block_group(bg);
+
+	if (num_bytes <= reclaimed)
+		break;
+	num_bytes -= reclaimed;
+
+When flush_space() calls btrfs_reset_unused_block_groups() for a primary
+space_info and encounters an unused block group belonging to a sub-group
+space_info (or vice versa), zoned_reset_bg_in_place() credits the reclaimed
+space and wakes tickets on bg->space_info, while
+btrfs_reset_unused_block_groups() still subtracts reclaimed from num_bytes
+and breaks out of the loop without reclaiming space for the target
+space_info.
+
+Should the loop in btrfs_reset_unused_block_groups() check
+bg->space_info != space_info instead of comparing the block group type flags?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027072232.419318-1-johannes.thumshirn@wdc.com?part=17
+

@@ -1,0 +1,101 @@
+From sashiko-bot@kernel.org Tue Oct 27 08:55:53 2026
+Message-ID: <sashiko-outbox-186245@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 03/25] btrfs: zoned: skip the append only metadata
+ writeback path for conventional block groups
+Date: Tue, 27 Oct 2026 07:55:48 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: leak in btrfs_zoned_account_meta_bg() on bg init error
+--
+
+commit d2004848044d29af8fa99a4968afe7e1e89cf997
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: skip the append only metadata writeback path for conventional block groups
+
+This commit adds btrfs_zoned_bg_is_append_only() and per-filesystem atomic
+counters for sequential and conventional metadata block groups so that
+metadata writeback and tree block freeing can bypass append-only handling on
+conventional zones.
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 027830a53f7dc..b29070b51b920 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+[ ... ]
+> @@ -1204,6 +1204,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+>  	rb_erase_cached(&block_group->cache_node,
+>  			&fs_info->block_group_cache_tree);
+>  	RB_CLEAR_NODE(&block_group->cache_node);
+> +	btrfs_zoned_account_meta_bg(block_group, -1);
+>  
+>  	/* Once for the block groups rbtree */
+>  	btrfs_put_block_group(block_group);
+[ ... ]
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 2572b3811018d..d952e8cf45248 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2007,6 +2007,7 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	}
+>  
+>  	if (!ret) {
+> +		btrfs_zoned_account_meta_bg(cache, 1);
+>  		cache->meta_write_pointer = cache->alloc_offset + cache->start;
+>  		if (test_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &cache->runtime_flags)) {
+>  			spin_lock(&fs_info->zone_active_bgs_lock);
+
+[Severity: Medium]
+Can this leak the fs_info->zoned_seq_meta_bgs or fs_info->zoned_conv_meta_bgs
+count if block group initialization fails after
+btrfs_load_block_group_zone_info() succeeds?
+
+In both read_one_block_group() and btrfs_make_block_group(), subsequent steps
+can still fail before the block group is inserted into
+fs_info->block_group_cache_tree, for example in btrfs_make_block_group():
+
+	ret = btrfs_load_block_group_zone_info(cache, true);
+	if (ret) {
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+
+	ret = exclude_super_stripes(cache);
+	if (ret) {
+		/* We may have excluded something, so call this just in case */
+		btrfs_free_excluded_extents(cache);
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+	...
+	ret = btrfs_add_new_free_space(cache, chunk_offset, chunk_offset + size, NULL);
+	btrfs_free_excluded_extents(cache);
+	if (ret) {
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+
+	ret = btrfs_add_block_group_cache(cache);
+	if (ret) {
+		btrfs_remove_free_space_cache(cache);
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+
+Because btrfs_zoned_account_meta_bg(block_group, -1) is only called from
+btrfs_remove_block_group() when erasing a block group from
+fs_info->block_group_cache_tree, freeing cache on these error paths leaves
+zoned_seq_meta_bgs or zoned_conv_meta_bgs permanently elevated, which can
+cause btrfs_zoned_meta_is_append_only() to take the wrong fast-path decision
+or needlessly look up the block group on every btrfs_clear_buffer_dirty()
+call.
+
+Would it be better to account the metadata block group when adding it to
+fs_info->block_group_cache_tree in btrfs_add_block_group_cache() (or after all
+fallible initialization steps have succeeded) so that the increment and
+decrement are symmetrically paired with rbtree insertion and removal?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027072232.419318-1-johannes.thumshirn@wdc.com?part=3
+

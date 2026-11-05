@@ -1,0 +1,100 @@
+From sashiko-bot@kernel.org Mon Nov  2 21:09:27 2026
+Message-ID: <sashiko-outbox-194070@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: test compression attribute on filesystems
+ mounted with nodatacow
+Date: Mon, 02 Nov 2026 20:09:23 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] btrfs/364: missing non-zoned device requirement for -o nodatacow mount
+- [Low] btrfs/364: comment and commit message claim +A sets append-only mode
+--
+
+commit 7163de368398bda0ed0ebbf96ebc7172c04a2d09
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: test compression attribute on filesystems mounted with nodatacow
+
+This commit adds fstest btrfs/364 to verify that files created inside a
+directory with the compression attribute on a filesystem mounted with
+-o nodatacow inherit compression and allow setting additional file
+attributes.
+
+> diff --git a/tests/btrfs/364 b/tests/btrfs/364
+> new file mode 100755
+> index 0000000000000..d59e1cab06cf7
+> --- /dev/null
+> +++ b/tests/btrfs/364
+> @@ -0,0 +1,45 @@
+> +#! /bin/bash
+> +# SPDX-License-Identifier: GPL-2.0
+> +# Copyright (c) 2026 SUSE S.A.  All Rights Reserved.
+> +#
+> +# FS QA Test 364
+> +#
+> +# Test that if we mount a filesystem with "-o nodatacow", set the compression
+> +# attribute on a directory and then create a file under it, the file should
+> +# inherit compression and setting an additional attribute (like +A, write append
+> +# mode) should work.
+> +#
+> +. ./common/preamble
+> +_begin_fstest auto quick compress fiemap
+> +
+> +. ./common/filter
+> +. ./common/punch # for _filter_fiemap_flags
+> +
+> +_require_xfs_io_command "fiemap"
+> +_require_chattr c
+> +_require_chattr A
+> +_require_scratch
+> +
+> +_fixed_by_kernel_commit xxxxxxxxxxxx \
+> +	"btrfs: dont propagate nodatacow mount option on files with inherited compression"
+> +
+> +_scratch_mkfs >> $seqres.full 2>&1 || _fail "mkfs failed"
+> +_scratch_mount "-o nodatacow"
+
+[Severity: Medium]
+Does this test need a _require_non_zoned_device $SCRATCH_DEV check before
+mounting with -o nodatacow?
+
+On a zoned btrfs filesystem, check_fsflags_compatible() in fs/btrfs/ioctl.c
+only rejects FS_NOCOW_FL (+C), so both _require_chattr c and _require_chattr A
+succeed. When the test then calls _scratch_mount "-o nodatacow", the kernel
+rejects the mount with -EINVAL in btrfs_check_mountopts_zoned():
+
+fs/btrfs/zoned.c:btrfs_check_mountopts_zoned() {
+	if (btrfs_raw_test_opt(*mount_opt, NODATACOW)) {
+		btrfs_err(info, "zoned: NODATACOW not supported");
+		return -EINVAL;
+	}
+}
+
+Without _require_non_zoned_device, running tests/btrfs/364 on a zoned block
+device will fail during _scratch_mount instead of skipping with _notrun.
+
+> +
+> +# Create a directory with the compression attribute, so that all files created
+> +# under it inherit the compression attribute.
+> +mkdir $SCRATCH_MNT/dir
+> +$CHATTR_PROG +c $SCRATCH_MNT/dir
+> +
+> +# Now create a file with some data inside the directory.
+> +$XFS_IO_PROG -f -c "pwrite 0 128K" $SCRATCH_MNT/dir/foo | _filter_xfs_io
+> +
+> +# Now try to make the file append only, it should work.
+> +$CHATTR_PROG +A $SCRATCH_MNT/dir/foo
+
+[Severity: Low]
+This isn't a runtime bug since setting either attribute triggers
+btrfs_fileattr_set() and check_fsflags(), but the commit message, test header
+comment, and the comment above all describe +A as write append-only mode.
+
+In chattr, +A sets no-atime updates (FS_NOATIME_FL), while +a sets
+append-only mode (FS_APPEND_FL). Should the comments and commit message refer
+to no-atime updates, or was _require_chattr a and $CHATTR_PROG +a intended
+here?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/19d06a11c66590ec2a053781c79bf00e39361a70.1793648537.git.fdmanana@suse.com?part=1
+

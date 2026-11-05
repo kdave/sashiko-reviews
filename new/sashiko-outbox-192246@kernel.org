@@ -1,0 +1,241 @@
+From sashiko-bot@kernel.org Sun Nov  1 03:20:46 2026
+Message-ID: <sashiko-outbox-192246@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC PATCH v3 5/5] btrfs: add provenance time (ptime)
+Date: Sun, 01 Nov 2026 02:20:43 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
+- [High] btrfs: unflagged ptime in btrfs_inode_item loads 0 or stale bytes
+- [High] btrfs: btrfs_fileattr_set() masks flags before check on special files
+- [Medium] btrfs: incomplete ptime sanitization in btrfs_read_locked_inode()
+--
+
+commit e78f1cd29ca62ea0b5c5bff69b001e3e54b097e3
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: add provenance time (ptime)
+
+This commit implements provenance time (ptime) in Btrfs by claiming 12 bytes
+from the reserved space in struct btrfs_inode_item and wiring up statx and
+fileattr support, including enabling btrfs_fileattr_get() and
+btrfs_fileattr_set() on symlinks and special files.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index abaa334714566..6ac7fa774ccfe 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -4057,6 +4057,17 @@ static int btrfs_read_locked_inode(struct btrfs_inode *inode, struct btrfs_path
+>  	inode->i_otime_sec = btrfs_timespec_sec(leaf, &inode_item->otime);
+>  	inode->i_otime_nsec = btrfs_timespec_nsec(leaf, &inode_item->otime);
+>  
+> +	inode->i_ptime_sec = btrfs_timespec_sec(leaf, &inode_item->ptime);
+> +	inode->i_ptime_nsec = btrfs_timespec_nsec(leaf, &inode_item->ptime);
+> +	/* Avoid old garbage on-disk data making btrfs load a bad value */
+> +	if (unlikely(inode->i_ptime_nsec >= NSEC_PER_SEC)) {
+> +		btrfs_warn(fs_info,
+> +			   "invalid ptime.nsec %u on ino %llu from disk, setting ptime to otime",
+> +			   inode->i_ptime_nsec, btrfs_ino(inode));
+> +		inode->i_ptime_sec = inode->i_otime_sec;
+> +		inode->i_ptime_nsec = inode->i_otime_nsec;
+> +	}
+> +
+>  	inode_set_bytes(vfs_inode, btrfs_inode_nbytes(leaf, inode_item));
+>  	inode->generation = btrfs_inode_generation(leaf, inode_item);
+>  	inode->last_trans = btrfs_inode_transid(leaf, inode_item);
+
+[Severity: Medium]
+As reported by Sashiko on RFC v2 [1], when btrfs_read_locked_inode() in
+fs/btrfs/inode.c detects inode->i_ptime_nsec >= NSEC_PER_SEC and falls back to
+inode->i_otime_sec and inode->i_otime_nsec, could an unvalidated otime or
+un-truncated ptime cause unrelated FS_IOC_SETFLAGS calls to fail?
+
+Neither check_inode_item() in fs/btrfs/tree-checker.c nor
+btrfs_read_locked_inode() verifies that otime.nsec < NSEC_PER_SEC, so on a
+corrupted image where otime.nsec is also >= NSEC_PER_SEC, inode->i_ptime_nsec
+remains invalid after the fallback. In addition, btrfs_read_locked_inode()
+does not normalize i_ptime with timestamp_truncate(), which zeroes tv_nsec at
+the superblock time bounds (TIME64_MIN and TIME64_MAX) and which can be
+missed if stale on-disk bytes have ptime.sec at an extreme bound while
+ptime.nsec < NSEC_PER_SEC.
+
+Because btrfs_fileattr_get() in fs/btrfs/ioctl.c unconditionally sets
+FS_XFLAG_PTIME and copies inode->i_ptime_sec and inode->i_ptime_nsec into
+fa->fsx_ptime, any subsequent FS_IOC_SETFLAGS call runs:
+
+  ioctl_setflags()
+    -> vfs_fileattr_set()
+      -> btrfs_fileattr_get()
+      -> fileattr_set_prepare()
+
+where fileattr_set_prepare() validates old_ma.fsx_ptime and rejects
+tv_nsec >= NSEC_PER_SEC with -EINVAL or un-truncated TIME64_MIN/TIME64_MAX
+values on immutable or append-only inodes with -EPERM.
+
+[ ... ]
+
+> @@ -8186,9 +8207,11 @@ static int btrfs_getattr(const struct mnt_idmap *idmap,
+>  	u32 blocksize = btrfs_sb(inode->i_sb)->sectorsize;
+>  	u32 bi_flags = BTRFS_I(inode)->flags;
+>  
+> -	stat->result_mask |= STATX_BTIME;
+> +	stat->result_mask |= (STATX_BTIME | STATX_PTIME);
+>  	stat->btime.tv_sec = BTRFS_I(inode)->i_otime_sec;
+>  	stat->btime.tv_nsec = BTRFS_I(inode)->i_otime_nsec;
+> +	stat->ptime.tv_sec = BTRFS_I(inode)->i_ptime_sec;
+> +	stat->ptime.tv_nsec = BTRFS_I(inode)->i_ptime_nsec;
+>  	if (bi_flags & BTRFS_INODE_APPEND)
+>  		stat->attributes |= STATX_ATTR_APPEND;
+>  	if (bi_flags & BTRFS_INODE_COMPRESS)
+> @@ -10779,6 +10802,8 @@ static const struct inode_operations btrfs_special_inode_operations = {
+>  	.get_inode_acl	= btrfs_get_acl,
+>  	.set_acl	= btrfs_set_acl,
+>  	.update_time	= btrfs_update_time,
+> +	.fileattr_get	= btrfs_fileattr_get,
+> +	.fileattr_set	= btrfs_fileattr_set,
+>  };
+>  static const struct inode_operations btrfs_symlink_inode_operations = {
+>  	.get_link	= page_get_link,
+> @@ -10787,6 +10812,8 @@ static const struct inode_operations btrfs_symlink_inode_operations = {
+>  	.permission	= btrfs_permission,
+>  	.listxattr	= btrfs_listxattr,
+>  	.update_time	= btrfs_update_time,
+> +	.fileattr_get	= btrfs_fileattr_get,
+> +	.fileattr_set	= btrfs_fileattr_set,
+>  };
+>  
+>  const struct dentry_operations btrfs_dentry_operations = {
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index f3e2afe221be3..dfcf710d828cf 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -275,6 +275,9 @@ int btrfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+>  	const struct btrfs_inode *inode = BTRFS_I(d_inode(dentry));
+>  
+>  	fileattr_fill_flags(fa, btrfs_inode_flags_to_fsflags(inode));
+> +	fa->fsx_ptime.tv_sec = inode->i_ptime_sec;
+> +	fa->fsx_ptime.tv_nsec = inode->i_ptime_nsec;
+> +	fa->fsx_xflags |= FS_XFLAG_PTIME;
+>  	return 0;
+>  }
+>  
+> @@ -294,7 +297,11 @@ int btrfs_fileattr_set(const struct mnt_idmap *idmap,
+>  	if (btrfs_root_readonly(root))
+>  		return -EROFS;
+>  
+> -	if (fileattr_has_fsx(fa))
+> +	/*
+> +	 * We now support FS_XFLAG_PTIME, so exclude it from the unsupported
+> +	 * check
+> +	 */
+> +	if (fileattr_has_fsx_mask(fa, FS_XFLAG_PTIME))
+>  		return -EOPNOTSUPP;
+>  
+>  	fsflags = btrfs_mask_fsflags_for_type(&inode->vfs_inode, fa->flags);
+
+[Severity: High]
+Now that btrfs_special_inode_operations and btrfs_symlink_inode_operations in
+fs/btrfs/inode.c wire up btrfs_fileattr_get() and btrfs_fileattr_set(), does
+calling btrfs_mask_fsflags_for_type() before check_fsflags() in
+btrfs_fileattr_set() mishandle flags on symlinks and special files?
+
+In fs/btrfs/ioctl.c, btrfs_mask_fsflags_for_type() masks flags for non-regular,
+non-directory inodes down to only FS_NODUMP_FL | FS_NOATIME_FL:
+
+  static unsigned int btrfs_mask_fsflags_for_type(const struct inode *inode,
+                                                  unsigned int flags)
+  {
+          if (S_ISDIR(inode->i_mode))
+                  return flags;
+          else if (S_ISREG(inode->i_mode))
+                  return flags & ~FS_DIRSYNC_FL;
+          else
+                  return flags & (FS_NODUMP_FL | FS_NOATIME_FL);
+  }
+
+Because btrfs_fileattr_set() masks fa->flags through
+btrfs_mask_fsflags_for_type() before calling check_fsflags(old_fsflags,
+fsflags), three issues arise on symlinks and special files:
+
+1. Passing unsupported FS_XFLAG_COMMON flags (such as FS_XFLAG_PROJINHERIT,
+   FS_XFLAG_SYNC, FS_XFLAG_IMMUTABLE, or FS_XFLAG_APPEND) via file_setattr()
+   or FS_IOC_FSSETXATTR, or unsupported FS_*_FL bits via FS_IOC_SETFLAGS, gets
+   silently stripped before check_fsflags() and succeeds with 0 instead of
+   returning -EOPNOTSUPP.
+
+2. Symlinks and special files inherit BTRFS_INODE_NODATACOW,
+   BTRFS_INODE_COMPRESS, and BTRFS_INODE_NOCOMPRESS from their parent directory
+   in btrfs_inherit_iflags(), and btrfs_fileattr_get() reports them via
+   btrfs_inode_flags_to_fsflags(). A read-modify-write with FS_IOC_GETFLAGS and
+   FS_IOC_SETFLAGS on a special file strips FS_NOCOW_FL, FS_COMPR_FL, and
+   FS_NOCOMP_FL in btrfs_mask_fsflags_for_type(), clearing those inherited
+   flags on the inode.
+
+3. If a symlink or special file has BTRFS_INODE_IMMUTABLE or
+   BTRFS_INODE_APPEND set, btrfs_fileattr_get() includes FS_IMMUTABLE_FL or
+   FS_APPEND_FL in old_ma.flags. An unprivileged owner without
+   CAP_LINUX_IMMUTABLE can call file_setattr(), FS_IOC_FSSETXATTR, or
+   FS_IOC_SETFLAGS while leaving FS_IMMUTABLE_FL or FS_APPEND_FL set in fa,
+   which passes the capability check in fileattr_set_prepare():
+
+     if ((fa->flags ^ old_ma->flags) & (FS_APPEND_FL | FS_IMMUTABLE_FL))
+             if (!capable(CAP_LINUX_IMMUTABLE))
+                     return -EPERM;
+
+   Then btrfs_mask_fsflags_for_type() strips FS_IMMUTABLE_FL and FS_APPEND_FL
+   from fsflags, and btrfs_fileattr_set() clears BTRFS_INODE_IMMUTABLE and
+   BTRFS_INODE_APPEND (as well as S_IMMUTABLE and S_APPEND via
+   btrfs_sync_inode_flags_to_i_flags()) without CAP_LINUX_IMMUTABLE.
+
+[ ... ]
+
+> diff --git a/include/uapi/linux/btrfs_tree.h b/include/uapi/linux/btrfs_tree.h
+> index 47ee52859b458..c360b3e95f456 100644
+> --- a/include/uapi/linux/btrfs_tree.h
+> +++ b/include/uapi/linux/btrfs_tree.h
+> @@ -900,7 +900,8 @@ struct btrfs_inode_item {
+>  	 * a little future expansion, for more than this we can
+>  	 * just grow the inode item and version it
+>  	 */
+> -	__le64 reserved[4];
+> +	__le32 reserved[5];
+> +	struct btrfs_timespec ptime;
+>  	struct btrfs_timespec atime;
+>  	struct btrfs_timespec ctime;
+>  	struct btrfs_timespec mtime;
+
+[Severity: High]
+How does btrfs_read_locked_inode() distinguish an inode item with a valid
+on-disk ptime from an inode item created or updated without ptime support?
+
+Claiming 12 bytes from reserved[] in struct btrfs_inode_item in
+include/uapi/linux/btrfs_tree.h without an inode flag or feature bit appears
+to cause several on-disk compatibility regressions:
+
+1. On existing Btrfs filesystems, as well as the root directory inode
+   (BTRFS_FIRST_FREE_OBJECTID) created by mkfs.btrfs, the reserved[] bytes on
+   disk are zeroed ({sec = 0, nsec = 0}). In btrfs_read_locked_inode(),
+   i_ptime_nsec == 0 passes the < NSEC_PER_SEC check, so btrfs_getattr() and
+   btrfs_fileattr_get() unconditionally report STATX_PTIME and FS_XFLAG_PTIME
+   with timestamp 0 (1970-01-01 00:00:00 UTC) instead of falling back to otime
+   or omitting STATX_PTIME.
+
+2. On older kernels, logging an inode via log_inode_item() or copy_items() in
+   fs/btrfs/tree-log.c allocated the log item with btrfs_insert_empty_item()
+   without zeroing the leaf buffer, and fill_inode_item() in tree-log.c did not
+   touch reserved[]. If that log was replayed onto the subvolume tree via
+   overwrite_item(), inode_item->ptime on disk contains stale leaf bytes. In
+   btrfs_read_locked_inode(), checking only i_ptime_nsec >= NSEC_PER_SEC will
+   accept arbitrary stale leaf data in ptime.sec and ptime.nsec whenever the
+   stale 32-bit nsec value happens to be < NSEC_PER_SEC.
+
+3. If a filesystem is mounted on an older kernel and an inode is updated via
+   btrfs_delayed_update_inode(), the older kernel zero-allocates
+   delayed_node->inode_item and writes the entire struct btrfs_inode_item back
+   to disk in __btrfs_update_delayed_inode(), silently resetting ptime to
+   {0, 0}.
+
+[1] https://lore.kernel.org/r/20261028134728.294127-3-koray.fra@gmail.com
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261101015551.786044-1-koray.fra@gmail.com?part=5
+

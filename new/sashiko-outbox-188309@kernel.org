@@ -1,0 +1,120 @@
+From sashiko-bot@kernel.org Wed Oct 28 19:44:59 2026
+Message-ID: <sashiko-outbox-188309@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 17/25] btrfs: zoned: factor out resetting a block
+ group in place
+Date: Wed, 28 Oct 2026 18:44:57 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: wrong space_info filter in btrfs_reset_unused_block_groups()
+--
+
+commit 8cfe82e16bd1f2d4d7237538f50e66e84c795455
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: factor out resetting a block group in place
+
+This commit moves the zone reset and space accounting logic out of
+btrfs_reset_unused_block_groups() into a new helper function,
+zoned_reset_bg_in_place().
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index ae5c1ded13cdb..e243300d78fe0 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2916,6 +2916,72 @@ void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg)
+>  	spin_unlock(&fs_info->relocation_bg_lock);
+>  }
+>  
+> +static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+> +{
+> +	struct btrfs_fs_info *fs_info = bg->fs_info;
+> +	struct btrfs_space_info *space_info = bg->space_info;
+
+[ ... ]
+
+> +	spin_lock(&space_info->lock);
+> +	spin_lock(&bg->lock);
+
+[ ... ]
+
+> +	bg->free_space_ctl->free_space += *reclaimed;
+> +	btrfs_space_info_update_bytes_zone_unusable(space_info, -*reclaimed);
+> +	spin_unlock(&bg->lock);
+> +	btrfs_return_free_space(space_info, *reclaimed);
+> +	spin_unlock(&space_info->lock);
+> +
+> +	return 0;
+> +}
+
+[ ... ]
+
+> @@ -3302,65 +3366,9 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		list_del_init(&bg->bg_list);
+>  		spin_unlock(&fs_info->unused_bgs_lock);
+>  
+
+[ ... ]
+
+> -		btrfs_space_info_update_bytes_zone_unusable(space_info, -reclaimed);
+> -		spin_unlock(&bg->lock);
+> -		btrfs_return_free_space(space_info, reclaimed);
+> -		spin_unlock(&space_info->lock);
+> +		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+> +		if (ret || !reclaimed)
+>  			goto requeue;
+
+[Severity: Medium]
+Does zoned_reset_bg_in_place() using bg->space_info cause
+btrfs_reset_unused_block_groups() to stop reclaiming early without satisfying
+the caller's space_info when sub-group block groups are on unused_bgs?
+
+On zoned filesystems, create_space_info() creates sub-group btrfs_space_info
+instances (BTRFS_SUB_GROUP_DATA_RELOC under DATA and BTRFS_SUB_GROUP_TREELOG
+under METADATA) that share the same space_info->flags as their parent
+space_info, while maintaining separate locks, bytes_zone_unusable counters,
+and reservation ticket queues. When block groups in either a primary or
+sub-group space_info become completely zone_unusable,
+__btrfs_add_free_space_zoned() places them on the shared fs_info->unused_bgs
+list.
+
+In btrfs_reset_unused_block_groups(), the candidate search loop filters
+fs_info->unused_bgs only by type flags:
+
+	spin_lock(&fs_info->unused_bgs_lock);
+	list_for_each_entry(bg, &fs_info->unused_bgs, bg_list) {
+		if ((bg->flags & BTRFS_BLOCK_GROUP_TYPE_MASK) != space_info->flags)
+			continue;
+
+Previously, btrfs_reset_unused_block_groups() updated bytes_zone_unusable and
+called btrfs_return_free_space() on the caller's space_info parameter. Now,
+zoned_reset_bg_in_place() uses bg->space_info instead, while
+btrfs_reset_unused_block_groups() still deducts reclaimed from the caller's
+num_bytes target:
+
+		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+		if (ret || !reclaimed)
+			goto requeue;
+
+		btrfs_put_block_group(bg);
+
+		if (num_bytes <= reclaimed)
+			break;
+		num_bytes -= reclaimed;
+
+When flush_space() calls btrfs_reset_unused_block_groups(space_info,
+num_bytes) during the RESET_ZONES state for a primary space_info (or for a
+sub-group such as BTRFS_SUB_GROUP_TREELOG) and encounters a block group on
+fs_info->unused_bgs belonging to the sibling sub-group (or parent), it resets
+that block group, credits the space and wakes tickets on bg->space_info, and
+then subtracts reclaimed from num_bytes.
+
+Could this cause the loop to break early without resetting unused block groups
+that actually belong to the caller's space_info and without waking tickets on
+the caller's space_info? Should the search loop in
+btrfs_reset_unused_block_groups() check bg->space_info != space_info instead
+of matching only BTRFS_BLOCK_GROUP_TYPE_MASK?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261028182111.160492-1-johannes.thumshirn@wdc.com?part=17
+

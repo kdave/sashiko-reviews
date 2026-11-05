@@ -1,0 +1,146 @@
+From sashiko-bot@kernel.org Tue Nov  3 22:13:11 2026
+Message-ID: <sashiko-outbox-195959@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v6 RESEND 6/6] btrfs: preserve btrfs.compression when
+ setting inode flags
+Date: Tue, 03 Nov 2026 20:07:39 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Low] btrfs: unreachable property reconstruction in btrfs_fileattr_set()
+- [Low] btrfs: uninitialized read of prop_compress_level in btrfs_fileattr_set()
+--
+
+commit fa607f5cde07a2a551b7d40cca7d853e1f38f2c5
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: preserve btrfs.compression when setting inode flags
+
+This patch updates btrfs_fileattr_set() to use btrfs_compress_typelevel2str()
+to reconstruct the algorithm:level string when FS_COMPR_FL is set, and moves
+BTRFS_COMPRESS_PROP_MAX_LEN to fs/btrfs/props.h.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 651a780dd7b14..56aad3f98859d 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -288,6 +288,7 @@ int btrfs_fileattr_set(const struct mnt_idmap *idmap,
+>  	unsigned int fsflags, old_fsflags;
+>  	int ret;
+>  	const char *comp = NULL;
+> +	char comp_buf[BTRFS_COMPRESS_PROP_MAX_LEN];
+>  	u32 inode_flags;
+>  	bool prop_set = false;
+>  
+> @@ -397,7 +398,6 @@ int btrfs_fileattr_set(const struct mnt_idmap *idmap,
+>  		inode_flags &= ~BTRFS_INODE_COMPRESS;
+>  		inode_flags |= BTRFS_INODE_NOCOMPRESS;
+>  	} else if (fsflags & FS_COMPR_FL) {
+> -		enum btrfs_compression_type comp_type;
+>  
+>  		if (IS_SWAPFILE(&inode->vfs_inode))
+>  			return -ETXTBSY;
+> @@ -406,22 +406,23 @@ int btrfs_fileattr_set(const struct mnt_idmap *idmap,
+>  		inode_flags &= ~BTRFS_INODE_NOCOMPRESS;
+>  
+>  		/*
+> -		 * Keep the algorithm recorded in the compression property,
+> -		 * otherwise changing an unrelated attribute would reset it to
+> -		 * the mount default, since FS_IOC_SETFLAGS callers write back
+> -		 * the whole flag set they got from FS_IOC_GETFLAGS and that
+> -		 * includes FS_COMPR_FL for any inode carrying the property.
+> +		 * If compression is already enabled, we must reconstruct the
+> +		 * full "algo:level" property string and write it back.
+> +		 * Otherwise changing an unrelated attribute would reset it to
+> +		 * the mount default and drop the level, since FS_IOC_SETFLAGS
+> +		 * callers write back the whole flag set they got from
+> +		 * FS_IOC_GETFLAGS, and that includes FS_COMPR_FL.
+>  		 *
+>  		 * Inodes with the compress flag set but no property keep using
+>  		 * the mount default, so they behave as before.
+>  		 */
+> -		if (inode->prop_compress)
+> -			comp_type = inode->prop_compress;
+> -		else if (fs_info->compress_type)
+> -			comp_type = fs_info->compress_type;
+> -		else
+> -			comp_type = BTRFS_COMPRESS_ZLIB;
+> -		comp = btrfs_compress_type2str(comp_type);
+> +		comp = btrfs_compress_typelevel2str(inode->prop_compress,
+> +						    inode->prop_compress_level,
+> +						    comp_buf, sizeof(comp_buf));
+> +		if (!comp || comp[0] == 0)
+> +			comp = btrfs_compress_type2str(fs_info->compress_type);
+> +		if (!comp || comp[0] == 0)
+> +			comp = btrfs_compress_type2str(BTRFS_COMPRESS_ZLIB);
+
+[Severity: Low]
+Can inode->prop_compress ever be non-zero when execution reaches this
+FS_COMPR_FL branch in btrfs_fileattr_set()?
+
+Earlier in btrfs_fileattr_set(), if neither FS_COMPR_FL nor FS_NOCOMP_FL
+changed between old_fsflags and fsflags, execution jumps directly to
+update_flags without modifying the btrfs.compression property:
+
+	if (!((fsflags ^ old_fsflags) & (FS_COMPR_FL | FS_NOCOMP_FL))) {
+		/* 1 item for the inode */
+		trans = btrfs_start_transaction(root, 1);
+		if (IS_ERR(trans))
+			return PTR_ERR(trans);
+		goto update_flags;
+	}
+
+Because check_fsflags() rejects having both FS_COMPR_FL and FS_NOCOMP_FL set,
+entering the else if (fsflags & FS_COMPR_FL) branch requires that FS_COMPR_FL
+was not set in old_fsflags.
+
+However, prop_compression_apply() in fs/btrfs/props.c is the only place that
+sets inode->prop_compress to a non-zero value, and it always sets
+BTRFS_INODE_COMPRESS and clears BTRFS_INODE_NOCOMPRESS on inode->flags:
+
+	inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+	inode->flags |= BTRFS_INODE_COMPRESS;
+	inode->prop_compress = type;
+	inode->prop_compress_level = level;
+
+Since compress_file_range() only sets BTRFS_INODE_NOCOMPRESS when
+!inode->prop_compress, and clearing FS_COMPR_FL or setting FS_NOCOMP_FL clears
+inode->prop_compress to BTRFS_COMPRESS_NONE, isn't inode->prop_compress
+guaranteed to be BTRFS_COMPRESS_NONE here (making the property reconstruction
+and comp_buf unreachable dead code since commit 862e41245f393f)?
+
+[Severity: Low]
+As reported by Sashiko on v6 [1], does passing inode->prop_compress_level by
+value to btrfs_compress_typelevel2str() in btrfs_fileattr_set() read an
+uninitialized field when FS_COMPR_FL is set on an inode that has not had a
+compression algorithm property applied?
+
+In fs/btrfs/inode.c, btrfs_alloc_inode() allocates struct btrfs_inode from
+btrfs_inode_cachep without __GFP_ZERO and initializes ei->prop_compress, but
+leaves ei->prop_compress_level uninitialized:
+
+	ei->runtime_flags = 0;
+	ei->prop_compress = BTRFS_COMPRESS_NONE;
+	ei->defrag_compress = BTRFS_COMPRESS_NONE;
+
+Similarly, in fs/btrfs/props.c, prop_compression_apply() resets
+inode->prop_compress to BTRFS_COMPRESS_NONE without initializing
+inode->prop_compress_level when clearing compression or setting "no" / "none":
+
+	if (len == 0) {
+		inode->flags &= ~BTRFS_INODE_COMPRESS;
+		inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+		inode->prop_compress = BTRFS_COMPRESS_NONE;
+		return 0;
+	}
+
+Even though btrfs_compress_typelevel2str() returns NULL when type is
+BTRFS_COMPRESS_NONE without inspecting level, wouldn't evaluating
+inode->prop_compress_level at the call site pass an uninitialized value across
+a function boundary and trigger a KMSAN uninit-value report when
+CONFIG_KMSAN_CHECK_PARAM_RETVAL is enabled?
+
+[1] https://lore.kernel.org/r/20261012190731.951056-7-koray.fra@gmail.com
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261103194734.598182-1-koray.fra@gmail.com?part=6
+

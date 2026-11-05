@@ -1,0 +1,188 @@
+From sashiko-bot@kernel.org Wed Nov  4 05:55:53 2026
+Message-ID: <sashiko-outbox-196664@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: move async data csum generation out of
+ experimental
+Date: Wed, 04 Nov 2026 04:55:49 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Critical] btrfs: race between csum_one_bio_work() and log_extent_csums() in fast fsync
+- [High] btrfs: incomplete flush of endio_workers in close_ctree() with async csum
+--
+
+commit 78282e20b7bc3d9ca49a41b208ac19ec086896d5
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: move async data csum generation out of experimental
+
+This commit enables asynchronous data checksum generation unconditionally by
+moving it out of CONFIG_BTRFS_EXPERIMENTAL, removing the synchronous path in
+btrfs_csum_one_bio(), and deleting the fs_info->workers workqueue along with
+the BTRFS_FS_CSUM_IMPL_FAST flag.
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index 35a43e7cb937c..c7b9ca7614e07 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+[ ... ]
+> @@ -4465,19 +4442,6 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
+>  	 */
+>  	btrfs_flush_workqueue(fs_info->delalloc_workers);
+>  
+> -	/*
+> -	 * We can have ordered extents getting their last reference dropped from
+> -	 * the fs_info->workers queue because for async writes for data bios we
+> -	 * queue a work for that queue, at btrfs_wq_submit_bio(), that runs
+> -	 * run_one_async_done() which calls btrfs_bio_end_io() in case the bio
+> -	 * has an error, and that later function can do the final
+> -	 * btrfs_put_ordered_extent() on the ordered extent attached to the bio,
+> -	 * which adds a delayed iput for the inode. So we must flush the queue
+> -	 * so that we don't have delayed iputs after committing the current
+> -	 * transaction below and stopping the cleaner and transaction kthreads.
+> -	 */
+> -	btrfs_flush_workqueue(fs_info->workers);
+> -
+>  	/*
+>  	 * When finishing a compressed write bio we schedule a work queue item
+>  	 * to finish an ordered extent - end_bbio_compressed_write()
+
+[Severity: High]
+With btrfs_csum_one_bio() now unconditionally queuing bbio->csum_work onto
+fs_info->endio_workers, is the single flush_workqueue(fs_info->endio_workers)
+call immediately below sufficient to drain all write bio completions during
+close_ctree()?
+
+During unmount, a compressed write work item running on
+fs_info->delalloc_workers (for example when compress_file_range() already
+cleared PAGECACHE_TAG_DIRTY before submit_compressed_extents() allocated the
+btrfs_ordered_extent, or when BTRFS_FS_ERROR(fs_info) caused
+btrfs_start_delalloc_roots() to return early) can submit a write bio while
+btrfs_flush_workqueue(fs_info->delalloc_workers) runs:
+
+  submit_compressed_extents()
+    submit_one_async_extent()
+      btrfs_submit_compressed_write()
+        btrfs_submit_bbio()
+          btrfs_submit_chunk()
+            btrfs_bio_csum()
+              btrfs_csum_one_bio()
+                bio_inc_remaining(bio);
+                INIT_WORK(&bbio->csum_work, csum_one_bio_work);
+                queue_work(fs_info->endio_workers, &bbio->csum_work);
+
+If the underlying device I/O completes or fails immediately (such as via
+bio_io_error() in btrfs_submit_dev_bio()) before csum_one_bio_work() finishes,
+the device completion's bio_endio() only decrements bio->__bi_remaining from 2
+to 1.
+
+When close_ctree() then calls flush_workqueue(fs_info->endio_workers) once, it
+only waits for the current work batch containing bbio->csum_work. When
+csum_one_bio_work() executes on fs_info->endio_workers, it calls
+bio_endio(&bbio->bio), which drops bio->__bi_remaining to 0 and invokes
+btrfs_simple_end_io() (or btrfs_orig_write_end_io()):
+
+  csum_one_bio_work()
+    bio_endio()
+      btrfs_simple_end_io()
+        INIT_WORK(&bbio->end_io_work, simple_end_io_work);
+        queue_work(btrfs_end_io_wq(fs_info, bio), &bbio->end_io_work);
+
+Because btrfs_end_io_wq() returns fs_info->endio_workers for data writes,
+bbio->end_io_work is queued back onto fs_info->endio_workers in the next work
+color batch. A single flush_workqueue(fs_info->endio_workers) call can return
+as soon as csum_one_bio_work() finishes without waiting for the newly queued
+bbio->end_io_work.
+
+Could bbio->end_io_work then run after btrfs_flush_workqueue(fs_info->endio_write_workers),
+btrfs_run_delayed_iputs(), set_bit(BTRFS_FS_STATE_NO_DELAYED_IPUT, ...), and
+kthread_stop(fs_info->cleaner_kthread), leading to late ordered extent
+completions, late btrfs_add_delayed_iput() calls, or a use-after-free waking
+cleaner_kthread?
+
+> diff --git a/fs/btrfs/file-item.c b/fs/btrfs/file-item.c
+> index ff8f8cad00fc0..53c4af76cebc4 100644
+> --- a/fs/btrfs/file-item.c
+> +++ b/fs/btrfs/file-item.c
+> @@ -815,7 +815,7 @@ static void csum_one_bio_work(struct work_struct *work)
+>  /*
+>   * Calculate checksums of the data contained inside a bio.
+>   */
+> -int btrfs_csum_one_bio(struct btrfs_bio *bbio, bool async)
+> +int btrfs_csum_one_bio(struct btrfs_bio *bbio)
+>  {
+>  	struct btrfs_ordered_extent *ordered = bbio->ordered;
+>  	struct btrfs_inode *inode = bbio->inode;
+> @@ -839,10 +839,6 @@ int btrfs_csum_one_bio(struct btrfs_bio *bbio, bool async)
+>  	btrfs_add_ordered_sum(ordered, sums);
+>  
+>  	bbio->csum_saved_iter = bio->bi_iter;
+> -	if (!async) {
+> -		csum_one_bio(bbio);
+> -		return 0;
+> -	}
+>  	bio_inc_remaining(bio);
+>  	INIT_WORK(&bbio->csum_work, csum_one_bio_work);
+>  	queue_work(fs_info->endio_workers, &bbio->csum_work);
+
+[Severity: Critical]
+Can unconditional async checksum generation in btrfs_csum_one_bio() race with
+log_extent_csums() during a fast fsync and write zeroed or partially computed
+checksums into the log tree?
+
+In btrfs_csum_one_bio(), sums is allocated with kvzalloc() and immediately
+added to ordered->csum_list via btrfs_add_ordered_sum(ordered, sums) before
+csum_one_bio_work() is queued onto fs_info->endio_workers to populate
+sums->sums[]:
+
+  btrfs_csum_one_bio()
+    sums = kvzalloc(btrfs_ordered_sum_size(fs_info, bio->bi_iter.bi_size),
+                    GFP_KERNEL);
+    ...
+    btrfs_add_ordered_sum(ordered, sums);
+    bbio->csum_saved_iter = bio->bi_iter;
+    bio_inc_remaining(bio);
+    INIT_WORK(&bbio->csum_work, csum_one_bio_work);
+    queue_work(fs_info->endio_workers, &bbio->csum_work);
+
+For write paths that create an ordered extent and modified extent map without
+marking pagecache folios with PAGECACHE_TAG_WRITEBACK in
+inode->vfs_inode.i_mapping - such as btrfs_do_encoded_write() (which submits
+private folios with cb->writeback == false) or an asynchronous O_DIRECT bounce
+write via btrfs_direct_write() / btrfs_dio_write() - a subsequent or
+O_SYNC/O_DSYNC fast fsync in btrfs_sync_file() does:
+
+  btrfs_sync_file()
+    btrfs_get_ordered_extents_for_logging(inode, &ctx.ordered_extents);
+    ret = filemap_fdatawait_range(inode->vfs_inode.i_mapping, start, end);
+    ...
+    btrfs_log_dentry_safe()
+      btrfs_log_inode_parent()
+        btrfs_log_inode()
+          btrfs_log_changed_extents()
+            log_one_extent()
+              log_extent_csums()
+
+Because filemap_fdatawait_range() only waits on pagecache writeback in
+i_mapping, it returns without waiting for the in-flight bio or
+bbio->csum_work. Then log_extent_csums() walks ordered->csum_list and logs
+sums->sums[] into the log tree:
+
+  fs/btrfs/tree-log.c:log_extent_csums() {
+      ...
+      if (test_and_set_bit(BTRFS_ORDERED_LOGGED_CSUM, &ordered->flags))
+          continue;
+
+      list_for_each_entry(sums, &ordered->csum_list, list) {
+          ret = log_csums(trans, inode, log_root, sums);
+          if (ret)
+              return ret;
+      }
+      ...
+  }
+
+while csum_one_bio_work() -> csum_one_bio() has not yet run or is concurrently
+writing into sums->sums[].
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/8eb322321cac98013cc46dfe8d89fa58c1ad3dee.1793766229.git.wqu@suse.com?part=1
+

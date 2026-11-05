@@ -1,0 +1,110 @@
+From sashiko-bot@kernel.org Tue Nov  3 21:02:51 2026
+Message-ID: <sashiko-outbox-195640@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/5] btrfs: wait for ordered extent IO in fast fsync
+Date: Tue, 03 Nov 2026 15:42:19 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: missing BTRFS_ORDERED_TRUNCATED check in cow_write_failed()
+--
+
+commit 7488fecd11793347f3fc3d3733e3b90dec77c0c8
+Author: Josef Bacik <josef@toxicpanda.com>
+
+btrfs: wait for ordered extent IO in fast fsync
+
+This commit removes BTRFS_INODE_COW_WRITE_ERROR and instead has fast fsync
+wait for BTRFS_ORDERED_IO_DONE on the collected ordered extents, checking
+whether any COW ordered extent has BTRFS_ORDERED_IOERR set so it can wait
+for ordered extent completion before logging.
+
+> diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+> index f978c6524aa03..4ae9aed8993f3 100644
+> --- a/fs/btrfs/file.c
+> +++ b/fs/btrfs/file.c
+> @@ -1512,6 +1512,42 @@ static inline bool skip_inode_logging(const struct btrfs_log_ctx *ctx)
+>  	return false;
+>  }
+>  
+> +/*
+> + * Wait for the IO of the ordered extents collected for logging to be done, and
+> + * return true if a COW write among them failed.
+> + *
+> + * Waiting for writeback is not enough to know that: the end IO handlers clear
+> + * writeback before they account the IO in the ordered extent. An ordered
+> + * extent gets BTRFS_ORDERED_IO_DONE only once all of its IO is accounted, and
+> + * can_finish_ordered_extent() sets BTRFS_ORDERED_IOERR before that.
+> + */
+> +static bool cow_write_failed(struct btrfs_inode *inode,
+> +			     struct list_head *ordered_extents)
+> +{
+> +	struct btrfs_ordered_extent *ordered;
+> +	bool failed = false;
+> +
+> +	list_for_each_entry(ordered, ordered_extents, log_list)
+> +		wait_event(ordered->wait,
+> +			   test_bit(BTRFS_ORDERED_IO_DONE, &ordered->flags));
+> +
+> +	/*
+> +	 * can_finish_ordered_extent() records a write error before it sets
+> +	 * BTRFS_ORDERED_IO_DONE, both under this lock.
+> +	 */
+> +	spin_lock(&inode->ordered_tree_lock);
+> +	list_for_each_entry(ordered, ordered_extents, log_list) {
+> +		if (test_bit(BTRFS_ORDERED_IOERR, &ordered->flags) &&
+> +		    !test_bit(BTRFS_ORDERED_NOCOW, &ordered->flags)) {
+> +			failed = true;
+> +			break;
+> +		}
+> +	}
+> +	spin_unlock(&inode->ordered_tree_lock);
+> +
+> +	return failed;
+> +}
+
+[Severity: High]
+Should cow_write_failed() in fs/btrfs/file.c also check
+BTRFS_ORDERED_TRUNCATED in addition to BTRFS_ORDERED_IOERR?
+
+When a COW (or PREALLOC) direct IO write stops short or fails before bio
+submission (for example with -EFAULT when pinning user pages in
+iomap_dio_bio_iter()), btrfs_dio_iomap_end() in fs/btrfs/direct-io.c does
+not set BTRFS_ORDERED_IOERR on the unsubmitted ordered extent. Instead,
+since commit 66ff4d366e7e ("btrfs: mark ordered extents in
+btrfs_dio_iomap_end() truncated not ioerr"), it marks the ordered extent
+truncated and finishes it with uptodate = true:
+
+	if (dio_data->ordered) {
+		btrfs_mark_ordered_extent_truncated(dio_data->ordered, 0);
+		btrfs_finish_ordered_extent(dio_data->ordered,
+					    pos + written, length - written, true);
+	}
+
+Similarly, extent_writepage_io() in fs/btrfs/extent_io.c sets
+BTRFS_ORDERED_TRUNCATED and calls btrfs_mark_ordered_io_finished(..., true)
+for sectors at or beyond i_size.
+
+Because uptodate is true, can_finish_ordered_extent() sets
+BTRFS_ORDERED_IO_DONE without setting BTRFS_ORDERED_IOERR. However, the
+extent map for the unwritten range remains in inode->extent_tree and
+inode->extent_tree.modified_extents until btrfs_finish_one_ordered() runs
+in the workqueue:
+
+	if (ret || truncated) {
+		u64 unwritten_start = start;
+		...
+		if (truncated && !ret)
+			unwritten_start += logical_len;
+		btrfs_drop_extent_map_range(inode, unwritten_start, end, false);
+	}
+
+If a fast fsync runs in btrfs_sync_file() before btrfs_finish_one_ordered()
+executes in the workqueue, cow_write_failed() sees BTRFS_ORDERED_IO_DONE
+set and BTRFS_ORDERED_IOERR clear, returning false. Would that allow
+btrfs_sync_file() to skip btrfs_wait_ordered_range() and log file extent
+items pointing to the unwritten disk blocks before
+btrfs_finish_one_ordered() drops and frees them?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261103-b4-btrfs-data-integrity-v2-0-577dc2690061@toxicpanda.com?part=3
+

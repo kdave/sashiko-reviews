@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Mon Nov  2 21:06:41 2026
+Message-ID: <sashiko-outbox-194059@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: dont propagate nodatacow mount option on files
+ with inherited compression
+Date: Mon, 02 Nov 2026 20:06:38 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: conflicting NOCOMPRESS and NODATACOW flags in btrfs_create_new_inode()
+--
+
+commit 32a09446d17da46e1531cc1ce366f07d23f902f3
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: dont propagate nodatacow mount option on files with inherited compression
+
+This commit prevents btrfs_create_new_inode() from applying the nodatacow and
+nodatasum mount options to newly created regular files that inherited the
+compression flag from their parent directory.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index abaa334714566..0bc668c9ec883 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -6654,11 +6654,20 @@ int btrfs_create_new_inode(struct btrfs_trans_handle *trans,
+>  
+>  	btrfs_set_inode_mapping_order(BTRFS_I(inode));
+>  	if (S_ISREG(inode->i_mode)) {
+> -		if (btrfs_test_opt(fs_info, NODATASUM))
+> -			BTRFS_I(inode)->flags |= BTRFS_INODE_NODATASUM;
+> -		if (btrfs_test_opt(fs_info, NODATACOW))
+> -			BTRFS_I(inode)->flags |= BTRFS_INODE_NODATACOW |
+> -				BTRFS_INODE_NODATASUM;
+> +		/*
+> +		 * If we inherited compression from the parent directory, it
+> +		 * takes precedence to nodatacow/nodatasum and we don't set
+> +		 * compression along with nodatacow/nodatasun, otherwise if a
+> +		 * user attempts to change some other attribute (say chattr +i),
+> +		 * it will fail at -EINVAL.
+> +		 */
+> +		if (!(BTRFS_I(inode)->flags & BTRFS_INODE_COMPRESS)) {
+> +			if (btrfs_test_opt(fs_info, NODATASUM))
+> +				BTRFS_I(inode)->flags |= BTRFS_INODE_NODATASUM;
+> +			if (btrfs_test_opt(fs_info, NODATACOW))
+> +				BTRFS_I(inode)->flags |= BTRFS_INODE_NODATACOW |
+> +					BTRFS_INODE_NODATASUM;
+> +		}
+
+[Severity: Medium]
+What happens when a regular file is created on a filesystem mounted with
+-o nodatacow inside a directory that has the nocompress attribute set (for
+example via chattr +m or btrfs property set <dir> compression no)?
+
+In fs/btrfs/inode.c:btrfs_create_new_inode(), directories do not get the
+nodatacow flag set when created because that block is guarded by S_ISREG(),
+allowing a directory to have BTRFS_INODE_NOCOMPRESS set on a nodatacow mount.
+When a regular file is later created under that directory,
+btrfs_inherit_iflags() copies BTRFS_INODE_NOCOMPRESS to the new file:
+
+fs/btrfs/inode.c:btrfs_inherit_iflags() {
+	if (flags & BTRFS_INODE_NOCOMPRESS) {
+		inode->flags &= ~BTRFS_INODE_COMPRESS;
+		inode->flags |= BTRFS_INODE_NOCOMPRESS;
+	} else if (flags & BTRFS_INODE_COMPRESS) {
+...
+}
+
+Because the check in btrfs_create_new_inode() only tests for
+BTRFS_INODE_COMPRESS, it proceeds to set BTRFS_INODE_NODATACOW alongside
+BTRFS_INODE_NOCOMPRESS on the new file.
+
+However, fs/btrfs/ioctl.c:check_fsflags() treats FS_NOCOW_FL and
+FS_NOCOMP_FL as mutually exclusive:
+
+fs/btrfs/ioctl.c:check_fsflags() {
+	/* NOCOW and compression options are mutually exclusive */
+	if ((old_flags & FS_NOCOW_FL) && (flags & (FS_COMPR_FL | FS_NOCOMP_FL)))
+		return -EINVAL;
+	if ((flags & FS_NOCOW_FL) && (old_flags & (FS_COMPR_FL | FS_NOCOMP_FL)))
+		return -EINVAL;
+}
+
+Wouldn't any subsequent btrfs_fileattr_set() call on that file (such as
+chattr +i or chattr +a) still fail with -EINVAL due to having both flags set,
+unless BTRFS_INODE_NOCOMPRESS is also handled when applying the nodatacow
+mount option?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/1c729c63075e727042efdeb07df10a70b0ba1a0d.1793647368.git.fdmanana@suse.com?part=1
+

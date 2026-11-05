@@ -1,0 +1,326 @@
+From sashiko-bot@kernel.org Tue Oct 27 08:56:35 2026
+Message-ID: <sashiko-outbox-186246@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 18/25] btrfs: zoned: prepare reserving the data
+ relocation block group at runtime
+Date: Tue, 27 Oct 2026 07:56:29 +0000
+
+Thank you for your contribution! Sashiko AI review found 5 potential issue(s) to consider:
+- [Critical] btrfs: zoned: race migrating block group space_info corrupts find_free_extent() list walk
+- [High] btrfs: zoned: race in btrfs_set_data_reloc_bg() corrupts space_info and ro_bgs
+- [High] btrfs: zoned: missing rechecks under lock in btrfs_set_data_reloc_bg()
+- [High] btrfs: zoned: migrating bg in btrfs_set_data_reloc_bg() ignores bytes_may_use
+- [Medium] btrfs: zoned: premature data_reloc_bg publication in btrfs_set_data_reloc_bg()
+--
+
+commit 100092d90a6120473dc902993527fc80db372666
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: prepare reserving the data relocation block group at runtime
+
+This commit updates btrfs_zoned_reserve_data_reloc_bg() to walk the block
+group list under groups_sem and factors out btrfs_set_data_reloc_bg() and
+zoned_move_bg_to_space_info() so the data relocation block group can be
+reserved at runtime concurrently with extent allocations.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 7176df0a50336..05ce2e83b3493 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2907,6 +2907,75 @@ void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg)
+>  	spin_unlock(&fs_info->relocation_bg_lock);
+>  }
+>  
+> +static void zoned_move_bg_to_space_info(struct btrfs_fs_info *fs_info,
+> +					struct btrfs_block_group *bg,
+> +					struct btrfs_space_info *to)
+> +{
+> +	struct btrfs_space_info *from = bg->space_info;
+> +	int factor = btrfs_bg_type_to_factor(bg->flags);
+> +	int index = btrfs_bg_flags_to_raid_index(bg->flags);
+> +
+> +	spin_lock(&from->lock);
+> +	from->total_bytes -= bg->length;
+> +	from->disk_total -= bg->length * factor;
+> +	from->bytes_used -= bg->used;
+> +	from->disk_used -= bg->used * factor;
+> +	from->bytes_readonly -= bg->bytes_super;
+> +	btrfs_space_info_update_bytes_zone_unusable(from, -(s64)bg->zone_unusable);
+> +	spin_unlock(&from->lock);
+> +
+> +	bg->space_info = to;
+> +	if (!to->block_group_kobjs[index])
+> +		btrfs_sysfs_add_block_group_type(bg);
+> +
+> +	btrfs_add_bg_to_space_info(bg);
+> +}
+
+[Severity: Critical]
+Can migrating bg->space_info at runtime race with the hinted block group
+path in find_free_extent() and cause a cross-list traversal across
+space_info->block_groups[ffe_ctl->index]?
+
+In fs/btrfs/extent-tree.c:find_free_extent(), when ffe_ctl->search_start ==
+ffe_ctl->hint_byte (for example, when cow_file_range(),
+submit_one_async_extent(), or btrfs_prealloc_file_range() sets alloc_hint to
+ins.objectid + ins.offset at the end of the preceding adjacent block group,
+and no active block group in fs_info->zone_active_bgs has enough free space
+so prepare_allocation_zoned() leaves ffe_ctl->hint_byte unchanged),
+block_group->space_info == space_info is checked before acquiring
+space_info->groups_sem:
+
+fs/btrfs/extent-tree.c:find_free_extent() {
+	...
+	if (block_group && block_group_bits(block_group, ffe_ctl->flags) &&
+	    block_group->space_info == space_info &&
+	    block_group->cached != BTRFS_CACHE_NO) {
+		down_read(&space_info->groups_sem);
+		if (list_empty(&block_group->list) ||
+		    block_group->ro ||
+		    (block_group->flags & BTRFS_BLOCK_GROUP_REMAPPED)) {
+			btrfs_put_block_group(block_group);
+			up_read(&space_info->groups_sem);
+		} else {
+			ffe_ctl->index = btrfs_bg_flags_to_raid_index(
+						block_group->flags);
+			btrfs_lock_block_group(block_group,
+					       ffe_ctl->delalloc);
+			ffe_ctl->hinted = true;
+			goto have_block_group;
+		}
+	}
+	...
+}
+
+Previously, a block group's space_info never changed after mount and
+list_del_init(&block_group->list) was only used during block group removal.
+With runtime migration between data_sinfo and data_sinfo->sub_group[0] (both
+here and in later patches in this series such as "btrfs: zoned: return
+finished relocation block groups to the data space_info", "btrfs: zoned:
+promote reset data block groups to the relocation target", and "btrfs:
+zoned: reuse block groups emptied by reclaim as relocation target"):
+
+1. find_free_extent() observes block_group->space_info == data_sinfo before
+   down_read(&data_sinfo->groups_sem).
+2. Concurrently, btrfs_set_data_reloc_bg() unlinks bg->list under
+   data_sinfo->groups_sem, drops data_sinfo->groups_sem, and
+   zoned_move_bg_to_space_info() sets bg->space_info = to and calls
+   btrfs_add_bg_to_space_info(bg), linking bg->list into
+   data_sinfo->sub_group[0]->block_groups[index].
+3. find_free_extent() then acquires down_read(&data_sinfo->groups_sem).
+   Because bg->list is now linked into sub_group[0]->block_groups[index],
+   list_empty(&block_group->list) is false and block_group->space_info ==
+   space_info is not rechecked.
+4. find_free_extent() jumps to have_block_group inside
+   list_for_each_entry(block_group, &space_info->block_groups[ffe_ctl->index],
+   list) while holding data_sinfo->groups_sem. When do_allocation_zoned()
+   skips the relocation block group and jumps to loop, list_for_each_entry()
+   advances along sub_group[0]->block_groups[ffe_ctl->index] without holding
+   sub_group[0]->groups_sem and compares against the head of
+   data_sinfo->block_groups[ffe_ctl->index], walking across the list head of
+   sub_group[0] and treating struct btrfs_space_info as a struct
+   btrfs_block_group.
+
+Should find_free_extent() recheck block_group->space_info != space_info
+after acquiring down_read(&space_info->groups_sem) (with bg->space_info
+updated under groups_sem)?
+
+> +
+> +static bool btrfs_set_data_reloc_bg(struct btrfs_fs_info *fs_info,
+> +				    struct btrfs_block_group *bg)
+> +{
+> +	struct btrfs_space_info *data_sinfo = fs_info->data_sinfo;
+> +	const bool migrate = (bg->space_info == data_sinfo);
+> +
+> +	if (migrate) {
+> +		bool still_empty;
+> +
+> +		ASSERT(data_sinfo->sub_group[0]->subgroup_id == BTRFS_SUB_GROUP_DATA_RELOC,
+> +		       "subgroup_id=%d", data_sinfo->sub_group[0]->subgroup_id);
+> +
+> +		/*
+> +		 * Recheck under the write lock: an allocation may have started
+> +		 * using this block group after the caller found it empty.
+> +		 */
+> +		down_write(&data_sinfo->groups_sem);
+> +		spin_lock(&bg->lock);
+> +		still_empty = (bg->alloc_offset == 0 && bg->used == 0 &&
+> +			       bg->reserved == 0 && !bg->ro &&
+> +			       bg->space_info == data_sinfo);
+> +		if (still_empty)
+> +			list_del_init(&bg->list);
+> +		spin_unlock(&bg->lock);
+> +		up_write(&data_sinfo->groups_sem);
+
+[Severity: High]
+What prevents btrfs_delete_unused_bgs(), btrfs_inc_block_group_ro(), or a
+second btrfs_set_data_reloc_bg() caller from racing with the block group in
+the window after bg->lock and data_sinfo->groups_sem are dropped here,
+before zoned_move_bg_to_space_info() updates bg->space_info and the
+space_info accounting?
+
+First, empty block groups are placed on fs_info->unused_bgs (by
+read_one_block_group() or btrfs_create_pending_block_groups()), and
+btrfs_set_data_reloc_bg() does not remove bg from fs_info->unused_bgs. If
+btrfs_delete_unused_bgs() (or scrub calling btrfs_inc_block_group_ro()) runs
+after list_del_init(&bg->list) drops data_sinfo->groups_sem and bg->lock,
+but before zoned_move_bg_to_space_info() sets bg->space_info = to:
+
+fs/btrfs/block-group.c:inc_block_group_ro() {
+	...
+	if (!ret) {
+		sinfo->bytes_readonly += num_bytes;
+		if (btrfs_zoned_bg_is_append_only(cache)) {
+			/* Migrate zone_unusable bytes to readonly */
+			sinfo->bytes_readonly += cache->zone_unusable;
+			btrfs_space_info_update_bytes_zone_unusable(sinfo, -cache->zone_unusable);
+			cache->zone_unusable = 0;
+		}
+		cache->ro++;
+		list_add_tail(&cache->ro_list, &sinfo->ro_bgs);
+	}
+	...
+}
+
+1. Because list_del_init(&bg->list) makes list_is_singular(&bg->list) false,
+   btrfs_delete_unused_bgs() calls inc_block_group_ro(bg, false) on
+   data_sinfo, which adds bg->length to data_sinfo->bytes_readonly, moves
+   bg->zone_unusable to bytes_readonly, zeroes bg->zone_unusable, increments
+   bg->ro, and links bg->ro_list onto data_sinfo->ro_bgs.
+2. zoned_move_bg_to_space_info() then subtracts only bg->bytes_super (0)
+   from data_sinfo->bytes_readonly and bg->zone_unusable (now 0) from
+   data_sinfo->bytes_zone_unusable, sets bg->space_info = sub_group[0]
+   without holding bg->lock, and adds bg to sub_group[0].
+3. When btrfs_dec_block_group_ro(bg) runs (for example, after
+   btrfs_zone_finish(bg) returns -EAGAIN), it reads sinfo = bg->space_info
+   (now sub_group[0]), locks sub_group[0]->lock instead of data_sinfo->lock,
+   underflows sub_group[0]->bytes_readonly, and calls
+   list_del_init(&bg->ro_list) under the wrong lock while bg->ro_list is on
+   data_sinfo->ro_bgs. (Or if btrfs_zone_finish(bg) runs before
+   btrfs_zone_activate(bg) sets BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE,
+   do_zone_finish() returns 0 and btrfs_delete_unused_bgs() deletes the new
+   data_reloc_bg.)
+
+Second, because still_empty does not check !list_empty(&bg->list) and
+bg->space_info is still data_sinfo until zoned_move_bg_to_space_info(), two
+concurrent callers entering btrfs_set_data_reloc_bg() on the same empty bg
+can both pass the still_empty check and both call
+zoned_move_bg_to_space_info(), subtracting bg twice from data_sinfo and
+adding bg->list twice to sub_group[0].
+
+[Severity: High]
+Does migrating an empty block group out of data_sinfo also need to check
+under data_sinfo->lock that pending reservations in data_sinfo->bytes_may_use
+do not depend on this block group's capacity?
+
+When buffered writes reserve space via btrfs_reserve_data_bytes() ->
+reserve_bytes(), data_sinfo->bytes_may_use is incremented under
+data_sinfo->lock while the backing block group in data_sinfo still has
+bg->alloc_offset == 0, bg->used == 0, bg->reserved == 0, and !bg->ro until
+writeback calls find_free_extent(). Both inc_block_group_ro() and
+btrfs_delete_unused_bgs() check btrfs_space_info_used(space_info, true)
+against space_info->total_bytes before removing capacity from data_sinfo:
+
+fs/btrfs/block-group.c:btrfs_delete_unused_bgs() {
+	...
+	used = btrfs_space_info_used(space_info, true);
+	if (((space_info->total_bytes - block_group->length < used &&
+	      block_group->zone_unusable < block_group->length) ||
+	     has_unwritten_metadata(block_group)) &&
+	    !(block_group->flags & BTRFS_BLOCK_GROUP_REMAPPED)) {
+		spin_unlock(&block_group->lock);
+		spin_unlock(&space_info->lock);
+		goto next;
+	}
+	...
+}
+
+If btrfs_set_data_reloc_bg() and zoned_move_bg_to_space_info() subtract
+bg->length from data_sinfo->total_bytes at runtime without checking
+btrfs_space_info_used(data_sinfo, true) (for instance when
+btrfs_zoned_reserve_data_reloc_bg() searches data_sinfo before trying
+btrfs_chunk_alloc() on the relocation sub_group, or when a zone is reset in
+place), won't data_sinfo become overcommitted and cause subsequent delalloc
+writeback in cow_file_range() -> btrfs_reserve_extent() to fail with -ENOSPC
+when no further data chunks can be allocated?
+
+> +
+> +		if (!still_empty)
+> +			return false;
+> +
+> +		ASSERT(bg->bytes_super == 0, "bg->bytes_super=%llu", bg->bytes_super);
+> +	}
+> +
+> +	spin_lock(&fs_info->relocation_bg_lock);
+> +	fs_info->data_reloc_bg = bg->start;
+> +	spin_unlock(&fs_info->relocation_bg_lock);
+> +	set_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC, &bg->runtime_flags);
+> +
+> +	if (migrate)
+> +		zoned_move_bg_to_space_info(fs_info, bg, data_sinfo->sub_group[0]);
+
+[Severity: Medium]
+If fs_info->data_reloc_bg = bg->start is published before
+zoned_move_bg_to_space_info() moves bg into data_sinfo->sub_group[0], can a
+concurrent relocation allocation miss the relocation block group?
+
+In the original code in btrfs_zoned_reserve_data_reloc_bg(),
+fs_info->data_reloc_bg = bg->start was set after bg->space_info = reloc_sinfo
+and btrfs_add_bg_to_space_info(bg). With fs_info->data_reloc_bg published
+before zoned_move_bg_to_space_info(), a concurrent relocation extent
+allocation (find_free_extent() with ffe_ctl->for_data_reloc == true) will:
+
+1. Read fs_info->data_reloc_bg == bg->start in prepare_allocation_zoned()
+   and set ffe_ctl->hint_byte = bg->start.
+2. Reject the hinted bg in find_free_extent() because bg->space_info is
+   still data_sinfo (or list_empty(&bg->list) is true).
+3. Walk data_sinfo->sub_group[0]->block_groups[index], where bg has not been
+   added yet, while do_allocation_zoned() skips every other block group
+   because bytenr != fs_info->data_reloc_bg.
+4. Fall through to allocate an unnecessary chunk in sub_group[0] or fail
+   with -ENOSPC if no free device zones remain.
+
+Should zoned_move_bg_to_space_info() complete before publishing
+fs_info->data_reloc_bg = bg->start?
+
+[Severity: High]
+Also in btrfs_set_data_reloc_bg(), what happens when migrate is false
+(because bg->space_info is already data_sinfo->sub_group[0]), or when another
+thread concurrently sets fs_info->data_reloc_bg?
+
+When btrfs_zoned_reserve_data_reloc_bg() allocates a new chunk in
+data_sinfo->sub_group[0] and loops back to again: (or in later patches when
+btrfs_reset_unused_block_groups() -> zoned_reset_bg_in_place() resets an
+unused block group that is already in data_sinfo->sub_group[0]),
+bg->space_info == data_sinfo is false, so migrate is false.
+
+In that case:
+1. btrfs_set_data_reloc_bg() skips acquiring groups_sem and bg->lock and
+   never rechecks that bg is still empty (bg->alloc_offset == 0 &&
+   bg->used == 0 && bg->reserved == 0 && !bg->ro) after the caller dropped
+   groups_sem or bg->lock.
+2. Under fs_info->relocation_bg_lock, fs_info->data_reloc_bg = bg->start is
+   assigned unconditionally without checking whether fs_info->data_reloc_bg
+   is already non-zero.
+
+If a concurrent relocation allocation in do_allocation_zoned() is between
+its initial check and acquiring fs_info->relocation_bg_lock, or already set
+fs_info->data_reloc_bg (or another caller raced in
+btrfs_zoned_reserve_data_reloc_bg() / zoned_reset_bg_in_place()), won't
+overwriting fs_info->data_reloc_bg trigger the assertion in
+do_allocation_zoned():
+
+fs/btrfs/extent-tree.c:do_allocation_zoned() {
+	...
+	ASSERT(!ffe_ctl->for_data_reloc ||
+	       block_group->start == fs_info->data_reloc_bg ||
+	       fs_info->data_reloc_bg == 0);
+	...
+}
+
+or strand the previously active data_reloc_bg with
+BLOCK_GROUP_FLAG_ZONED_DATA_RELOC and BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE set?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027072232.419318-1-johannes.thumshirn@wdc.com?part=18
+

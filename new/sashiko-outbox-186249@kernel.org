@@ -1,0 +1,119 @@
+From sashiko-bot@kernel.org Tue Oct 27 08:58:32 2026
+Message-ID: <sashiko-outbox-186249@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 13/25] btrfs: zoned: wait for a running block group
+ reclaim in RECLAIM_ZONES
+Date: Tue, 27 Oct 2026 07:58:30 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: zoned: deadlock and unbounded stall from flush_work() in flush_space()
+--
+
+commit d5338a00e36f387cd4299b21fefd3a85461c4503
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: wait for a running block group reclaim in RECLAIM_ZONES
+
+This commit adds a flush_work() call on fs_info->reclaim_bgs_work in the
+RECLAIM_ZONES state of flush_space() on zoned filesystems so that callers
+wait for any in-progress background block group reclaim before attempting
+synchronous reclaim.
+
+> diff --git a/fs/btrfs/space-info.c b/fs/btrfs/space-info.c
+> index d5a84fa97462c..bb08294cbf9af 100644
+> --- a/fs/btrfs/space-info.c
+> +++ b/fs/btrfs/space-info.c
+> @@ -913,6 +913,7 @@ static void flush_space(struct btrfs_space_info *space_info, u64 num_bytes,
+>  		break;
+>  	case RECLAIM_ZONES:
+>  		if (btrfs_is_zoned(fs_info)) {
+> +			flush_work(&fs_info->reclaim_bgs_work);
+
+[Severity: High]
+Can calling flush_work(&fs_info->reclaim_bgs_work) in flush_space() cause an
+unbounded stall in btrfs_async_reclaim_data_space(), as well as a filesystem
+freeze deadlock and a circular locking dependency with sb_writers and
+sb->s_umount?
+
+First, regarding the unbounded stall: commit ad0c23c97b4e ("btrfs: zoned:
+limit number of zones reclaimed in flush_space()") previously removed
+flush_work(&fs_info->reclaim_bgs_work) from this path because
+cleaner_kthread() -> btrfs_reclaim_bgs() queues fs_info->reclaim_bgs_work to
+run btrfs_reclaim_bgs_work():
+
+fs/btrfs/block-group.c:btrfs_reclaim_bgs_work() {
+	struct btrfs_fs_info *fs_info =
+		container_of(work, struct btrfs_fs_info, reclaim_bgs_work);
+
+	btrfs_reclaim_block_groups(fs_info, -1);
+}
+
+Because btrfs_reclaim_bgs_work() passes -1 (UINT_MAX) as the limit, it
+relocates the entire fs_info->reclaim_bgs list without bound. Waiting on
+reclaim_bgs_work here causes btrfs_async_reclaim_data_space() ->
+do_async_reclaim_data_space() -> btrfs_flush_space() -> flush_space() to
+block on a full-list reclaim (causing hung-task stalls exceeding 120 seconds,
+such as in fstests generic/551), and then still unconditionally proceed to
+run btrfs_reclaim_sweep() and btrfs_reclaim_block_groups() for up to
+BTRFS_ZONED_SYNC_RECLAIM_BATCH more block groups before re-checking whether
+waiting tickets have been satisfied.
+
+Second, regarding the freeze deadlock and lockdep dependency: tasks reserving
+data space with BTRFS_RESERVE_FLUSH_DATA already hold superblock freeze
+protection while sleeping in reserve_bytes() -> wait_reserve_ticket() waiting
+for fs_info->async_data_reclaim_work to satisfy their ticket. For example,
+vfs_write() and vfs_fallocate() hold sb_start_write() (SB_FREEZE_WRITE), and
+btrfs_page_mkwrite() holds sb_start_pagefault() (SB_FREEZE_PAGEFAULT):
+
+fs/btrfs/file.c:btrfs_page_mkwrite() {
+	...
+	sb_start_pagefault(inode->vfs_inode.i_sb);
+	page_start = folio_pos(folio);
+	page_end = page_start + folio_size(folio) - 1;
+	end = page_end;
+
+	ret = btrfs_check_data_free_space(inode, &data_reserved, page_start,
+					  reserved_space, false);
+	...
+}
+
+Meanwhile, btrfs_reclaim_block_groups() (both when run via reclaim_bgs_work
+and when called directly below in RECLAIM_ZONES) acquires sb_start_write()
+via guard(super_write)(fs_info->sb):
+
+fs/btrfs/block-group.c:btrfs_reclaim_block_groups() {
+	...
+	if (!btrfs_should_reclaim(fs_info))
+		return;
+
+	guard(super_write)(fs_info->sb);
+	...
+}
+
+If freeze_super() runs concurrently, it sets SB_FREEZE_WRITE, calls
+sb_wait_write(sb, SB_FREEZE_WRITE), and then sets SB_FREEZE_PAGEFAULT and
+calls sb_wait_write(sb, SB_FREEZE_PAGEFAULT). Once freeze_super() begins
+waiting on SB_FREEZE_WRITE (or finishes SB_FREEZE_WRITE and waits on a
+btrfs_page_mkwrite() caller holding SB_FREEZE_PAGEFAULT),
+btrfs_reclaim_block_groups() blocks in guard(super_write)(fs_info->sb). As a
+result, btrfs_async_reclaim_data_space() cannot make progress to wake the
+ticket in wait_reserve_ticket(), the writer or pagefault never drops its
+superblock freeze reference, and freeze_super() deadlocks.
+
+In addition, because freeze_super() establishes the lock order sb_writers
+(SB_FREEZE_WRITE) -> sb->s_umount, and reconfigure_super() ->
+btrfs_remount_ro() runs under sb->s_umount and calls
+cancel_work_sync(&fs_info->async_data_reclaim_work), flushing
+reclaim_bgs_work from async_data_reclaim_work chains:
+
+  sb_writers (SB_FREEZE_WRITE)
+  -> &sb->s_umount
+  -> (work_completion)(&fs_info->async_data_reclaim_work)
+  -> (work_completion)(&fs_info->reclaim_bgs_work)
+  -> sb_writers (SB_FREEZE_WRITE)
+
+Wouldn't this complete a circular locking dependency in lockdep?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027072232.419318-1-johannes.thumshirn@wdc.com?part=13
+

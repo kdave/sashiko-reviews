@@ -1,0 +1,63 @@
+From sashiko-bot@kernel.org Wed Nov  4 21:00:56 2026
+Message-ID: <sashiko-outbox-197985@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/5] btrfs: use I_VERITY_BUILDING instead of private
+ flags
+Date: Wed, 04 Nov 2026 20:00:52 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: unpropagated btrfs_orphan_add() error in btrfs_begin_enable_verity()
+--
+
+commit d32a0bd97250023398879e80e49ecc247da4ccdf
+Author: Andrey Albershteyn via Linux-f2fs-devel <linux-f2fs-devel@lists.sourceforge.net>
+
+btrfs: use I_VERITY_BUILDING instead of private flags
+
+This commit removes the BTRFS_INODE_VERITY_IN_PROGRESS inode runtime flag now
+that the generic VFS fs-verity path tracks in-progress Merkle tree
+construction via I_VERITY_BUILDING.
+
+> diff --git a/fs/btrfs/verity.c b/fs/btrfs/verity.c
+> index b34d2247cf84e..82e2ebad0d3e6 100644
+> --- a/fs/btrfs/verity.c
+> +++ b/fs/btrfs/verity.c
+
+[ ... ]
+
+> @@ -606,8 +600,6 @@ static int btrfs_begin_enable_verity(struct file *filp)
+>  		return PTR_ERR(trans);
+>  
+>  	ret = btrfs_orphan_add(trans, inode);
+> -	if (!ret)
+> -		set_bit(BTRFS_INODE_VERITY_IN_PROGRESS, &inode->runtime_flags);
+>  	btrfs_end_transaction(trans);
+>  
+>  	return 0;
+
+[Severity: Medium]
+In btrfs_begin_enable_verity(), removing the if (!ret) check leaves the return
+value of btrfs_orphan_add() in ret unread (which triggers an unused-but-set
+variable compiler warning) while the function still ends with return 0.
+
+Previously, if btrfs_orphan_add() failed during the
+fsverity_ioctl_enable() -> enable_verity() -> btrfs_begin_enable_verity()
+path, BTRFS_INODE_VERITY_IN_PROGRESS was not set. Now, enable_verity() in
+fs/verity/enable.c checks the return value of begin_enable_verity():
+
+    err = vops->begin_enable_verity(filp);
+    if (!err) {
+        spin_lock(&inode->i_lock);
+        inode_state_set(inode, I_VERITY_BUILDING);
+        spin_unlock(&inode->i_lock);
+    }
+
+Because btrfs_begin_enable_verity() returns 0 even when btrfs_orphan_add()
+fails and aborts the transaction, enable_verity() will still set
+I_VERITY_BUILDING and proceed to build_merkle_tree() without an orphan item.
+
+Should btrfs_begin_enable_verity() return ret instead of 0?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261104194618.103332-1-aalbersh@kernel.org?part=3
+

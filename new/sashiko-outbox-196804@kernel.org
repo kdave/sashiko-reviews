@@ -1,0 +1,113 @@
+From sashiko-bot@kernel.org Wed Nov  4 08:39:37 2026
+Message-ID: <sashiko-outbox-196804@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH RFC] btrfs: wait for encoded writes in fast fsync
+Date: Wed, 04 Nov 2026 07:39:32 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: early exit on encoded write error in btrfs_sync_file() skips waits
+--
+
+commit 885167181817b4740fc908bd1f8825ef47b8961f
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: wait for encoded writes in fast fsync
+
+This commit waits for encoded ordered extents in the fast fsync path of
+btrfs_sync_file() before waiting on page cache writeback so that encoded
+write data and async checksums complete before being logged. If an encoded
+ordered extent has BTRFS_ORDERED_IOERR set, it fails the fsync early.
+
+Link: https://sashiko.dev/#/patchset/8eb322321cac98013cc46dfe8d89fa58c1ad3dee.1793766229.git.wqu%40suse.com
+
+> diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+> index f978c6524aa03..536a6aa446398 100644
+> --- a/fs/btrfs/file.c
+> +++ b/fs/btrfs/file.c
+> @@ -1629,12 +1629,31 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+>  		ret = btrfs_wait_ordered_range(inode, start, len);
+>  		clear_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags);
+>  	} else {
+> +		struct btrfs_ordered_extent *ordered;
+> +
+>  		/*
+>  		 * Get our ordered extents as soon as possible to avoid doing
+>  		 * checksum lookups in the csum tree, and use instead the
+>  		 * checksums attached to the ordered extents.
+>  		 */
+>  		btrfs_get_ordered_extents_for_logging(inode, &ctx.ordered_extents);
+> +
+> +		/*
+> +		 * Encoded writes don't mark any folio of the inode as writeback,
+> +		 * thus the fdatawait below can't wait for them.  Wait for them
+> +		 * explicitly, so that their data is on disk and their checksums
+> +		 * are fully generated before we log them.
+> +		 */
+> +		list_for_each_entry(ordered, &ctx.ordered_extents, log_list) {
+> +			if (test_bit(BTRFS_ORDERED_ENCODED, &ordered->flags)) {
+> +				btrfs_start_ordered_extent(ordered);
+> +				if (test_bit(BTRFS_ORDERED_IOERR, &ordered->flags)) {
+> +					ret = -EIO;
+> +					goto out_release_extents;
+> +				}
+> +			}
+> +		}
+
+[Severity: Medium]
+If an application submits multiple encoded writes (or mixes encoded and
+buffered writes) and the first BTRFS_ORDERED_ENCODED extent in
+ctx.ordered_extents fails with BTRFS_ORDERED_IOERR, jumping directly to
+out_release_extents in btrfs_sync_file() (fs/btrfs/file.c) skips waiting
+for the remaining encoded ordered extents in ctx.ordered_extents, skips
+filemap_fdatawait_range(), and skips the BTRFS_INODE_COW_WRITE_ERROR check
+that follows:
+
+fs/btrfs/file.c:btrfs_sync_file() {
+    ...
+		ret = filemap_fdatawait_range(inode->vfs_inode.i_mapping, start, end);
+		if (ret)
+			goto out_release_extents;
+
+		if (test_and_clear_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags))
+			ret = btrfs_wait_ordered_range(inode, start, len);
+	}
+    ...
+out:
+    ...
+	err = file_check_and_advance_wb_err(file);
+	if (!ret)
+		ret = err;
+}
+
+When an encoded write fails, end_bbio_compressed_write() ->
+btrfs_finish_ordered_extent() (fs/btrfs/ordered-data.c) sets
+BTRFS_INODE_COW_WRITE_ERROR on inode->runtime_flags:
+
+fs/btrfs/ordered-data.c:btrfs_finish_ordered_extent() {
+    ...
+	if (!uptodate && !test_bit(BTRFS_ORDERED_NOCOW, &ordered->flags))
+		set_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags);
+    ...
+}
+
+Because out_release_extents leads to out:, file_check_and_advance_wb_err()
+advances file->f_wb_err while later encoded writes or page cache writeback
+started before this fsync are still in flight (or still in
+inode->ordered_tree awaiting completion on endio_write_workers), and leaves
+BTRFS_INODE_COW_WRITE_ERROR set on the inode. If one of those pre-existing
+in-flight writes also fails after file_check_and_advance_wb_err() runs, or
+has not yet been removed from inode->ordered_tree, a subsequent fsync() can
+observe a spurious -EIO from the earlier write and is forced to run
+btrfs_wait_ordered_range().
+
+Unlike this loop, btrfs_wait_ordered_range() (fs/btrfs/ordered-data.c)
+records ret = -EIO on BTRFS_ORDERED_IOERR without exiting early so that all
+ordered extents in the range finish before returning. Should
+btrfs_sync_file() similarly record the error and continue waiting for the
+remaining encoded ordered extents, filemap_fdatawait_range(), and
+btrfs_wait_ordered_range() when BTRFS_INODE_COW_WRITE_ERROR is set before
+jumping to out_release_extents?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/c284dccd8c27a6434e56ed067b0ef4ea67935d8c.1793776224.git.wqu@suse.com?part=1
+

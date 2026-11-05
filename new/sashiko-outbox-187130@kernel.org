@@ -1,0 +1,131 @@
+From sashiko-bot@kernel.org Tue Oct 27 22:37:30 2026
+Message-ID: <sashiko-outbox-187130@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 10/10] ovl: implement containerized syncfs for overlayfs
+Date: Tue, 27 Oct 2026 21:37:27 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] ovl: unhashed root inode skipped by dirty tracking in ovl_sync_fs()
+--
+
+commit 741172152da9dc7e9c48781b1b044c29b845fc05
+Author: Chengguang Xu <charliecgxu@tencent.com>
+
+ovl: implement containerized syncfs for overlayfs
+
+This commit changes ovl_sync_fs() so that when dirty inode tracking is
+enabled on an overlayfs mount (SB_I_OVL_USE_SYNC_FS), it skips calling
+sync_filesystem() on the upper superblock and instead invokes ->sync_fs()
+and syncs the upper block device directly.
+
+> diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+> index 631f68a97980f..c570bf7103f84 100644
+> --- a/fs/overlayfs/super.c
+> +++ b/fs/overlayfs/super.c
+[ ... ]
+> @@ -269,18 +270,45 @@ static int ovl_sync_fs(struct super_block *sb, int wait)
+>  	/*
+>  	 * Not called for sync(2) call or an emergency sync (SB_I_SKIP_SYNC).
+>  	 * All the super blocks will be iterated, including upper_sb.
+> -	 *
+> -	 * If this is a syncfs(2) call, then we do need to call
+> -	 * sync_filesystem() on upper_sb, but enough if we do it when being
+> -	 * called with wait == 1.
+>  	 */
+> -	if (!wait)
+> -		return 0;
+> -
+>  	upper_sb = ovl_upper_mnt(ofs)->mnt_sb;
+>  
+> +	if (!ovl_tracks_dirty(ofs)) {
+> +		/*
+> +		 * If this is a syncfs(2) call, then we do need to call
+> +		 * sync_filesystem() on upper_sb, but enough if we do it when
+> +		 * being called with wait == 1.
+> +		 */
+> +		if (!wait)
+> +			return 0;
+> +
+> +		down_read(&upper_sb->s_umount);
+> +		ret = sync_filesystem(upper_sb);
+> +		up_read(&upper_sb->s_umount);
+> +
+> +		return ret;
+> +	}
+> +
+> +	/*
+> +	 * For syncfs(2) and for unmount, sync_filesystem() has written the
+> +	 * dirty inodes of this overlay by now, see ovl_write_inode().  What is
+> +	 * left is for the upper filesystem to commit its metadata.  The dirty
+> +	 * inodes of everybody else on the upper filesystem are none of our
+> +	 * business.
+> +	 */
+>  	down_read(&upper_sb->s_umount);
+> -	ret = sync_filesystem(upper_sb);
+> +	/* As in sync_filesystem(): ->sync_fs() doesn't expect to be called then */
+> +	ret = 0;
+> +	if (sb_rdonly(upper_sb))
+> +		goto out;
+> +
+> +	if (upper_sb->s_op->sync_fs)
+> +		ret = upper_sb->s_op->sync_fs(upper_sb, wait);
+> +	if (!ret && wait)
+> +		ret = sync_blockdev(upper_sb->s_bdev);
+> +	else if (!ret)
+> +		ret = sync_blockdev_nowait(upper_sb->s_bdev);
+
+[Severity: Medium]
+Can lazytime timestamp updates on the overlay root directory be lost across
+syncfs(2) and umount(2) when ovl_tracks_dirty(ofs) is true and the upper
+filesystem uses SB_LAZYTIME?
+
+In fs/overlayfs/super.c:ovl_get_root(), the overlay root inode is allocated
+via ovl_new_inode() -> new_inode() and never inserted into the inode hash
+table:
+
+	root = d_make_root(ovl_new_inode(sb, S_IFDIR, 0));
+	if (!root)
+		return NULL;
+
+When timestamps on the overlay root directory are updated (for example via
+ovl_update_time(), ovl_setattr(), or ovl_dir_modified() -> ovl_copyattr()),
+the upper root inode is marked I_DIRTY_TIME and ovl_mark_inode_dirty() calls
+mark_inode_dirty() on the overlay root inode:
+
+	touch_atime(&upperpath);
+	inode_set_atime_to_ts(inode,
+			      inode_get_atime(d_inode(upperpath.dentry)));
+	ovl_mark_inode_dirty(inode);
+
+However, fs/fs-writeback.c:__mark_inode_dirty() skips queueing unhashed
+inodes onto wb->b_dirty:
+
+	if (!S_ISBLK(inode->i_mode)) {
+		if (inode_unhashed(inode))
+			goto out_unlock;
+	}
+
+As a result, writeback_inodes_sb(sb) and sync_inodes_sb(sb) never visit
+d_inode(sb->s_root) to call ovl_write_inode() -> ovl_sync_lazytime(). During
+umount(2), fs/overlayfs/super.c:ovl_drop_inode() also calls
+inode_generic_drop(), which returns 1 for an unhashed inode so iput_final()
+evicts the root inode without calling write_inode_now():
+
+static int ovl_drop_inode(struct inode *inode)
+{
+	if (!(inode_state_read(inode) & (I_DIRTY_ALL | I_SYNC)))
+		return 1;
+	return inode_generic_drop(inode);
+}
+
+Previously, ovl_sync_fs() called sync_filesystem(upper_sb), which flushed the
+upper root inode via sync_inodes_sb(upper_sb). With this change, when
+ovl_tracks_dirty(ofs) is true, ovl_sync_fs() only calls
+upper_sb->s_op->sync_fs() and sync_blockdev(), leaving I_DIRTY_TIME on the
+upper root inode unwritten. Should the overlay root inode be hashed (or
+otherwise flushed during sync and eviction) so its dirty state is tracked like
+other overlay inodes?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027-b4-ovl-containerized-sync-v1-0-802e512379a6@toxicpanda.com?part=10
+

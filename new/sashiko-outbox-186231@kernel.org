@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Tue Oct 27 08:46:25 2026
+Message-ID: <sashiko-outbox-186231@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5 16/25] btrfs: zoned: don't account superblock zones
+ as available data space
+Date: Tue, 27 Oct 2026 07:46:10 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: zoned: btrfs_zoned_dev_avail_bytes() misses regular superblock zones
+--
+
+commit 1249c90bb4f17615e9d43a3e1b4de589a36a4d39
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't account superblock zones as available data space
+
+This commit subtracts the log-structured superblock zones from the
+per-device available space calculation on zoned filesystems in
+btrfs_calc_avail_data_space() via btrfs_zoned_dev_avail_bytes().
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 9184a7fc385ca..186f22aff4b1b 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -963,6 +963,28 @@ static inline bool is_sb_log_zone(struct btrfs_zoned_device_info *zinfo,
+>  	return true;
+>  }
+>  
+> +u64 btrfs_zoned_dev_avail_bytes(struct btrfs_device *device, u64 avail)
+> +{
+> +	struct btrfs_zoned_device_info *zinfo = device->zone_info;
+> +	const u64 total = btrfs_device_get_total_bytes(device);
+> +	u64 sb_bytes = 0;
+> +
+> +	for (int i = 0; i < BTRFS_SUPER_MIRROR_MAX; i++) {
+> +		const u32 sb_zone = sb_zone_number(zinfo->zone_size_shift, i);
+> +
+> +		for (int j = 0; j < BTRFS_NR_SB_LOG_ZONES; j++) {
+> +			if (zone_start_physical(sb_zone + j, zinfo) < total)
+> +				sb_bytes += zinfo->zone_size;
+> +		}
+> +	}
+
+[Severity: Medium]
+Should btrfs_zoned_dev_avail_bytes() also exclude the zones containing the
+regular superblock offsets returned by btrfs_sb_offset(i)?
+
+In btrfs_find_allocatable_zones() (and in exclude_super_stripes() in
+fs/btrfs/block-group.c), the zoned chunk allocator unconditionally skips
+any zone overlapping btrfs_sb_offset(i):
+
+fs/btrfs/zoned.c:btrfs_find_allocatable_zones() {
+	...
+			/* We also need to exclude regular superblock positions */
+			sb_pos = btrfs_sb_offset(i);
+			if (!(pos + num_bytes <= sb_pos ||
+			      sb_pos + BTRFS_SUPER_INFO_SIZE <= pos)) {
+				have_sb = true;
+				pos = ALIGN(sb_pos + BTRFS_SUPER_INFO_SIZE,
+					    zinfo->zone_size);
+				break;
+			}
+	...
+}
+
+Because sb_zone_number() places the log-structured superblock zone pairs at
+0B, 512 GiB, and 4 TiB, whereas btrfs_sb_offset(i) places the regular
+superblock offsets at 64 KiB, 64 MiB, and 256 GiB, the regular superblock
+offsets fall into separate unallocatable zones in two cases:
+
+1. For mirror 1 (64 MiB), when zinfo->zone_size is smaller than 64 MiB
+   (4 MiB, 8 MiB, 16 MiB, or 32 MiB), the mirror 0 log zones [0,
+   2 * zone_size) end at or before 64 MiB, so btrfs_sb_offset(1) lies in a
+   distinct zone.
+
+2. For mirror 2 (256 GiB), because BTRFS_MAX_ZONE_SIZE is 8 GiB, the zone
+   containing 256 GiB never overlaps the log zones at 0B, 512 GiB, or
+   4 TiB for any valid zone size on devices larger than 256 GiB.
+
+Since chunks can never be allocated in those zones, they are never added to
+device->bytes_used. Does omitting them here cause
+btrfs_calc_avail_data_space() (and btrfs_zoned_data_chunk_allowed() in the
+following patch "btrfs: zoned: keep a zone free for relocation when
+allocating data chunks") to overcount available zones by 1 or 2 zones and
+allow data chunk allocation to consume the last free zone reserved for
+relocation?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027072232.419318-1-johannes.thumshirn@wdc.com?part=16
+

@@ -1,0 +1,94 @@
+From sashiko-bot@kernel.org Wed Oct 28 15:14:13 2026
+Message-ID: <sashiko-outbox-187965@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC PATCH v2 2/2] btrfs: add provenance time (ptime)
+Date: Wed, 28 Oct 2026 14:14:08 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: unconditional FS_XFLAG_PTIME in btrfs_fileattr_get() breaks setflags
+--
+
+commit 3980aac90649dff9583d47cd090fe00a8692a1f0
+Author: koraynilay <koray.fra@gmail.com>
+
+btrfs: add provenance time (ptime)
+
+This commit implements provenance time (ptime) in Btrfs by claiming 12 bytes
+from the reserved space in btrfs_inode_item and adding support for reading
+and setting ptime via getattr and fileattr operations. It also introduces
+fileattr_has_fsx_mask() to check for unsupported xflags while allowing
+supported ones.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index f3e2afe221be3..48598a99bddb1 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -275,6 +275,9 @@ int btrfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+>  	const struct btrfs_inode *inode = BTRFS_I(d_inode(dentry));
+>  
+>  	fileattr_fill_flags(fa, btrfs_inode_flags_to_fsflags(inode));
+> +	fa->fsx_ptime.tv_sec = inode->i_ptime_sec;
+> +	fa->fsx_ptime.tv_nsec = inode->i_ptime_nsec;
+> +	fa->fsx_xflags |= FS_XFLAG_PTIME;
+>  	return 0;
+>  }
+
+[Severity: High]
+Does setting FS_XFLAG_PTIME unconditionally in btrfs_fileattr_get() prevent
+clearing the immutable or append-only flags on Btrfs inodes via
+FS_IOC_SETFLAGS (e.g., chattr -i or chattr -a)?
+
+When ioctl_setflags() calls vfs_fileattr_set() with fa->flags_valid set,
+vfs_fileattr_set() first calls vfs_fileattr_get() -> btrfs_fileattr_get()
+to populate old_ma, which sets FS_XFLAG_PTIME in old_ma.fsx_xflags.
+
+Because FS_XFLAG_PTIME is not in FS_XFLAG_COMMON, vfs_fileattr_set() copies
+it into fa->fsx_xflags:
+
+fs/file_attr.c:vfs_fileattr_set() {
+	...
+	if (fa->flags_valid) {
+		fa->fsx_xflags |= old_ma.fsx_xflags & ~FS_XFLAG_COMMON;
+		...
+		fa->fsx_ptime = old_ma.fsx_ptime;
+	}
+	...
+	err = fileattr_set_prepare(inode, &old_ma, fa);
+}
+
+Then fileattr_set_prepare() runs before btrfs_fileattr_set() can update the
+inode flags:
+
+fs/file_attr.c:fileattr_set_prepare() {
+	...
+	if (fa->fsx_xflags & FS_XFLAG_PTIME) {
+		if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
+			return -EPERM;
+
+		if ((unsigned long)fa->fsx_ptime.tv_nsec >= NSEC_PER_SEC)
+			return -EINVAL;
+
+		fa->fsx_ptime = timestamp_truncate(fa->fsx_ptime, inode);
+	}
+}
+
+If the inode currently has S_IMMUTABLE or S_APPEND set, won't
+fileattr_set_prepare() always reject the operation with -EPERM, making it
+impossible to clear FS_IMMUTABLE_FL or FS_APPEND_FL or modify other flags
+like FS_NOATIME_FL on an append-only inode?
+
+Similarly, a read-modify-write using file_getattr() followed by
+file_setattr() to clear FS_XFLAG_IMMUTABLE or FS_XFLAG_APPEND will also
+fail with -EPERM unless the caller explicitly clears FS_XFLAG_PTIME from
+fa_xflags.
+
+Additionally, since btrfs_read_locked_inode() and check_inode_item() do not
+validate that ptime.nsec < NSEC_PER_SEC, if an on-disk inode item has an
+out-of-range i_ptime_nsec (for example, from non-zero reserved[] bytes),
+won't any unrelated FS_IOC_SETFLAGS call fail with -EINVAL in
+fileattr_set_prepare(), and otherwise cause btrfs_fileattr_set() to rewrite
+inode->i_ptime_sec and inode->i_ptime_nsec on every FS_IOC_SETFLAGS call?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261028134728.294127-1-koray.fra@gmail.com?part=2
+

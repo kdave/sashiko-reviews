@@ -1,0 +1,144 @@
+From sashiko-bot@kernel.org Tue Oct 27 15:57:42 2026
+Message-ID: <sashiko-outbox-186777@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: zoned: don't wait for ordered extents in
+ do_zone_finish()
+Date: Tue, 27 Oct 2026 14:57:40 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [High] btrfs: zoned: unhandled -EAGAIN from btrfs_zone_finish_one_bg() on allocation race
+--
+
+commit df8ffe040241bb171aead21ccee807c8bb627ab1
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't wait for ordered extents in do_zone_finish()
+
+This commit removes the btrfs_wait_ordered_roots() call from
+do_zone_finish() on zoned filesystems, relying on the subsequent check of
+block_group->reserved to return -EAGAIN if a data allocation raced before
+the block group was marked read-only.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 1cda88332284e..16f8d9e7a7bec 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2578,9 +2578,10 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+>  
+>  		/* Ensure all writes in this block group finish */
+>  		btrfs_wait_block_group_reservations(block_group);
+> -		/* No need to wait for NOCOW writers. Zoned mode does not allow that */
+> -		btrfs_wait_ordered_roots(fs_info, U64_MAX, block_group);
+> -		/* Wait for extent buffers to be written. */
+> +		/*
+> +		 * No need to wait for NOCOW writers, as zoned mode does not
+> +		 * allow that, only wait for extent buffers to be written.
+> +		 */
+>  		if (is_metadata)
+>  			wait_eb_writebacks(block_group);
+
+[Severity: High]
+Does removing btrfs_wait_ordered_roots() here cause unhandled -EAGAIN errors
+and potential hangs when btrfs_zone_finish_one_bg() races with a concurrent
+data allocation?
+
+In fs/btrfs/zoned.c:btrfs_zone_finish_one_bg(), a candidate active data block
+group with reserved == 0 is selected under fs_info->zone_active_bgs_lock.
+After dropping zone_active_bgs_lock and before do_zone_finish() marks min_bg
+read-only via btrfs_inc_block_group_ro(), a concurrent find_free_extent()
+call can allocate from min_bg and increment min_bg->reserved.
+
+Without btrfs_wait_ordered_roots(), do_zone_finish() only waits for
+btrfs_wait_block_group_reservations() (ordered extent creation) and then sees
+block_group->reserved > 0 while that ordered extent is still in flight,
+returning -EAGAIN. btrfs_zone_finish_one_bg() propagates that -EAGAIN directly
+instead of trying another active block group or treating it like a 0 return:
+
+fs/btrfs/zoned.c:btrfs_zone_finish_one_bg() {
+	...
+	ret = btrfs_zone_finish(min_bg);
+	btrfs_put_block_group(min_bg);
+
+	return ret < 0 ? ret : 1;
+}
+
+This appears to cause two regressions in the callers of
+btrfs_zone_finish_one_bg():
+
+1. In fs/btrfs/extent-tree.c:can_allocate_chunk_zoned(),
+btrfs_can_activate_zone() has already set BTRFS_FS_NEED_ZONE_FINISH on
+fs_info->flags. When btrfs_zone_finish_one_bg() returns 0 (because all active
+block groups already had reserved > 0), can_allocate_chunk_zoned() falls
+through to the ffe_ctl->max_extent_size >= ffe_ctl->min_alloc_size check and
+returns -ENOSPC, which tells btrfs_reserve_extent() to shrink num_bytes and
+allocate the remaining space in the active block groups so they can fill up
+and finish in btrfs_zone_finish_endio().
+
+However, when btrfs_zone_finish_one_bg() returns -EAGAIN,
+can_allocate_chunk_zoned() returns -EAGAIN early, bypassing the
+max_extent_size check:
+
+fs/btrfs/extent-tree.c:can_allocate_chunk_zoned() {
+	...
+	if (ffe_ctl->flags & BTRFS_BLOCK_GROUP_DATA) {
+		int ret = btrfs_zone_finish_one_bg(fs_info);
+
+		if (ret == 1)
+			return 0;
+		else if (ret < 0)
+			return ret;
+	}
+
+	if (ffe_ctl->max_extent_size >= ffe_ctl->min_alloc_size)
+		return -ENOSPC;
+	...
+}
+
+btrfs_reserve_extent() then returns -EAGAIN without splitting the allocation
+request. Callers such as fs/btrfs/inode.c:cow_file_range() and
+fs/btrfs/direct-io.c:btrfs_new_extent_direct() will sleep uninterruptibly on
+BTRFS_FS_NEED_ZONE_FINISH:
+
+fs/btrfs/inode.c:cow_file_range() {
+	...
+		if (ret == -EAGAIN) {
+			ASSERT(btrfs_is_zoned(fs_info));
+			if (start == orig_start) {
+				wait_on_bit_io(&inode->root->fs_info->flags,
+					       BTRFS_FS_NEED_ZONE_FINISH,
+					       TASK_UNINTERRUPTIBLE);
+				continue;
+			}
+	...
+}
+
+Because the active block groups still have unallocated space (alloc_offset <
+zone_capacity), completing the racing I/O in btrfs_zone_finish_endio() will
+not finish the zone or clear BTRFS_FS_NEED_ZONE_FINISH, leaving the waiting
+task hung. In addition, callers of btrfs_reserve_extent() that do not handle
+-EAGAIN (such as btrfs_encoded_write()) will fail with -EAGAIN.
+
+2. In fs/btrfs/zoned.c:btrfs_zoned_activate_one_bg(), a 0 return from
+btrfs_zone_finish_one_bg() breaks out of the loop and returns 0, whereas
+-EAGAIN is propagated as an error to btrfs_inc_block_group_ro() and
+reserve_chunk_space():
+
+fs/btrfs/zoned.c:btrfs_zoned_activate_one_bg() {
+	...
+		ret = btrfs_zone_finish_one_bg(fs_info);
+		if (ret == 0)
+			break;
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+Should btrfs_zone_finish_one_bg() handle -EAGAIN from btrfs_zone_finish() (for
+example, by retrying other candidate block groups or returning 0 when none can
+be finished due to a race)?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261027143305.4001082-1-johannes.thumshirn@wdc.com?part=1
+
