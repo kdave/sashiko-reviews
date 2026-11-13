@@ -1,0 +1,116 @@
+From sashiko-bot@kernel.org Thu Nov  5 13:28:26 2026
+Message-ID: <sashiko-outbox-199029@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: bug: btrfs: direct IO fallback racing with in-flight direct IO
+ fails fsync
+Date: Thu, 05 Nov 2026 12:28:22 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: btrfs_direct_write() dirties EOF folio before inode_dio_wait()
+--
+
+commit 871cb8197e0af60435956e4e7a1751d0c312b01f
+Author: Breno Leitao <leitao@debian.org>
+
+bug: btrfs: direct IO fallback racing with in-flight direct IO fails fsync
+
+This commit drains in-flight direct IO via inode_dio_wait() in
+btrfs_buffered_write() when an O_DIRECT write falls back to buffered IO, so
+that page cache folios are not dirtied while concurrent direct IO is in
+flight.
+
+> diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+> index f978c6524aa03..2017a96814d85 100644
+> --- a/fs/btrfs/file.c
+> +++ b/fs/btrfs/file.c
+> @@ -1334,6 +1334,14 @@ ssize_t btrfs_buffered_write(struct kiocb *iocb, struct iov_iter *iter)
+>  	if (ret < 0)
+>  		return ret;
+>  
+> +	/*
+> +	 * A direct write that fell back to buffered IO must not dirty folios
+> +	 * while direct IO is in flight: its completion fails to invalidate
+> +	 * them and records -EIO in the mapping.
+> +	 */
+> +	if (iocb->ki_flags & IOCB_DIRECT)
+> +		inode_dio_wait(inode);
+
+[Severity: Medium]
+Can btrfs_direct_write() already dirty the folio containing oldsize before
+reaching inode_dio_wait() here?
+
+In fs/btrfs/direct-io.c, btrfs_direct_write() calls btrfs_write_check()
+before check_direct_IO() and before falling back to btrfs_buffered_write():
+
+fs/btrfs/direct-io.c:btrfs_direct_write() {
+	...
+	ret = btrfs_write_check(iocb, ret);
+	if (ret < 0) {
+		btrfs_inode_unlock(BTRFS_I(inode), ilock_flags);
+		goto out;
+	}
+	...
+}
+
+When pos > oldsize, btrfs_write_check() calls btrfs_cont_expand(), which
+calls btrfs_truncate_block(inode, oldsize, oldsize, -1):
+
+fs/btrfs/file.c:btrfs_write_check() {
+	...
+	oldsize = i_size_read(inode);
+	if (pos > oldsize) {
+		/* Expand hole size to cover write data, preventing empty gap */
+		loff_t end_pos = round_up(pos + count, fs_info->sectorsize);
+
+		ret = btrfs_cont_expand(BTRFS_I(inode), oldsize, end_pos);
+		if (ret)
+			return ret;
+	}
+	...
+}
+
+If an earlier unaligned O_DIRECT write fell back to buffered IO and left
+oldsize unaligned to sectorsize, btrfs_truncate_block() allocates the folio
+containing oldsize in the page cache, zeroes the partial tail block, and
+marks the folio dirty via btrfs_folio_set_dirty() without waiting for
+in-flight direct IO on other blocks of the same folio:
+
+fs/btrfs/inode.c:btrfs_truncate_block() {
+	...
+	btrfs_folio_set_dirty(fs_info, folio, block_start,
+			      block_end + 1 - block_start);
+	...
+}
+
+When btrfs_direct_write() subsequently falls back to btrfs_buffered_write(),
+inode_dio_wait(inode) blocks waiting for the in-flight direct IO to complete
+while that folio is already dirty in the page cache. When the in-flight
+direct IO finishes, iomap_dio_complete() runs
+kiocb_invalidate_post_direct_write() before inode_dio_end(), which sees the
+dirty folio, fails invalidate_inode_pages2_range() with -EBUSY, and calls
+dio_warn_stale_pagecache() to record -EIO in the mapping.
+
+Also, if pos is in a later folio than oldsize, the post-fallback writeback
+and invalidation in btrfs_direct_write() only covers
+[pos, pos + written_buffered - 1], which leaves the folio dirtied at oldsize
+in the page cache:
+
+fs/btrfs/direct-io.c:btrfs_direct_write() {
+	...
+	endbyte = pos + written_buffered - 1;
+	ret = btrfs_fdatawrite_range(BTRFS_I(inode), pos, endbyte);
+	if (ret)
+		goto out;
+	ret = filemap_fdatawait_range(inode->i_mapping, pos, endbyte);
+	if (ret)
+		goto out;
+	written += written_buffered;
+	iocb->ki_pos = pos + written_buffered;
+	invalidate_mapping_pages(file->f_mapping, pos >> PAGE_SHIFT,
+				 endbyte >> PAGE_SHIFT);
+	...
+}
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/auxv7Tg0xSq5yHmb@gmail.com?part=1
+

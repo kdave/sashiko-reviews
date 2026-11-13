@@ -1,0 +1,98 @@
+From sashiko-bot@kernel.org Fri Nov  6 20:27:00 2026
+Message-ID: <sashiko-outbox-202150@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: drop the link count of a subvolume inode when
+ deleting the subvolume
+Date: Fri, 06 Nov 2026 19:26:57 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: btrfs_evict_inode() truncates dead subvolume root when
+  i_nlink is 0
+- [Medium] btrfs: unlocked drop_nlink() in btrfs_ioctl_snap_destroy()
+  misses btrfs_rmdir()
+--
+
+commit 7f8537ec8ca7c6b8bd5a0521b4b1db19a9edb47d
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: drop the link count of a subvolume inode when deleting the subvolume
+
+This commit drops the link count of a subvolume's root inode in
+btrfs_ioctl_snap_destroy() after btrfs_delete_subvolume() succeeds so
+that holding an open file descriptor on the deleted subvolume does not
+keep it listed as deleted after close.
+
+Link: https://lore.kernel.org/linux-btrfs/18e431317f832f21-26f56778@a-workstation/
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 9857d6a9d4560..1ef798feb89fb 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -2451,8 +2451,10 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
+>  	btrfs_inode_lock(BTRFS_I(inode), 0);
+>  	ret = btrfs_delete_subvolume(BTRFS_I(dir), dentry);
+>  	btrfs_inode_unlock(BTRFS_I(inode), 0);
+> -	if (!ret)
+> +	if (!ret) {
+> +		drop_nlink(inode);
+>  		d_delete_notify(dir, dentry);
+> +	}
+>  
+>  out_end_removing:
+>  	end_removing(dentry);
+
+[Severity: Medium]
+Does dropping inode->i_nlink to 0 here cause btrfs_evict_inode() to
+synchronously truncate the deleted subvolume's root directory items from
+the dead subvolume B-tree instead of leaving the tree for
+btrfs_drop_snapshot()?
+
+In btrfs_evict_inode(), inodes in a deleted subvolume
+(btrfs_root_refs(&root->root_item) == 0) rely on inode->i_nlink > 0 to
+skip per-inode B-tree truncation:
+
+fs/btrfs/inode.c:btrfs_evict_inode() {
+	...
+	if (inode->i_nlink > 0) {
+		BUG_ON(btrfs_root_refs(&root->root_item) != 0 &&
+		       btrfs_root_id(root) != BTRFS_ROOT_TREE_OBJECTID);
+		goto out;
+	}
+	...
+		ret = btrfs_truncate_inode_items(trans, root, &control);
+}
+
+With inode->i_nlink set to 0 on the subvolume root inode
+(BTRFS_FIRST_FREE_OBJECTID), dropping the last reference in
+d_delete_notify() or on final close falls through into the unlinked-inode
+eviction loop and btrfs_orphan_del().  For a non-empty subvolume or
+snapshot, btrfs_truncate_inode_items() synchronously COWs shared leaves in
+the dead subvolume tree to delete every directory item in the root
+directory using BTRFS_RESERVE_FLUSH_EVICT reservations, without the
+bytes_deleted or delayed-refs throttling that only tracks
+BTRFS_EXTENT_DATA_KEY items.
+
+Should btrfs_evict_inode() jump to out when
+btrfs_root_refs(&root->root_item) == 0?
+
+[Severity: Medium]
+Does calling drop_nlink(inode) in btrfs_ioctl_snap_destroy() after
+btrfs_inode_unlock() miss subvolume deletion via rmdir(2) and modify
+inode->__i_nlink without holding the inode lock?
+
+When an empty subvolume is deleted through vfs_rmdir() -> btrfs_rmdir(),
+btrfs_rmdir() calls btrfs_delete_subvolume(dir, dentry) directly and
+returns, leaving inode->i_nlink at 1 so an open file descriptor or inotify
+watch on the subvolume still prevents fsnotify_inoderemove() and keeps the
+deleted subvolume pinned.  In addition, calling drop_nlink(inode) outside
+btrfs_inode_lock(BTRFS_I(inode), 0) races with concurrent operations such
+as btrfs_setattr() on an open file descriptor.
+
+Calling drop_nlink(inode) inside btrfs_delete_subvolume() (where both
+btrfs_ioctl_snap_destroy() and btrfs_rmdir() hold the inode lock, and
+which is not called by rename) would cover both paths under the lock.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/115ec91d82e466382dd9cfb61bf484cb09be50db.1793989939.git.fdmanana@suse.com?part=1
+

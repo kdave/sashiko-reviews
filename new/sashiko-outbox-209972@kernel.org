@@ -1,0 +1,105 @@
+From sashiko-bot@kernel.org Thu Nov 12 01:39:49 2026
+Message-ID: <sashiko-outbox-209972@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix block group ref leak when scrub races with
+ unused bg deletion
+Date: Thu, 12 Nov 2026 00:39:44 +0000
+
+Thank you for your contribution! Sashiko AI review found no new issues
+in this patch, but noticed 1 related pre-existing issue it does not
+introduce:
+- [Critical] btrfs: zoned: race on bg_list in
+  btrfs_reset_unused_block_groups() [1]
+--
+
+commit 984ce33bda8f4b0b8327061e454358afbe78eb87
+Author: Boris Burkov <boris@bur.io>
+
+btrfs: fix block group ref leak when scrub races with unused bg deletion
+
+This commit fixes a block group reference leak in btrfs_delete_unused_bgs()
+by checking whether bg->bg_list is empty under fs_info->unused_bgs_lock
+before taking a new reference and moving the block group to deleted_bgs.
+
+Link: https://sashiko.dev/#/bug/linux-821034ac-556f-4d72-af2c-d04468879af8
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 027830a53f7dc..0b3b8843d221c 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -1830,12 +1830,15 @@ void btrfs_delete_unused_bgs(struct btrfs_fs_info *fs_info)
+>  			/*
+>  			 * A concurrent scrub might have added us to the list
+>  			 * fs_info->unused_bgs, so use a list_move operation
+> -			 * to add the block group to the deleted_bgs list.
+> +			 * to add the block group to the deleted_bgs list. In
+> +			 * that case the list reference moves along with it,
+> +			 * so only take a new one if we were not on any list.
+>  			 */
+> +			if (list_empty(&block_group->bg_list))
+> +				btrfs_get_block_group(block_group);
+>  			list_move(&block_group->bg_list,
+>  				  &trans->transaction->deleted_bgs);
+>  			spin_unlock(&fs_info->unused_bgs_lock);
+> -			btrfs_get_block_group(block_group);
+>  		}
+>  end_trans:
+>  		/*
+
+[Severity: Critical]
+This problem wasn't introduced by this patch, but can a similar race on
+bg->bg_list corrupt fs_info->unused_bgs or trigger a duplicate zone reset
+in btrfs_reset_unused_block_groups() [1]?
+
+fs/btrfs/zoned.c:btrfs_reset_unused_block_groups() {
+	...
+		list_del_init(&bg->bg_list);
+		spin_unlock(&fs_info->unused_bgs_lock);
+
+		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+		if (ret || !reclaimed)
+			goto requeue;
+
+		btrfs_put_block_group(bg);
+		...
+requeue:
+		list_add_tail(&bg->bg_list, &retry_list);
+	...
+}
+
+While fs_info->unused_bgs_lock is dropped across zoned_reset_bg_in_place(),
+neither bg->ro nor space_info->groups_sem is held, so a concurrent scrub can
+re-add bg->bg_list to fs_info->unused_bgs:
+
+CPU0                                CPU1
+btrfs_reset_unused_block_groups()
+  spin_lock(&unused_bgs_lock)
+  list_del_init(&bg->bg_list)
+  spin_unlock(&unused_bgs_lock)
+  zoned_reset_bg_in_place(bg)
+                                    scrub_enumerate_chunks()
+                                      btrfs_dec_block_group_ro(bg)
+                                        btrfs_mark_bg_unused(bg)
+                                          spin_lock(&unused_bgs_lock)
+                                          if (list_empty(&bg->bg_list))
+                                            btrfs_get_block_group(bg)
+                                            list_add_tail(&bg->bg_list,
+                                                          &unused_bgs)
+                                          spin_unlock(&unused_bgs_lock)
+  requeue:
+    list_add_tail(&bg->bg_list,
+                  &retry_list)      <-- unlocked list corruption
+
+If zoned_reset_bg_in_place() takes the requeue branch, list_add_tail()
+overwrites bg->bg_list without holding fs_info->unused_bgs_lock, corrupting
+fs_info->unused_bgs and leaking a reference.  If zoned_reset_bg_in_place()
+succeeds instead, the reset block group is returned for new allocations
+while still linked on fs_info->unused_bgs, so a later call to
+btrfs_reset_unused_block_groups() can pop it again and issue a second
+REQ_OP_ZONE_RESET on a reused zone.
+
+[1] https://sashiko.dev/#/bug/linux-18a9816d-bb56-4d6c-b7cd-7db140e604cb
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/52f2ee4b5d0879b99ea8c863ee40403bb06c5345.1794441990.git.boris@bur.io?part=1
+

@@ -1,0 +1,48 @@
+From sashiko-bot@kernel.org Thu Nov 12 23:44:58 2026
+Message-ID: <sashiko-outbox-211920@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: props: validate property values loaded from disk
+Date: Thu, 12 Nov 2026 22:44:54 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: props: missing Fixes trailer for unvalidated property
+  loading in inode_prop_iterator()
+--
+
+commit 1d1d60ffdf4aa05343ea07bf31ad0dd81527c70f
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: props: validate property values loaded from disk
+>
+> Sashiko reported an out-of-bounds read during prop_compression_apply().
+> It only checks the length for "no" and "none", but not for "lzo", "zlib"
+> and "zstd". A crafted or corrupted image with a short value such as "lz"
+> makes strncmp() read past the end of the buffer.
+>
+> Normally a prop is validated before applying, but that only applies to
+> set and inherit paths, not the loading-from-disk path.
+>
+> Hardening the behavior by calling handler->validate() for non-empty values
+> before applying them, the same as the set and inherit paths do. Invalid
+> values are skipped with a warning.
+>
+> This may cause a behavior change: validate also rejects compression on
+> inodes that cannot be compressed (NODATACOW or NODATASUM). Such an inode
+> with an existing compression xattr, e.g. one set before "chattr +C" on
+> an empty file, used to get BTRFS_INODE_COMPRESS applied on load. Now the
+> property is skipped with a warning.
+>
+> Reported-by: Sashiko <sashiko-bot@kernel.org>
+> Link: https://sashiko.dev/#/bug/linux-c5d0a07b-d18d-495f-96b7-9dadef420b95
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+Since this fixes an out-of-bounds read when loading inode properties from
+disk in inode_prop_iterator(), should it include a Fixes tag?
+
+  Fixes: 63541927c8d1 ("Btrfs: add support for inode properties")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/27eb729ab79e98927812e0e1df9e699716df6036.1794522787.git.wqu@suse.com?part=1
+

@@ -1,0 +1,72 @@
+From sashiko-bot@kernel.org Thu Nov  5 21:28:39 2026
+Message-ID: <sashiko-outbox-200103@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/4] btrfs: honor FMODE_NOCMTIME when cloning
+Date: Thu, 05 Nov 2026 20:28:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
+- [Medium] btrfs: skipped i_version update in btrfs_write_check() with FMODE_NOCMTIME
+--
+
+commit 9d83827c173e5273dd9258bd5a1f25f1d11f67ab
+Author: Jeff Layton <jlayton@kernel.org>
+
+btrfs: honor FMODE_NOCMTIME when cloning
+
+This commit exports btrfs_should_update_cmtime() and uses it in
+btrfs_clone_files() so that cloning to a destination file opened with
+FMODE_NOCMTIME skips updating the destination inode's ctime and mtime.
+
+> diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+> index 6ff494846aeaf..6f525ce42a2d8 100644
+> --- a/fs/btrfs/file.c
+> +++ b/fs/btrfs/file.c
+> @@ -1030,7 +1030,7 @@ void btrfs_check_nocow_unlock(struct btrfs_inode *inode)
+>   * with FMODE_NOCMTIME (e.g. by nfsd while a client holds delegated
+>   * timestamps).
+>   */
+> -static bool btrfs_should_update_cmtime(const struct file *file)
+> +bool btrfs_should_update_cmtime(const struct file *file)
+>  {
+>  	return !IS_NOCMTIME(file_inode(file)) && !(file->f_mode & FMODE_NOCMTIME);
+>  }
+
+[Severity: Medium]
+In btrfs_clone(), passing !btrfs_should_update_cmtime(file) as no_time_update
+causes btrfs_replace_file_extents() and clone_finish_inode_update() to skip
+updating ctime and mtime while still incrementing i_version unconditionally:
+
+fs/btrfs/reflink.c:clone_finish_inode_update() {
+	...
+	inode_inc_iversion(vfs_inode);
+	if (!no_time_update)
+		inode_set_mtime_to_ts(vfs_inode, inode_set_ctime_current(vfs_inode));
+	...
+}
+
+However, in btrfs_write_check(), which is called from btrfs_do_write_iter() ->
+btrfs_buffered_write() and btrfs_direct_write(), inode_inc_iversion() is
+inside the btrfs_should_update_cmtime() check:
+
+fs/btrfs/file.c:btrfs_write_check() {
+	...
+	if (btrfs_should_update_cmtime(file)) {
+		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+		inode_inc_iversion(inode);
+	}
+	...
+}
+
+Since btrfs_write_check() is the only place in the btrfs buffered and direct
+write paths that increments i_version, when nfsd writes to a file opened with
+FMODE_NOCMTIME under an OPEN_DELEGATE_WRITE_ATTRS_DELEG delegation, both
+ctime and i_version (and thus the NFSv4 change attribute) remain unchanged.
+
+Should inode_inc_iversion(inode) in btrfs_write_check() be called
+unconditionally outside the btrfs_should_update_cmtime(file) block, matching
+clone_finish_inode_update(), btrfs_replace_file_extents(), btrfs_punch_hole(),
+and the fallocate paths?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261105-delegts-btrfs-v1-0-a42a2b93cdc2@kernel.org?part=4
+

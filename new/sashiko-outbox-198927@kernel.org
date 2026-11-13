@@ -1,0 +1,181 @@
+From sashiko-bot@kernel.org Thu Nov  5 12:13:56 2026
+Message-ID: <sashiko-outbox-198927@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix delayed_refs_rsv leak when realloc
+ shrinks an extent
+Date: Thu, 05 Nov 2026 11:13:42 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
+- [Medium] btrfs: flawed csum rsv adjustment in update_existing_head_ref()
+- [Low] btrfs: btrfs_delayed_refs_rsv_add() inserted after rsv_release() comment
+--
+
+commit 4cfcbdc2e004b995d50c8de346cd5721c3450701
+Author: Shunbo Shi <shishunbo@cmss.chinamobile.com>
+
+btrfs: fix delayed_refs_rsv leak when realloc shrinks an extent
+
+This commit adjusts pending_csums and delayed_refs_rsv accounting in
+update_existing_head_ref() when a freed data extent is reallocated with a
+different size before its delayed refs are processed.
+
+Link: https://lore.kernel.org/linux-btrfs/6ae88b9e.64e51036.15cf6a.0027.GAE@google.com/
+
+> diff --git a/fs/btrfs/delayed-ref.c b/fs/btrfs/delayed-ref.c
+> index 8bc1929237f70..45e2696700687 100644
+> --- a/fs/btrfs/delayed-ref.c
+> +++ b/fs/btrfs/delayed-ref.c
+> @@ -63,6 +63,31 @@ bool btrfs_check_space_for_delayed_refs(struct btrfs_fs_info *fs_info)
+>   * Drops the delayed ref head's count from the delayed refs rsv and free any
+>   * excess reservation we had.
+>   */
+> +/*
+> + * Grow the delayed refs rsv size for csum items to be deleted.
+> + *
+> + * Unlike trans->delayed_ref_csum_deletions, which is folded into the
+> + * delayed refs rsv by btrfs_update_delayed_refs_rsv() at a later point,
+> + * this adjusts the size immediately.  It is needed when a ref head's
+> + * num_bytes is updated to a larger size and the head's reservation is
+> + * released in the same call to update_existing_head_ref(): the release
+> + * path subtracts from the rsv right away, so the size must cover the
+> + * new csum leaves before that happens, otherwise the rsv would
+> + * over-release reservations of other delayed refs.
+> + */
+> +void btrfs_delayed_refs_rsv_add(struct btrfs_fs_info *fs_info, int nr_csums)
+> +{
+> +	struct btrfs_block_rsv *block_rsv = &fs_info->delayed_refs_rsv;
+> +	u64 num_bytes;
+> +
+> +	num_bytes = btrfs_calc_delayed_ref_csum_bytes(fs_info, nr_csums);
+> +
+> +	spin_lock(&block_rsv->lock);
+> +	block_rsv->size += num_bytes;
+> +	block_rsv->full = (block_rsv->reserved >= block_rsv->size);
+> +	spin_unlock(&block_rsv->lock);
+> +}
+> +
+>  void btrfs_delayed_refs_rsv_release(struct btrfs_fs_info *fs_info, int nr_refs, int nr_csums)
+>  {
+>  	struct btrfs_block_rsv *block_rsv = &fs_info->delayed_refs_rsv;
+
+[Severity: Low]
+This isn't a bug, but inserting btrfs_delayed_refs_rsv_add() and its comment
+block here separates btrfs_delayed_refs_rsv_release() from its function
+comment above:
+
+/*
+ * Release a ref head's reservation.
+ *
+ * @fs_info:  the filesystem
+ * @nr_refs:  number of delayed refs to drop
+ * @nr_csums: number of csum items to drop
+ *
+ * Drops the delayed ref head's count from the delayed refs rsv and free any
+ * excess reservation we had.
+ */
+
+Should btrfs_delayed_refs_rsv_add() be placed above that comment block (or
+after btrfs_delayed_refs_rsv_release()) so the comment stays attached to
+btrfs_delayed_refs_rsv_release()?
+
+> @@ -694,6 +719,42 @@ static noinline void update_existing_head_ref(struct btrfs_trans_handle *trans,
+>  		existing->must_insert_reserved = update->must_insert_reserved;
+>  		existing->owning_root = update->owning_root;
+>  
+> +		/*
+> +		 * The extent may have been reallocated with a different
+> +		 * size before its delayed refs were processed.  The csum
+> +		 * reservation was made for the old size (see
+> +		 * add_delayed_ref_head()), so adjust the accounting to the
+> +		 * new size here; otherwise the release done when
+> +		 * total_ref_mod turns non-negative below is based on the
+> +		 * new size while only the old size was reserved: for a
+> +		 * smaller size the difference is leaked, for a larger size
+> +		 * the rsv over-releases reservations of other delayed refs.
+> +		 *
+> +		 * Both adjustments must take effect immediately: the
+> +		 * total_ref_mod transition below may release new_leaves in
+> +		 * this same call, while trans->delayed_ref_csum_deletions
+> +		 * is only folded into the rsv by
+> +		 * btrfs_update_delayed_refs_rsv() after we return.
+> +		 */
+> +		if (existing->is_data && existing->total_ref_mod < 0 &&
+> +		    existing->num_bytes != update->num_bytes) {
+> +			u64 old_leaves = btrfs_csum_bytes_to_leaves(fs_info,
+> +							   existing->num_bytes);
+> +			u64 new_leaves = btrfs_csum_bytes_to_leaves(fs_info,
+> +							    update->num_bytes);
+> +
+> +			if (new_leaves < old_leaves) {
+> +				btrfs_delayed_refs_rsv_release(fs_info, 0,
+> +					       (int)(old_leaves - new_leaves));
+> +			} else if (new_leaves > old_leaves) {
+> +				btrfs_delayed_refs_rsv_add(fs_info,
+> +					       (int)(new_leaves - old_leaves));
+> +			}
+> +
+> +			delayed_refs->pending_csums += update->num_bytes;
+> +			delayed_refs->pending_csums -= existing->num_bytes;
+> +		}
+> +
+>  		/*
+>  		 * update the num_bytes so we make sure the accounting
+>  		 * is done correctly
+
+[Severity: Medium]
+As reported by Sashiko on v1 [1], when a freed data extent is reallocated
+with a larger size (new_leaves > old_leaves), does adjusting the reservation
+here before updating existing->total_ref_mod introduce two issues?
+
+First, in the common case where old_ref_mod is -1 and existing->total_ref_mod
+transitions to 0 in the same call:
+
+btrfs_alloc_reserved_file_extent()
+  btrfs_add_delayed_data_ref()
+    add_delayed_ref()
+      add_delayed_ref_head()
+        update_existing_head_ref()
+
+btrfs_delayed_refs_rsv_add() locks fs_info->delayed_refs_rsv.lock, increases
+delayed_refs_rsv.size by (new_leaves - old_leaves), updates
+delayed_refs_rsv.full, and drops the lock, only for the sign-transition check
+at the end of update_existing_head_ref() to immediately release new_leaves:
+
+	if (existing->is_data) {
+		u64 csum_leaves =
+			btrfs_csum_bytes_to_leaves(fs_info,
+						   existing->num_bytes);
+
+		if (existing->total_ref_mod >= 0 && old_ref_mod < 0) {
+			delayed_refs->pending_csums -= existing->num_bytes;
+			btrfs_delayed_refs_rsv_release(fs_info, 0, csum_leaves);
+		}
+
+During the unlocked window between those two calls, can concurrent callers of
+btrfs_check_space_for_delayed_refs(), btrfs_delayed_refs_rsv_refill(), or
+btrfs_block_rsv_release() observe the temporary size increase and cleared
+full flag, causing unnecessary flushing or migrating released space from
+other reserves into delayed_refs_rsv?
+
+Second, if old_ref_mod <= -2 so that existing->total_ref_mod remains negative
+after adding update->ref_mod, the extra csum reservation stays active after
+update_existing_head_ref() returns. Because btrfs_delayed_refs_rsv_add()
+directly increments delayed_refs_rsv.size instead of adding to
+trans->delayed_ref_csum_deletions, doesn't the subsequent call to
+btrfs_update_delayed_refs_rsv(trans) in add_delayed_ref() skip migrating
+pre-reserved bytes from trans->delayed_rsv into delayed_refs_rsv.reserved and
+bypass the btrfs_is_testing(fs_info) check?
+
+Would it be simpler and avoid btrfs_delayed_refs_rsv_add() altogether to save
+old_num_bytes = existing->num_bytes before overwriting existing->num_bytes,
+and then handle both the transition and size change in the existing->is_data
+block after existing->total_ref_mod is updated (releasing old_leaves when
+transitioning from < 0 to >= 0, or adjusting by the difference between
+old_leaves and new_leaves via btrfs_delayed_refs_rsv_release() and
+trans->delayed_ref_csum_deletions when remaining < 0)?
+
+[1] https://lore.kernel.org/r/20261104082834.25047-1-shishunbo@cmss.chinamobile.com
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261105104453.2151-1-shishunbo@cmss.chinamobile.com?part=1
+

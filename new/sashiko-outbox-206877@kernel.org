@@ -1,0 +1,96 @@
+From sashiko-bot@kernel.org Tue Nov 10 13:03:49 2026
+Message-ID: <sashiko-outbox-206877@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix return value to report partial success for
+ direct IO writes
+Date: Tue, 10 Nov 2026 10:33:50 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Critical] btrfs: clobbering -EIOCBQUEUED in btrfs_direct_write()
+  causes kiocb UAF
+- [Medium] btrfs: over-advanced ki_pos in btrfs_direct_write() on
+  buffered flush error
+--
+
+commit e4aca42b7844521a257f239e9877d6db646a710f
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix return value to report partial success for direct IO writes
+
+This commit changes btrfs_direct_write() to return the number of bytes
+already written whenever a subsequent retry or buffered I/O fallback
+fails.
+
+> diff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c
+> index ed3914257d395..da50abbf315a6 100644
+> --- a/fs/btrfs/direct-io.c
+> +++ b/fs/btrfs/direct-io.c
+> @@ -1061,7 +1061,17 @@ ssize_t btrfs_direct_write(struct kiocb *iocb, struct iov_iter *from)
+>  	invalidate_mapping_pages(file->f_mapping, pos >> PAGE_SHIFT,
+>  				 endbyte >> PAGE_SHIFT);
+>  out:
+> -	return ret < 0 ? ret : written;
+> +	/*
+> +	 * Always report partial writes if we wrote something, otherwise it
+> +	 * could lead to silent corruption for some applications: for example
+> +	 * if an application does writes to a file opened with append only mode,
+> +	 * in case we succeed doing a part of the write and then fallback to
+> +	 * buffered IO and that fails (or return -EAGAIN because we are in a
+> +	 * NOWAIT context), we mislead the application into trying to write the
+> +	 * whole buffer again, resulting in duplicating part of the data and
+> +	 * therefore a corruption at the application level.
+> +	 */
+> +	return written > 0 ? written : ret;
+>  }
+
+[Severity: Critical]
+Does this introduce a use-after-free on struct kiocb when a retried
+asynchronous direct I/O write returns -EIOCBQUEUED?
+
+On an async direct write (aio or io_uring), if the first pass hits an
+unfaulted user page after submitting part of the buffer, __iomap_dio_rw()
+waits for that partial I/O and iomap_dio_complete() sets written > 0.
+btrfs_direct_write() then faults in the remaining pages and jumps back to
+again:, passing written as done_before to btrfs_dio_write().  When the
+second pass queues the remaining bio asynchronously, __iomap_dio_rw()
+returns ERR_PTR(-EIOCBQUEUED), so ret is -EIOCBQUEUED at out:.
+
+Returning written (> 0) instead of -EIOCBQUEUED tells the caller that the
+kiocb completed synchronously:
+
+CPU0                              CPU1 (kworker)
+aio_write()
+  btrfs_direct_write()
+    /* pass 1: written > 0 */
+    /* pass 2: queues bio */
+    /* returns written > 0 */
+  aio_rw_done()
+    req->ki_complete(req, ret)
+      aio_complete_rw()
+        kiocb_free(iocb)
+                                  iomap_dio_complete_work()
+                                    iocb->ki_complete(iocb, ...)
+                                      <-- use-after-free / double completion
+
+Checking for -EIOCBQUEUED before returning written avoids clobbering the
+queued status, since iomap_dio_complete() already folds dio->done_before
+into the final completion result.
+
+[Severity: Medium]
+Can this regression leave iocb->ki_pos ahead of the reported byte count
+when flushing the buffered fallback fails?
+
+When a partial direct write (written > 0) falls back to buffered:,
+btrfs_buffered_write() copies written_buffered bytes into the page cache
+and advances iocb->ki_pos by written_buffered.  If btrfs_fdatawrite_range()
+or filemap_fdatawait_range() then fails and jumps to out:,written has not
+been incremented by written_buffered, but returning written (> 0) causes
+VFS callers such as new_sync_write() to commit iocb->ki_pos (pos +
+written_buffered) to file->f_pos while reporting only written bytes to
+user space.  Resetting iocb->ki_pos to pos before jumping to out: on flush
+failure would keep the file position consistent with the return value.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/c40fb9e159c3ddc020c5d48db85a517caf63bc30.1794246932.git.fdmanana@suse.com?part=1
+

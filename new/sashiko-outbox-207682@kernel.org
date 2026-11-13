@@ -1,0 +1,117 @@
+From sashiko-bot@kernel.org Tue Nov 10 20:48:49 2026
+Message-ID: <sashiko-outbox-207682@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix race between concurrent sync direct IO
+ writes
+Date: Tue, 10 Nov 2026 19:48:44 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: missing iocb_is_dsync() recheck under lock in
+  btrfs_direct_write()
+- [Low] btrfs: missing Fixes trailer for commit 939b656bc8ab
+--
+
+commit 167654dcbbb6bea4fbc4d7dca5a7aec96ff0c302
+Author: Filipe Manana <fdmanana@suse.com>
+
+> btrfs: fix race between concurrent sync direct IO writes
+>
+> If we have a direct IO write within i_size, we lock the inode's vfs lock
+> in shared mode, which allows for concurrent direct IO writes within
+> different ranges of the file, which is an important optimization for many
+> applications such as databases.
+>
+> However if we have a sync direct IO write within i_size, it locks the
+> inode in shared mode and then enters fsync through the call to the
+> iomap_dio_complete() function from iomap using the shared lock. This
+> means that if we have another concurrent direct IO write that locks the
+> inode in shared mode and the fsync is in fast mode (the inode flag
+> BTRFS_INODE_NEEDS_FULL_SYNC is not set), the fsync does not wait for
+> the ordered extent created by the concurrent direct IO write to complete
+> before logging its extent map. The fsync code relies on direct IO writes
+> to create ordered extents and wait for their IO to finish while holding
+> the inode's lock, while the fsync should hold the inode lock in exclusive
+> mode. This means that this race can end up persisting a log tree with
+> file extent items that point to extents that were not yet written when
+> the log is synced.
+>
+> Fix this by always taking the inode lock in exclusive mode if we have a
+> sync write.
+>
+> This issue was identified by Sashiko in the link below, which identifies
+> two different races between direct IO writes and fsync. The race fixed
+> here is the second case identified by Sashiko in the link below. The first
+> race is already being fixed in a separate patch from Josef.
+>
+> Link: https://sashiko.dev/#/bug/linux-ee047626-2fa7-46d5-b543-861136993fc7
+> Signed-off-by: Filipe Manana <fdmanana@suse.com>
+
+[Severity: Low]
+Since keeping the inode lock held across iomap_dio_complete() was
+introduced by 939b656bc8ab ("btrfs: fix corruption after buffer fault in
+during direct IO append write"), should this include:
+
+  Fixes: 939b656bc8ab ("btrfs: fix corruption after buffer fault in during direct IO append write")
+
+> diff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c
+> index ed3914257d395..ca64be68ccc2d 100644
+> --- a/fs/btrfs/direct-io.c
+> +++ b/fs/btrfs/direct-io.c
+> @@ -896,9 +896,14 @@ ssize_t btrfs_direct_write(struct kiocb *iocb, struct iov_iter *from)
+>  	 * If the write DIO is within EOF, use a shared lock and also only if
+>  	 * security bits will likely not be dropped by file_remove_privs() called
+>  	 * from btrfs_write_check(). Either will need to be rechecked after the
+> -	 * lock was acquired.
+> +	 * lock was acquired. Also if this is a sync write we will need to fsync
+> +	 * and therefore we must lock in exclusive mode, otherwise we would race
+> +	 * with other concurrent DIO writes and the fsync would not wait for
+> +	 * their ordered extent to finish IO before logging the new extent maps.
+>  	 */
+> -	if (iocb->ki_pos + iov_iter_count(from) <= i_size_read(inode) && IS_NOSEC(inode))
+> +	if (iocb->ki_pos + iov_iter_count(from) <= i_size_read(inode) &&
+> +	    IS_NOSEC(inode) &&
+> +	    !iocb_is_dsync(iocb))
+>  		ilock_flags |= BTRFS_ILOCK_SHARED;
+>  
+>  relock:
+
+[Severity: Medium]
+Does iocb_is_dsync(iocb) also need to be rechecked after acquiring the
+shared inode lock, just like IS_NOSEC(inode) and i_size_read(inode)?
+
+iocb_is_dsync() checks IS_SYNC(inode), which tests S_SYNC on
+inode->i_flags.  vfs_fileattr_set() -> btrfs_fileattr_set() updates S_SYNC
+under the exclusive inode lock, while __iomap_dio_rw() re-evaluates
+iocb_is_dsync(iocb) later to set IOMAP_DIO_NEED_SYNC:
+
+CPU0                              CPU1
+vfs_fileattr_set()
+  inode_lock(inode)
+                                  btrfs_direct_write()
+                                    !iocb_is_dsync(iocb) -> true
+                                    ilock_flags |= BTRFS_ILOCK_SHARED
+                                    btrfs_inode_lock(..., BTRFS_ILOCK_SHARED)
+  btrfs_fileattr_set()
+    inode->i_flags |= S_SYNC
+  inode_unlock(inode)
+                                    /* acquires shared lock */
+                                    btrfs_dio_write()
+                                      __iomap_dio_rw()
+                                        iocb_is_dsync(iocb) -> true
+                                        dio->flags |= IOMAP_DIO_NEED_SYNC
+                                    current->journal_info =
+                                      BTRFS_TRANS_DIO_WRITE_STUB
+                                    iomap_dio_complete(dio)
+                                      generic_write_sync()
+                                        btrfs_sync_file()  <-- shared lock
+
+If S_SYNC is set while one or more direct IO writes are waiting for the
+shared lock, they proceed with BTRFS_ILOCK_SHARED and enter
+btrfs_sync_file() with skip_ilock = true, allowing fast fsync to log
+extent maps from a concurrent direct IO write before its ordered extent IO
+completes.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/9d7367f9498173442964c97ddeae9f1be248e48d.1794338999.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,46 @@
+From sashiko-bot@kernel.org Thu Nov 12 21:14:08 2026
+Message-ID: <sashiko-outbox-211785@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix off-by-one max tree level bound when
+ replaying log trees
+Date: Thu, 12 Nov 2026 20:14:04 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: missing Fixes trailer for walk_up_log_tree() level bound
+  fix
+--
+
+commit 39b8e0308bd170e77692c2b6ed4b36fffca30f5a
+Author: Filipe Manana <fdmanana@suse.com>
+
+> btrfs: fix off-by-one max tree level bound when replaying log trees
+>
+> In walk_up_log_tree() we are bounding the loop iteration to 7 levels
+> instead of 8. This is a bug since the maximum number of levels for a
+> tree is 8 and they go from 0 (leaf level) to 7, so the loop condition
+> should be:
+>
+>    i < BTRFS_MAX_LEVEL (which 8)
+>
+> and not
+>
+>    i < BTRFS_MAX_LEVEL - 1 (7)
+>
+> This means that in case if we ever get a log tree with 8 levels, which
+> theoretically should be impossible specially because they are very
+> short lived, we would miss replaying large parts of the log tree.
+>
+> Link: https://sashiko.dev/#/bug/linux-8d5b7229-3920-47fa-ad36-3a7ddd02f0e7
+> Signed-off-by: Filipe Manana <fdmanana@suse.com>
+
+[Severity: Low]
+walk_up_log_tree() was introduced with the BTRFS_MAX_LEVEL - 1 bound in
+e02119d5a7b4 ("Btrfs: Add a write ahead tree log to optimize synchronous
+operations").  Should this include:
+
+  Fixes: e02119d5a7b4 ("Btrfs: Add a write ahead tree log to optimize synchronous operations")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/b8a17190faf5846c5d843cef9c0887a050eaf98f.1794513725.git.fdmanana@suse.com?part=1
+

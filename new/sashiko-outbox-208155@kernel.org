@@ -1,0 +1,105 @@
+From sashiko-bot@kernel.org Wed Nov 11 04:04:28 2026
+Message-ID: <sashiko-outbox-208155@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: qgroup: skip inconsistent accounting after mount
+Date: Wed, 11 Nov 2026 03:04:12 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [High] btrfs: qgroup: single-word handle used in Author and
+  Signed-off-by trailer
+- [Low] btrfs: qgroup: unreachable warning message in
+  btrfs_read_qgroup_config()
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [Medium] btrfs: memory leak in btrfs_read_qgroup_config() [1]
+--
+
+commit f8068d01825fe19e72d96dd1e5dee7ab5ebf0789
+Author: sunyangkai <sunyangkai@fnnas.com>
+
+> btrfs: qgroup: skip inconsistent accounting after mount
+>
+> When full qgroups become inconsistent, qgroup_mark_inconsistent() sets
+> NO_ACCOUNTING to avoid expensive backref walks which cannot repair the
+> counters. This is a runtime flag, so unmounting and mounting the filesystem
+> loses it. Incremental accounting then resumes even when the persistent
+> INCONSISTENT flag is set and no rescan is pending.
+>
+> On a filesystem with many snapshots, the resulting backref walks can
+> stall transaction commits and operations waiting to join a transaction.
+>
+> Use qgroup_mark_inconsistent() when loading an inconsistent full-qgroup
+> configuration without a pending rescan. This restores NO_ACCOUNTING and
+> CANCEL_RESCAN. Preserve the existing rescan initialization path, which
+> clears both flags for resumed and newly requested rescans. Simple quotas
+> are unaffected.
+>
+> Fixes: e15e9f43c7ca ("btrfs: introduce BTRFS_QGROUP_RUNTIME_FLAG_NO_ACCOUNTING to skip qgroup accounting")
+> Signed-off-by: sunyangkai <sunyangkai@fnnas.com>
+
+[Severity: High]
+Both the Author header and the Signed-off-by trailer use the single-word
+handle "sunyangkai" instead of a full real human name, which does not
+satisfy the Developer's Certificate of Origin requirements in
+Documentation/process/submitting-patches.rst.
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index baef546fa213e..522493ffab8d4 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -615,8 +615,18 @@ int btrfs_read_qgroup_config(struct btrfs_fs_info *fs_info)
+>  	if (ret >= 0) {
+>  		if (test_bit(BTRFS_QGROUP_STATUS_BIT_ON, &fs_info->qgroup_flags))
+>  			set_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags);
+> -		if (test_bit(BTRFS_QGROUP_STATUS_BIT_RESCAN, &fs_info->qgroup_flags))
+> +		if (test_bit(BTRFS_QGROUP_STATUS_BIT_RESCAN, &fs_info->qgroup_flags)) {
+>  			ret = qgroup_rescan_init(fs_info, rescan_progress, 0);
+
+[Severity: Medium]
+This problem wasn't introduced by this patch, but can a failure in
+qgroup_rescan_init() leak the populated qgroup rb-tree and its sysfs
+entries [1]?
+
+Because qgroup_rescan_init() is called inside the "if (ret >= 0)" block, a
+negative return value skips the "else" branch that calls
+btrfs_sysfs_del_qgroups(), and open_ctree() then jumps to
+fail_trans_kthread, which is placed after fail_qgroup and skips
+btrfs_free_qgroup_config().
+
+> +		} else if (btrfs_qgroup_full_accounting(fs_info) &&
+> +			   test_bit(BTRFS_QGROUP_STATUS_BIT_INCONSISTENT,
+> +				    &fs_info->qgroup_flags)) {
+> +			/*
+> +			 * Incremental accounting cannot repair inconsistent counters.
+> +			 * Keep it disabled until a new rescan is started.
+> +			 */
+> +			qgroup_mark_inconsistent(fs_info,
+> +						 "inconsistent qgroup status found at mount");
+> +		}
+>  	} else {
+>  		clear_bit(BTRFS_QGROUP_STATUS_BIT_RESCAN, &fs_info->qgroup_flags);
+>  		btrfs_sysfs_del_qgroups(fs_info);
+
+[Severity: Low]
+Is the "inconsistent qgroup status found at mount" warning message
+reachable here?
+
+This branch only runs when BTRFS_QGROUP_STATUS_BIT_INCONSISTENT is already
+set in fs_info->qgroup_flags, while qgroup_mark_inconsistent() only logs
+its format string when BTRFS_QGROUP_STATUS_BIT_INCONSISTENT was not set in
+old_flags:
+
+fs/btrfs/qgroup.c:qgroup_mark_inconsistent() {
+	const unsigned long old_flags = fs_info->qgroup_flags;
+...
+	if (!test_bit(BTRFS_QGROUP_STATUS_BIT_INCONSISTENT, &old_flags)) {
+...
+		btrfs_warn_rl(fs_info, "qgroup marked inconsistent, %pV", &vaf);
+}
+
+[1] https://sashiko.dev/#/bug/linux-6e133d49-5021-45a6-b3cd-2a0162501e96
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261111023233.1138009-1-sunyangkai@fnnas.com?part=1
+

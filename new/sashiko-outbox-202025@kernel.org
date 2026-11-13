@@ -1,0 +1,114 @@
+From sashiko-bot@kernel.org Fri Nov  6 19:26:13 2026
+Message-ID: <sashiko-outbox-202025@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: drop the link count of a subvolume inode when
+ deleting the subvolume
+Date: Fri, 06 Nov 2026 18:26:07 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [Critical] btrfs: BUG_ON() crash in btrfs_rename() when overwriting
+  subvolume stub dir
+- [Critical] btrfs: subvolume rename drops root inode i_nlink to 0 and
+  truncates subvol
+- [Medium] btrfs: btrfs_evict_inode() runs btree truncation on deleted
+  subvol and stub inodes
+--
+
+commit f063ef1f75067ea9b4c2ea8dca54c327ff061285
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: drop the link count of a subvolume inode when deleting the subvolume
+
+This commit drops the VFS link count of a subvolume inode in
+btrfs_unlink_subvol() so that a deleted subvolume whose inode is held open
+is not listed by btrfs-progs.
+
+Link: https://lore.kernel.org/linux-btrfs/18e431317f832f21-26f56778@a-workstation/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index abaa334714566..e2958dfa0c1fb 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -4622,6 +4622,7 @@ static int btrfs_unlink_subvol(struct btrfs_trans_handle *trans,
+>  	btrfs_i_size_write(dir, dir->vfs_inode.i_size - fname.disk_name.len * 2);
+>  	inode_inc_iversion(&dir->vfs_inode);
+>  	inode_set_mtime_to_ts(&dir->vfs_inode, inode_set_ctime_current(&dir->vfs_inode));
+> +	drop_nlink(&inode->vfs_inode);
+
+[Severity: Critical]
+Does this trigger BUG_ON(new_inode->i_nlink == 0) in btrfs_rename() when a
+rename overwrites an empty subvolume placeholder directory
+(BTRFS_EMPTY_SUBVOL_DIR_OBJECTID)?
+
+new_simple_dir() allocates the placeholder inode with i_nlink == 1, and
+btrfs_rename() calls btrfs_unlink_subvol() on new_dentry right before that
+BUG_ON():
+
+fs/btrfs/inode.c:btrfs_rename() {
+    ...
+		if (unlikely(btrfs_ino(BTRFS_I(new_inode)) ==
+			     BTRFS_EMPTY_SUBVOL_DIR_OBJECTID)) {
+			ret = btrfs_unlink_subvol(trans, BTRFS_I(new_dir), new_dentry);
+			if (unlikely(ret)) {
+				btrfs_abort_transaction(trans, ret);
+				goto out_fail;
+			}
+			BUG_ON(new_inode->i_nlink == 0);
+		}
+    ...
+}
+
+[Severity: Critical]
+When renaming or exchanging a subvolume (BTRFS_FIRST_FREE_OBJECTID),
+btrfs_rename() and btrfs_rename_exchange() call btrfs_unlink_subvol()
+followed by btrfs_add_link().  Since btrfs_add_link() does not increment
+i_nlink, doesn't this leave the live subvolume root inode with i_nlink == 0?
+
+When that inode is later evicted, btrfs_evict_inode() sees i_nlink == 0,
+skips its early returns, and runs btrfs_truncate_inode_items() on the live
+subvolume root (ino BTRFS_FIRST_FREE_OBJECTID), deleting its root directory
+items from the B-tree.  A second rename or deletion before eviction also
+hits WARN_ON(inode->i_nlink == 0) in drop_nlink() and underflows i_nlink.
+
+[Severity: Medium]
+Does dropping i_nlink to 0 here also cause btrfs_evict_inode() to run
+btrfs_truncate_inode_items() and btrfs_orphan_del() when evicting a deleted
+subvolume's root inode or an rmdir'd BTRFS_EMPTY_SUBVOL_DIR_OBJECTID stub
+inode?
+
+Previously both retained i_nlink == 1 and took the early exits in
+btrfs_evict_inode():
+
+fs/btrfs/inode.c:btrfs_evict_inode() {
+    ...
+	if (inode->i_nlink &&
+	    ((btrfs_root_refs(&root->root_item) != 0 &&
+	      btrfs_root_id(root) != BTRFS_ROOT_TREE_OBJECTID) ||
+	     btrfs_is_free_space_inode(BTRFS_I(inode))))
+		goto out;
+
+	if (is_bad_inode(inode))
+		goto out;
+	/*
+	 *Our subvolume was dropped, we haven't cleaned up the full directory
+	 * yet so don't do anything here, the cleaner will take care of it
+	 * completely.
+	 */
+	if (inode->i_nlink > 0) {
+		BUG_ON(btrfs_root_refs(&root->root_item) != 0 &&
+		       btrfs_root_id(root) != BTRFS_ROOT_TREE_OBJECTID);
+		goto out;
+	}
+    ...
+}
+
+With i_nlink == 0, evicting a deleted subvolume's root inode synchronously
+joins transactions to COW tree blocks and truncate objectid 256 instead of
+leaving tree deletion to the cleaner thread, and evicting an rmdir'd stub
+inode runs B-tree truncation and orphan deletion for objectid 2 on the
+parent subvolume root.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/de103b6af03cec8d98b21e0734fb482f9244bed6.1793988522.git.fdmanana@suse.com?part=1
+

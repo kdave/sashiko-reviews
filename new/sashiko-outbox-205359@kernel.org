@@ -1,0 +1,100 @@
+From sashiko-bot@kernel.org Mon Nov  9 19:00:06 2026
+Message-ID: <sashiko-outbox-205359@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: zoned: don't release active zone reservations
+ for conventional zones
+Date: Mon, 09 Nov 2026 18:00:01 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: zoned: active zone accounting mismatch in
+  btrfs_zone_activate()
+- [Low] btrfs: zoned: missing Fixes trailer for commit a7e1ac7bdc5a
+--
+
+commit 63e3b6cf2f7d23d7661626cf4fc3e830c2f2c046
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+> btrfs: zoned: don't release active zone reservations for conventional zones
+>
+> On mount, btrfs_check_active_zone_reservation() releases a reserved
+> active zone for each stripe of an active metadata or system block-group.
+> Block-groups on conventional zones are marked active when loaded but
+> hold no active zone on the device, so they use up the reservation. Once
+> metadata moves to a sequential block-group, its activation fails and the
+> transaction commit aborts with -EAGAIN.
+>
+> Only release reservations for sequential zones.
+>
+> Reported-by: Jochen Philipp <a2jphilipp@gmail.com>
+> Link: https://lore.kernel.org/linux-btrfs/CAD=K2o-BBqh+ikgfD732Cb3M1Xx48QGw3kTFsP5iSgH1mkr0wA@mail.gmail.com/
+> Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+[Severity: Low]
+Should this include a Fixes: tag for the commit that introduced
+btrfs_check_active_zone_reservation()?
+
+  Fixes: a7e1ac7bdc5a ("btrfs: zoned: reserve zones for an active metadata/system block group")
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 3192b86669b9b..7058f712936da 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -3115,8 +3115,14 @@ void btrfs_check_active_zone_reservation(struct btrfs_fs_info *fs_info)
+>  		      (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)))
+>  			continue;
+>  
+> -		for (int i = 0; i < map->num_stripes; i++)
+> -			map->stripes[i].dev->zone_info->reserved_active_zones--;
+> +		for (int i = 0; i < map->num_stripes; i++) {
+> +			struct btrfs_device *dev = map->stripes[i].dev;
+> +
+> +			if (!btrfs_dev_is_sequential(dev, map->stripes[i].physical))
+> +				continue;
+> +
+> +			dev->zone_info->reserved_active_zones--;
+> +		}
+>  	}
+>  	spin_unlock(&fs_info->zone_active_bgs_lock);
+>  }
+
+[Severity: Medium]
+Can skipping conventional stripes here cause a reservation mismatch with
+btrfs_zone_activate() and call_zone_finish() on a multi-stripe block group
+that spans both a conventional zone and a sequential zone?
+
+When loading a partly conventional DUP or RAID metadata/system block group
+whose sequential stripe is open, btrfs_load_block_group_dup() sees
+test_bit(0, active) != test_bit(1, active) and calls
+btrfs_zone_activate().  Neither btrfs_zone_activate() nor
+btrfs_dev_set_active_zone() checks btrfs_dev_is_sequential():
+
+fs/btrfs/zoned.c:btrfs_zone_activate() {
+    ...
+		if (!btrfs_dev_set_active_zone(device, physical, &new)) {
+			/* Cannot activate the zone */
+			ret = false;
+			goto out_unlock;
+		}
+		if (!is_data && new)
+			zinfo->reserved_active_zones--;
+    ...
+}
+
+For the conventional stripe, btrfs_dev_set_active_zone() decrements
+zone_info->active_zones_left and sets the zone bit in
+zone_info->active_zones.  btrfs_check_active_zone_reservation() then
+resets reserved_active_zones and, with this patch, skips the conventional
+stripe while leaving its bit set in zone_info->active_zones.  When the
+block group is later finished in do_zone_finish() -> call_zone_finish(),
+btrfs_dev_clear_active_zone() clears that bit and increments
+zinfo->reserved_active_zones++, permanently over-counting
+reserved_active_zones and starving data block groups of active zones.
+
+Likewise, activating a partly conventional metadata or system block group
+at runtime via btrfs_zone_activate() still consumes active_zones_left and
+decrements reserved_active_zones for the conventional stripe.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261109173624.1144223-1-johannes.thumshirn@wdc.com?part=1
+

@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Mon Nov  9 14:17:16 2026
+Message-ID: <sashiko-outbox-204996@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 6.6.y] btrfs: fix unfinished ordered extent when
+ cow_file_range() fails
+Date: Mon, 09 Nov 2026 13:17:10 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: PAGE_SET_ORDERED on unlocked pages in cow_file_range()
+  error path
+--
+
+commit a94e70e04a11033e69e9e64f915e490d8e2191a5
+Author: Joseph Qi <joseph.qi@linux.alibaba.com>
+
+btrfs: fix unfinished ordered extent when cow_file_range() fails
+
+This commit restores PAGE_SET_ORDERED in cow_file_range()'s error cleanup
+for the range that already has ordered extents, so callers with a
+locked_page can finish accounting their share of the ordered extent.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index c8034d86f844f..a40201596b80f 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -1532,10 +1532,16 @@ static noinline int cow_file_range(struct btrfs_inode *inode,
+>  	 *
+>  	 * So here we only clear EXTENT_LOCKED and EXTENT_DELALLOC flag, and
+>  	 * finish the writeback of the involved folios, which will be never submitted.
+> +	 *
+> +	 * PAGE_SET_ORDERED is still needed here:
+> +	 * btrfs_cleanup_ordered_extents() skips @locked_page and leaves
+> +	 * its share of the ordered extent to the caller, which can only
+> +	 * account for it while the Ordered bit is set.
+>  	 */
+>  	if (orig_start < start) {
+>  		clear_bits = EXTENT_LOCKED | EXTENT_DELALLOC;
+> -		page_ops = PAGE_UNLOCK | PAGE_START_WRITEBACK | PAGE_END_WRITEBACK;
+> +		page_ops = PAGE_UNLOCK | PAGE_SET_ORDERED |
+> +			   PAGE_START_WRITEBACK | PAGE_END_WRITEBACK;
+
+[Severity: High]
+Does passing PAGE_SET_ORDERED across [orig_start, start - 1] leave every
+page other than locked_page unlocked in the page cache with PageOrdered
+(PG_private_2) set, clean, not under writeback, and without EXTENT_LOCKED
+until btrfs_cleanup_ordered_extents() runs?
+
+CPU0                                  CPU1
+cow_file_range()
+  extent_clear_unlock_delalloc()
+    process_one_page()
+      btrfs_page_clamp_set_ordered()
+      btrfs_page_clamp_clear_dirty()
+      btrfs_page_clamp_set_writeback()
+      btrfs_page_clamp_clear_writeback()
+      btrfs_page_end_writer_lock()
+                                      invalidate_inode_pages2_range()
+                                        filemap_release_folio()
+                                          btrfs_release_folio()
+                                            clear_page_extent_mapped()
+                                        invalidate_complete_folio2()
+                                          BUG_ON(folio_has_private(folio))
+
+Because the non-locked_page pages are clean, not under writeback, and no
+longer have EXTENT_LOCKED set, btrfs_release_folio() succeeds and
+clear_page_extent_mapped() clears PG_private while leaving PG_private_2
+set.  Page invalidation then hits BUG_ON(folio_has_private(folio)),
+reclaim or eviction frees the folio with PG_private_2 still set and trips
+bad_page(), and on subpage filesystems btrfs_cleanup_ordered_extents()
+can dereference a freed struct btrfs_subpage because it calls
+btrfs_page_clamp_clear_ordered() without locking the page.
+
+If btrfs_invalidate_folio() runs on one of those unlocked pages in the
+same window, it sees PageOrdered set, clears it, and decrements
+ordered->bytes_left via btrfs_dec_test_ordered_pending(), after which
+btrfs_cleanup_ordered_extents() calls btrfs_mark_ordered_io_finished()
+with page == NULL and accounts the same range a second time.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261109124750.64205-1-joseph.qi@linux.alibaba.com?part=1
+

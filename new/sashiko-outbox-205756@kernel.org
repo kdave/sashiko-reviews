@@ -1,0 +1,172 @@
+From sashiko-bot@kernel.org Mon Nov  9 23:37:05 2026
+Message-ID: <sashiko-outbox-205756@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: move async data csum generation out of
+ experimental features
+Date: Mon, 09 Nov 2026 22:37:01 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [High] btrfs: fast fsync logs unwritten checksums on async DIO write
+  with btrfs_csum_one_bio()
+- [Medium] btrfs: data race on bio->bi_opf in csum_one_bio_work() for
+  zoned writes
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [Critical] btrfs: missing wait for BTRFS_ORDERED_DIRECT extents in
+  btrfs_sync_file() [1]
+--
+
+commit 19237e6a50a483f3dc093d972d2b5c1351ebb5f1
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: move async data csum generation out of experimental features
+
+This commit enables asynchronous data checksum calculation unconditionally
+for all data write bios and removes the old workqueue submission offload
+for slow checksum algorithms.
+
+> diff --git a/fs/btrfs/file-item.c b/fs/btrfs/file-item.c
+> index 1fb99e11aa8af..3081dbeae8d9d 100644
+> --- a/fs/btrfs/file-item.c
+> +++ b/fs/btrfs/file-item.c
+> @@ -814,8 +814,12 @@ static void csum_one_bio_work(struct work_struct *work)
+>  
+>  /*
+>   * Calculate checksums of the data contained inside a bio.
+> + *
+> + * The checksums are calculated by a work queued on fs_info->workers, so they
+> + * are not valid on return. This must be called before the bio is submitted, as
+> + * the extra bio_inc_remaining() makes the bio completion wait for the work.
+>   */
+> -int btrfs_csum_one_bio(struct btrfs_bio *bbio, bool async)
+> +int btrfs_csum_one_bio(struct btrfs_bio *bbio)
+>  {
+>  	struct btrfs_ordered_extent *ordered = bbio->ordered;
+>  	struct btrfs_inode *inode = bbio->inode;
+
+[Severity: Medium]
+Can csum_one_bio_work() race with zoned write submission on bio->bi_opf and
+trip ASSERT(btrfs_op(&bbio->bio) == BTRFS_MAP_WRITE)?
+
+btrfs_submit_chunk() calls btrfs_bio_csum() -> btrfs_csum_one_bio(), which
+queues bbio->csum_work onto fs_info->workers before returning to call
+btrfs_submit_bio().  For a zone-append data write on a sequential zone,
+btrfs_submit_dev_bio() then modifies bio->bi_opf in two separate steps while
+csum_one_bio_work() may already be running:
+
+CPU0                              CPU1 (kworker)
+btrfs_submit_chunk()
+  btrfs_bio_csum()
+    btrfs_csum_one_bio()
+      queue_work(..., &bbio->csum_work)
+  btrfs_submit_bio()
+    btrfs_submit_dev_bio()
+      bio->bi_opf &= ~REQ_OP_WRITE;
+                                  csum_one_bio_work()
+                                    ASSERT(btrfs_op(&bbio->bio) ==
+                                           BTRFS_MAP_WRITE);
+                                      <-- sees REQ_OP_READ (0), BUG()
+      bio->bi_opf |= REQ_OP_ZONE_APPEND;
+
+blk_zone_wplug_prepare_bio() similarly clears REQ_OP_MASK before setting
+REQ_OP_WRITE | REQ_NOMERGE during emulated zone append submission.  Moving
+the ASSERT() into btrfs_csum_one_bio() before queueing bbio->csum_work
+would avoid reading bio->bi_opf concurrently with bio submission.
+
+> @@ -839,10 +843,6 @@ int btrfs_csum_one_bio(struct btrfs_bio *bbio, bool async)
+>  	btrfs_add_ordered_sum(ordered, sums);
+>  
+>  	bbio->csum_saved_iter = bio->bi_iter;
+> -	if (!async) {
+> -		csum_one_bio(bbio);
+> -		return 0;
+> -	}
+>  	bio_inc_remaining(bio);
+>  	INIT_WORK(&bbio->csum_work, csum_one_bio_work);
+>  	queue_work(fs_info->workers, &bbio->csum_work);
+
+[Severity: High]
+Can a fast fsync() log zero-filled or partially computed checksums from
+sums->sums[] when racing with an asynchronous direct I/O write?
+
+Previously, without CONFIG_BTRFS_EXPERIMENTAL, btrfs_csum_one_bio()
+computed sums->sums[] synchronously before btrfs_submit_bbio() returned.
+Now btrfs_csum_one_bio() attaches the zeroed btrfs_ordered_sum to
+ordered->csum_list via btrfs_add_ordered_sum() and queues csum_one_bio_work
+to populate sums->sums[] asynchronously.
+
+For an async O_DIRECT write (!is_sync_kiocb(iocb)), btrfs_create_dio_extent()
+creates a BTRFS_ORDERED_DIRECT ordered extent without setting
+BTRFS_INODE_NEEDS_FULL_SYNC, and btrfs_dio_write() submits the bounce bio
+and returns -EIOCBQUEUED while the bio and bbio->csum_work are still in
+flight:
+
+CPU0                              CPU1
+btrfs_direct_write()
+  btrfs_dio_write()
+    ...
+    btrfs_csum_one_bio()
+      sums = kvzalloc(...)
+      btrfs_add_ordered_sum(ordered, sums)
+      queue_work(..., &bbio->csum_work)
+  btrfs_inode_unlock()
+                                  btrfs_sync_file()
+                                    btrfs_get_ordered_extents_for_logging()
+                                    filemap_fdatawait_range()
+                                    btrfs_log_dentry_safe()
+                                      ...
+                                      log_extent_csums()
+                                        log_csums(..., sums)
+                                          <-- logs unwritten sums->sums[]
+                                  csum_one_bio_work()
+                                    csum_one_bio(bbio)
+
+Because direct I/O bounce pages are not in inode->vfs_inode.i_mapping,
+filemap_fdatawait_range() does not wait for the bio or bbio->csum_work.  If
+a crash happens before the next full transaction commit, replaying the log
+tree installs zeroed or corrupted checksums in the csum tree, causing
+permanent -EIO errors on subsequent reads.
+
+[Severity: Critical]
+This problem wasn't introduced by this patch, but btrfs_sync_file() does not
+wait for in-flight BTRFS_ORDERED_DIRECT ordered extents during fast fsync
+[1], and making btrfs_csum_one_bio() unconditionally asynchronous
+widens the window where log_one_extent() logs an in-flight direct I/O
+ordered extent.
+
+fs/btrfs/file.c:btrfs_sync_file() {
+	...
+	if (full_sync || btrfs_is_zoned(fs_info)) {
+		ret = btrfs_wait_ordered_range(inode, start, len);
+		clear_bit(BTRFS_INODE_COW_WRITE_ERROR, &inode->runtime_flags);
+	} else {
+		...
+		btrfs_get_ordered_extents_for_logging(inode, &ctx.ordered_extents);
+
+		list_for_each_entry(ordered, &ctx.ordered_extents, log_list) {
+			if (test_bit(BTRFS_ORDERED_ENCODED, &ordered->flags)) {
+				btrfs_start_ordered_extent(ordered);
+				...
+			}
+		}
+
+		ret = filemap_fdatawait_range(inode->vfs_inode.i_mapping, start, end);
+	...
+}
+
+In the fast fsync branch, the loop only waits for BTRFS_ORDERED_ENCODED
+extents and filemap_fdatawait_range() only waits on pagecache writeback.
+When an async O_DIRECT write has left an in-flight BTRFS_ORDERED_DIRECT
+extent in inode->ordered_tree, btrfs_log_changed_extents() logs the file
+extent item and ordered->csum_list before the data I/O and checksum
+work complete, removes the extent map from modified_extents, and sets
+BTRFS_ORDERED_LOGGED so later fast fsyncs skip it.  After a crash and log
+replay, the file extent points to unwritten on-disk blocks with missing or
+zeroed checksums in the csum tree.
+
+[1] https://sashiko.dev/#/bug/linux-ee047626-2fa7-46d5-b543-861136993fc7
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1794261158.git.wqu@suse.com?part=2
+

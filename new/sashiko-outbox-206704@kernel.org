@@ -1,0 +1,122 @@
+From sashiko-bot@kernel.org Tue Nov 10 10:38:48 2026
+Message-ID: <sashiko-outbox-206704@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: set write error flags before clearing writeback
+ on failed buffered writes
+Date: Tue, 10 Nov 2026 09:05:50 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: real bio error overwritten with -EIO in
+  end_bbio_data_write()
+- [Low] btrfs: inaccurate Fixes trailer in end_bbio_data_write() error
+  fix
+--
+
+commit edd4d83e11291354e2399cbc876645e877bebcc9
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: set write error flags before clearing writeback on failed buffered writes
+>
+> [BUG]
+> After commit f13e01b89daf ("btrfs: ensure fast fsync waits for ordered
+> extents after a write failure"), a failed COW write sets the inode's
+> BTRFS_INODE_COW_WRITE_ERROR flag.
+>
+> That flag makes the next fast fsync wait for ordered extents to complete,
+> so that it never logs the failed extents.
+>
+> However for buffered writes the flag can be set too late, and a fast
+> fsync can still log file extent items for the failed write.
+>
+> [CAUSE]
+> In end_bbio_data_write() the folios' writeback is cleared before the error
+> is recorded:
+>
+>  CPU0 (endio, failed buffered bio)  CPU1 (fast fsync)
+>  end_bbio_data_write()
+>  |-btrfs_folio_clear_writeback()
+>  | ^^^ wakes up the fsync           btrfs_sync_file()
+>  |                                  |-filemap_fdatawait_range()
+>  |                                  | ^^^ Returns after the writeback
+>  |                                  | finished
+>  |                                  |
+>  |                                  |-test_and_clear_bit(COW_WRITE_ERROR)
+>  |                                  | ^^^ Still 0, skips
+>  |                                  |     btrfs_wait_ordered_range()
+>  |                                  |
+>  |                                  \-btrfs_log_changed_extents()
+>  |                                    ^^^ logs the extent maps of the
+>  |                                        failed ordered extent
+>  |-mapping_set_error()
+>  \-btrfs_finish_ordered_extent()
+>    \-set_bit(COW_WRITE_ERROR)
+>      ^^^ Too late.
+>
+> A power loss after the log tree is persisted makes log replay point the
+> file to blocks that didn't receive its data.
+>
+> The mapping error is recorded late too, so the fsync can miss it as well.
+>
+> [FIX]
+> Record the error before anything a fast fsync can wait for.
+>
+> Introduce btrfs_ordered_extent_io_failed(), which marks the ordered
+> extent with BTRFS_ORDERED_IOERR, sets the mapping error and sets
+> BTRFS_INODE_COW_WRITE_ERROR for COW ordered extents.
+>
+> Call it from end_bbio_data_write() before clearing writeback, along with
+> mapping_set_error() with the real error code.
+>
+> Also call it from btrfs_finish_ordered_extent() before
+> can_finish_ordered_extent(), which sets BTRFS_ORDERED_IO_DONE, so that the
+> flag is also visible to anyone woken up by IO_DONE.
+> Compressed writes already finish the ordered extent before clearing
+> writeback and are not affected.
+>
+> Assisted-by: LLM (exposing the bug and coding)
+> Fixes: f13e01b89daf ("btrfs: ensure fast fsync waits for ordered extents after a write failure")
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+At f13e01b89daf ("btrfs: ensure fast fsync waits for ordered extents after
+a write failure"), end_bbio_data_write() called both
+btrfs_finish_ordered_extent() and mapping_set_error() inside the folio loop
+before btrfs_folio_clear_writeback().  Moving those calls after writeback
+completion happened later in a11d6912fdd9 ("btrfs: remove folio parameter
+from ordered io related functions") and 9d7db4100057 ("btrfs: move the
+mapping_set_error() out of the loop in end_bbio_data_write()").
+
+Should the Fixes: tags reference those two commits instead?
+
+> diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+> index b2739838c6462..53fced2756b57 100644
+> --- a/fs/btrfs/extent_io.c
+> +++ b/fs/btrfs/extent_io.c
+> @@ -545,6 +545,16 @@ static void end_bbio_data_write(struct btrfs_bio *bbio)
+>  	u32 bio_size = 0;
+>  
+>  	ASSERT(!bio_flagged(bio, BIO_CLONED));
+> +
+> +	/*
+> +	 * Record the error before clearing writeback, as a fast fsync waiting
+> +	 * for writeback checks the error right after being woken up.
+> +	 */
+> +	if (error) {
+> +		mapping_set_error(bbio->inode->vfs_inode.i_mapping, error);
+> +		btrfs_ordered_extent_io_failed(bbio->ordered);
+> +	}
+
+[Severity: Medium]
+Does calling btrfs_ordered_extent_io_failed() after mapping_set_error()
+overwrite the real bio error code with -EIO?
+
+btrfs_ordered_extent_io_failed() calls btrfs_mark_ordered_extent_error(),
+which calls mapping_set_error(..., -EIO) when setting BTRFS_ORDERED_IOERR.
+Because errseq_set() replaces any unsampled error value and AS_EIO takes
+precedence over AS_ENOSPC in filemap_check_errors(), a specific bio error
+such as -ENOSPC or -ENOMEM is clobbered by -EIO before fsync() can read it.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/93ad6002c98614b7a35c87b2792bce8dadb1e6b2.1794300081.git.wqu@suse.com?part=1
+

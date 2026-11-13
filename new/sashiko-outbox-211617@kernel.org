@@ -1,0 +1,78 @@
+From sashiko-bot@kernel.org Thu Nov 12 18:40:44 2026
+Message-ID: <sashiko-outbox-211617@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: send: fix invalid access to inline extents in
+ clone_range()
+Date: Thu, 12 Nov 2026 17:40:41 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: send: clone_range() still reads offset field on inline
+  extents
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [High] btrfs: send: out-of-bounds read in clone_range() [1]
+--
+
+commit 06e50f3a5b03c5e817db710c86b2c5e96d91adf3
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: send: fix invalid access to inline extents in clone_range()
+
+This commit initializes clone_data_offset to 0 and guards the
+btrfs_file_extent_disk_bytenr() checks in clone_range() against
+BTRFS_FILE_EXTENT_INLINE extents.
+
+Link: https://sashiko.dev/#/bug/linux-b662b951-0491-465b-a262-f01a108d8146
+
+> diff --git a/fs/btrfs/send.c b/fs/btrfs/send.c
+> index 1b903e75cec0a..d0b9429f14aaf 100644
+> --- a/fs/btrfs/send.c
+> +++ b/fs/btrfs/send.c
+> @@ -5842,7 +5842,7 @@ static int clone_range(struct send_ctx *sctx, struct btrfs_path *dst_path,
+>  		u8 type;
+>  		u64 ext_len;
+>  		u64 clone_len;
+> -		u64 clone_data_offset;
+> +		u64 clone_data_offset = 0;
+>  		bool crossed_src_i_size = false;
+>  
+>  		if (slot >= btrfs_header_nritems(leaf)) {
+
+[Severity: High]
+Isn't this initialization of clone_data_offset overwritten unconditionally by
+btrfs_file_extent_offset(leaf, ei) before the type != BTRFS_FILE_EXTENT_INLINE
+check?
+
+For an inline extent, the inline payload starts at disk_bytenr and the offset
+field lies even further into the item.  When a clone source inode has an
+inline extent at slot 0 with fewer than 24 bytes of inline data, calling
+btrfs_file_extent_offset(leaf, ei) reads past eb->len in btrfs_get_64(),
+which indexes eb->folios[] out of bounds or triggers report_setget_bounds().
+Moving the btrfs_file_extent_offset() call inside the
+type != BTRFS_FILE_EXTENT_INLINE branch avoids reading that field on inline
+extents.
+
+> @@ -5907,7 +5907,8 @@ static int clone_range(struct send_ctx *sctx, struct btrfs_path *dst_path,
+>  		}
+>  
+>  		clone_data_offset = btrfs_file_extent_offset(leaf, ei);
+> -		if (btrfs_file_extent_disk_bytenr(leaf, ei) == disk_byte) {
+> +		if (type != BTRFS_FILE_EXTENT_INLINE &&
+> +		    btrfs_file_extent_disk_bytenr(leaf, ei) == disk_byte) {
+
+[Severity: High]
+This problem wasn't introduced by this patch, but can the unguarded
+btrfs_file_extent_offset(leaf, ei) call here still trigger the out-of-bounds
+read [1] when clone_range() inspects a small inline extent at file
+offset 0 positioned at the end of a leaf extent buffer?
+
+Because inline extents do not have an offset field, reading it on a small
+inline payload at a leaf boundary accesses memory past the end of the extent
+buffer folio, which can cause a KASAN splat or kernel panic.
+
+[1] https://sashiko.dev/#/bug/linux-b662b951-0491-465b-a262-f01a108d8146
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/a8f80de0fd18699ffc6f9fbbdfa794e80e9a1fe1.1794504038.git.fdmanana@suse.com?part=1
+

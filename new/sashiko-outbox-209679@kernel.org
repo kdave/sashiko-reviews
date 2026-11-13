@@ -1,0 +1,148 @@
+From sashiko-bot@kernel.org Wed Nov 11 21:48:31 2026
+Message-ID: <sashiko-outbox-209679@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: fix RCU usage in btrfs_ioctl_dev_info()
+Date: Wed, 11 Nov 2026 20:47:52 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [High] btrfs: race and UAF in btrfs_rm_device() freeing cur_devices
+  without mutex
+- [High] btrfs: lock order inversion on uuid_mutex in btrfs_rm_device()
+- [Medium] btrfs: RCU use-after-free of seed_devices in
+  btrfs_rollback_sprout()
+--
+
+commit 7d9edd479d1ba0d57e2512c23363521c7f470d65
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix RCU usage in btrfs_ioctl_dev_info()
+
+This commit introduces an RCU variant of btrfs_find_device() for
+btrfs_ioctl_dev_info() and updates device and seed_list manipulations to
+use RCU list primitives.
+
+Link: https://sashiko.dev/#/bug/linux-96a9e36b-a712-491c-b210-91c8c4f6070f
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 3d4ef6725de0e..de0516bdb7a36 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -2515,9 +2515,12 @@ int btrfs_rm_device(struct btrfs_fs_info *fs_info,
+>  	 * remove it from our list and free the fs_devices.
+>  	 */
+>  	if (cur_devices->num_devices == 0) {
+> -		list_del_init(&cur_devices->seed_list);
+> +		mutex_lock(&uuid_mutex);
+
+[Severity: High]
+Does taking uuid_mutex here while holding an open transaction invert the
+lock order against btrfs_init_new_device()?
+
+btrfs_rm_device() starts a transaction before reaching this block and only
+commits it at the end of the function.  When sprouting a seed filesystem,
+btrfs_init_new_device() acquires uuid_mutex before starting and committing
+a transaction, which can cause an ABBA deadlock:
+
+CPU0                              CPU1
+----                              ----
+btrfs_start_transaction()
+                                  mutex_lock(&uuid_mutex)
+mutex_lock(&uuid_mutex)
+                                  btrfs_start_transaction()
+
+ *** DEADLOCK ***
+
+CPU0: btrfs_ioctl_rm_dev() -> btrfs_rm_device()
+CPU1: btrfs_ioctl_add_dev() -> btrfs_init_new_device()
+
+> +		list_del_rcu(&cur_devices->seed_list);
+>  		ASSERT(cur_devices->opened == 1, "opened=%d", cur_devices->opened);
+>  		cur_devices->opened--;
+> +		mutex_unlock(&uuid_mutex);
+> +		synchronize_rcu();
+>  		free_fs_devices(cur_devices);
+>  	}
+
+[Severity: High]
+Can a caller of the non-RCU btrfs_find_device() race with this removal and
+trigger a use-after-free on cur_devices?
+
+Callers such as btrfs_get_dev_stats() and btrfs_scrub_progress() call the
+non-RCU btrfs_find_device() while holding only
+fs_devices->device_list_mutex, outside an RCU read-side critical section:
+
+fs/btrfs/volumes.c:btrfs_get_dev_stats() {
+	...
+	mutex_lock(&fs_devices->device_list_mutex);
+	args.devid = stats->devid;
+	dev = btrfs_find_device(fs_info->fs_devices, &args);
+	mutex_unlock(&fs_devices->device_list_mutex);
+	...
+}
+
+Because btrfs_rm_device() drops fs_devices->device_list_mutex earlier and
+only takes uuid_mutex here, and synchronize_rcu() does not wait for threads
+holding a mutex outside RCU, cur_devices can be unlinked and freed while
+btrfs_find_device() is walking fs_devices->seed_list:
+
+CPU0                                    CPU1
+btrfs_get_dev_stats()                   btrfs_rm_device()
+  mutex_lock(&device_list_mutex)
+  btrfs_find_device()
+    list_for_each_entry(seed_devs,
+                        &fs_devices->seed_list, ...)
+                                          mutex_lock(&uuid_mutex)
+                                          list_del_rcu(&cur_devices->seed_list)
+                                          mutex_unlock(&uuid_mutex)
+                                          synchronize_rcu()
+                                          free_fs_devices(cur_devices)
+                                            kfree(cur_devices)
+      dev_args_match_fs_devices(...,
+        seed_devs)  <-- use-after-free
+
+[ ... ]
+
+> @@ -2821,7 +2824,7 @@ static void btrfs_rollback_sprout(struct btrfs_fs_info *fs_info,
+>  	lockdep_assert_held(&uuid_mutex);
+>  	lockdep_assert_held(&fs_devices->device_list_mutex);
+>  
+> -	list_del_init(&seed_devices->seed_list);
+> +	list_del_rcu(&seed_devices->seed_list);
+>  	list_splice_init_rcu(&seed_devices->devices, &fs_devices->devices, synchronize_rcu);
+>  	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+>  		device->fs_devices = fs_devices;
+
+[Severity: Medium]
+Can btrfs_ioctl_dev_info() dereference seed_devices after
+btrfs_rollback_sprout() frees it?
+
+list_splice_init_rcu() calls synchronize_rcu() before linking the devices
+back onto fs_devices->devices, while each device->fs_devices still points
+to seed_devices.  Once spliced, an RCU reader in btrfs_ioctl_dev_info() can
+find a device on fs_devices->devices and load dev->fs_devices before the
+loop resets device->fs_devices to fs_devices, after which
+btrfs_rollback_sprout() immediately calls free_fs_devices(seed_devices)
+without waiting for another RCU grace period:
+
+CPU0                                    CPU1
+btrfs_rollback_sprout()                 btrfs_ioctl_dev_info()
+  list_del_rcu(&seed_devices->seed_list)
+  list_splice_init_rcu(...,
+    &fs_devices->devices,
+    synchronize_rcu)
+                                          rcu_read_lock()
+                                          dev = btrfs_find_device_rcu(...)
+                                          /* loads dev->fs_devices
+                                           * (== seed_devices) */
+  device->fs_devices = fs_devices
+  ...
+  free_fs_devices(seed_devices)
+    kfree(seed_devices)
+                                          memcpy(di_args->fsid,
+                                            dev->fs_devices->fsid, ...)
+                                            <-- use-after-free
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/7523a44da9b8504e6cbc65b9f5388c07a7aaa645.1794426971.git.fdmanana@suse.com?part=1
+

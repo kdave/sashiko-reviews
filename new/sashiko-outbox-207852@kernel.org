@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Tue Nov 10 23:56:01 2026
+Message-ID: <sashiko-outbox-207852@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zstd: remove unnecessary early return in reclaim
+ function
+Date: Tue, 10 Nov 2026 22:55:57 +0000
+
+Thank you for your contribution! Sashiko AI review found no new issues
+in this patch, but noticed 1 related pre-existing issue it does not
+introduce:
+- [Critical] btrfs: zstd: use-after-free in zstd_put_workspace() [1]
+--
+
+commit 8b29fa624dc6965e67a020d79f3dabb057ab6f74
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: zstd: remove unnecessary early return in reclaim function
+
+This commit removes the early list_empty() check on zwsm->lru_list in
+zstd_reclaim_timer_fn().
+
+> diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+> index b686f67d52ec1..e75a46a84e151 100644
+> --- a/fs/btrfs/zstd.c
+> +++ b/fs/btrfs/zstd.c
+> @@ -116,11 +116,6 @@ static void zstd_reclaim_timer_fn(struct timer_list *timer)
+>  
+>  	spin_lock(&zwsm->lock);
+>  
+> -	if (list_empty(&zwsm->lru_list)) {
+> -		spin_unlock(&zwsm->lock);
+> -		return;
+> -	}
+> -
+>  	list_for_each_prev_safe(pos, next, &zwsm->lru_list) {
+>  		struct workspace *victim = container_of(pos, struct workspace,
+>  							lru_list);
+
+[Severity: Critical]
+This problem wasn't introduced by this patch, but can zstd_put_workspace()
+trigger a use-after-free [1] on workspace when racing with
+zstd_reclaim_timer_fn()?
+
+fs/btrfs/zstd.c:zstd_put_workspace() {
+    ...
+	set_bit(workspace->level, &zwsm->active_map);
+	list_add(&workspace->list, &zwsm->idle_ws[workspace->level]);
+	workspace->req_level = 0;
+
+	spin_unlock_bh(&zwsm->lock);
+
+	if (workspace->level == clip_level(ZSTD_BTRFS_MAX_LEVEL))
+		cond_wake_up(&zwsm->wait);
+}
+
+When zstd_find_workspace() borrows a higher-level workspace for a lower
+compression level (clip_level(level) < workspace->level), the workspace
+stays on zwsm->lru_list with its old workspace->last_used timestamp while
+workspace->req_level is set.  If workspace->last_used ages past
+ZSTD_BTRFS_RECLAIM_JIFFIES before the workspace is returned,
+zstd_put_workspace() skips the LRU update, clears workspace->req_level and
+unlocks zwsm->lock:
+
+CPU0                              CPU1 (<softirq>)
+zstd_put_workspace()
+  spin_lock_bh(&zwsm->lock)
+  workspace->req_level = 0
+  spin_unlock_bh(&zwsm->lock)
+                                  zstd_reclaim_timer_fn()
+                                    spin_lock(&zwsm->lock)
+                                    zstd_free_workspace(&victim->list)
+                                      kfree(workspace)
+                                    spin_unlock(&zwsm->lock)
+  if (workspace->level == ...)  <-- use-after-free
+
+Once zwsm->lock is released, zstd_reclaim_timer_fn() can see
+victim->req_level == 0 with an expired last_used timestamp and free the
+workspace before zstd_put_workspace() reads workspace->level.  Checking
+workspace->level before unlocking zwsm->lock (or caching it in a local
+variable) would avoid the race.
+
+[1] https://sashiko.dev/#/bug/linux-92b08485-a86c-4bb5-9138-fa80c84389f0
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/13284885928812954a694ac399f3186b76806fbe.1794351010.git.fdmanana@suse.com?part=1
+

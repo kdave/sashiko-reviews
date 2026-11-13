@@ -1,0 +1,87 @@
+From sashiko-bot@kernel.org Mon Nov  9 22:11:05 2026
+Message-ID: <sashiko-outbox-205636@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: Clean up delayed inode items on transaction
+ abort
+Date: Mon, 09 Nov 2026 21:10:59 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: btrfs_evict_inode() kills uncommitted delayed inode on
+  non-abort error
+--
+
+commit 1c21e2956ad4cec244192964f7ba8a140f911508
+Author: Yalagada Pavan Kumar <pavankumaryalagada@gmail.com>
+
+btrfs: Clean up delayed inode items on transaction abort
+
+This commit moves the error check for btrfs_commit_inode_delayed_inode()
+in btrfs_evict_inode() after btrfs_kill_delayed_inode_items() so that
+pending delayed items are dropped on failure.
+
+Link: https://lore.kernel.org/all/6af131f2.44d55313.247daf.0001.GAE@google.com/T/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 19b1eba2dd845..9e038552813d0 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -5607,8 +5607,6 @@ void btrfs_evict_inode(struct inode *inode)
+>  	 * the inode update is released.
+>  	 */
+>  	ret = btrfs_commit_inode_delayed_inode(BTRFS_I(inode));
+> -	if (ret)
+> -		goto out;
+>  
+>  	/*
+>  	 * This drops any pending insert or delete operations we have for this
+> @@ -5618,6 +5616,9 @@ void btrfs_evict_inode(struct inode *inode)
+>  	 */
+>  	btrfs_kill_delayed_inode_items(BTRFS_I(inode));
+>  
+> +	if (ret)
+> +		goto out;
+> +
+>  	btrfs_init_metadata_block_rsv(fs_info, &rsv, BTRFS_BLOCK_RSV_TEMP);
+>  	rsv.size = btrfs_calc_metadata_size(fs_info, 1);
+>  	rsv.failfast = true;
+
+[Severity: High]
+Can calling btrfs_kill_delayed_inode_items() before checking ret corrupt
+the on-disk subvolume tree when btrfs_commit_inode_delayed_inode() fails
+without aborting the transaction?
+
+In __btrfs_unlink_inode(), unlinking the last link of an inode defers the
+nlink = 0 inode update (BTRFS_DELAYED_NODE_INODE_DIRTY) and the
+BTRFS_INODE_REF_KEY deletion (BTRFS_DELAYED_NODE_DEL_IREF) in the
+inode's delayed_node.  btrfs_commit_inode_delayed_inode() can fail with
+-ENOMEM (for example when btrfs_alloc_path() returns NULL) while the
+running transaction remains healthy:
+
+fs/btrfs/delayed-inode.c:btrfs_commit_inode_delayed_inode() {
+    ...
+	trans = btrfs_join_transaction(delayed_node->root);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		goto out;
+	}
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto trans_out;
+	}
+    ...
+}
+
+Running btrfs_kill_delayed_inode_items() -> __btrfs_kill_delayed_node()
+on that error path discards both the uncommitted nlink = 0 update and the
+delayed INODE_REF deletion in memory, and jumping to out then skips
+btrfs_truncate_inode_items().  When the transaction commits, the unlinked
+inode stays on disk with nlink = 1 and a dangling INODE_REF, so
+btrfs_orphan_cleanup() on the next mount sees i_nlink > 0 and only
+deletes the orphan item, leaking the inode and its extents.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261109202914.64371-1-pavankumaryalagada@gmail.com?part=1
+

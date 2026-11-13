@@ -1,0 +1,95 @@
+From sashiko-bot@kernel.org Fri Nov 13 04:09:40 2026
+Message-ID: <sashiko-outbox-212125@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: handle errors of btrfs_next_leaf() in
+ create_remap_tree_entries()
+Date: Fri, 13 Nov 2026 03:09:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: unreleased bg->free_space_lock on error in
+  create_remap_tree_entries()
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [High] btrfs: missing slot bounds check in create_remap_tree_entries()
+  [1]
+--
+
+commit 393b39b07f15df807035ea5bedaa6cdadfe7301a
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: handle errors of btrfs_next_leaf() in create_remap_tree_entries()
+
+This commit checks for errors returned by btrfs_next_leaf() after iterating
+the free space tree in create_remap_tree_entries() so they are not
+overwritten by add_remap_tree_entries().
+
+Link: https://sashiko.dev/#/bug/linux-93f4c09d-07d1-4919-b201-2d46f70adf3d
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 9af207446848d..8ef6934acfa19 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+> @@ -4659,6 +4659,8 @@ static int create_remap_tree_entries(struct btrfs_trans_handle *trans,
+>  	}
+>  
+>  	btrfs_release_path(path);
+> +	if (ret < 0)
+> +		goto out;
+>  
+>  	mutex_unlock(&bg->free_space_lock);
+
+[Severity: High]
+Does jumping to out before mutex_unlock(&bg->free_space_lock) return with
+bg->free_space_lock still held when btrfs_next_leaf() fails?  The out label
+only frees entries and space_runs, so any later caller acquiring
+bg->free_space_lock will deadlock:
+
+fs/btrfs/relocation.c:create_remap_tree_entries() {
+    ...
+out:
+	kfree(entries);
+	kfree(space_runs);
+
+	return ret;
+}
+
+[Severity: High]
+This problem wasn't introduced by this patch, but can the free-space tree
+walk in create_remap_tree_entries() read one slot past the end of a leaf's
+item array [1]?
+
+fs/btrfs/relocation.c:create_remap_tree_entries() {
+    ...
+	key.objectid = bg->start;
+	key.type = 0;
+	key.offset = 0;
+
+	space_root = btrfs_free_space_root(bg);
+
+	ret = btrfs_search_slot(trans, space_root, &key, path, 0, 0);
+    ...
+	while (true) {
+		leaf = path->nodes[0];
+
+		btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+    ...
+		path->slots[0]++;
+
+		if (path->slots[0] >= btrfs_header_nritems(leaf)) {
+			ret = btrfs_next_leaf(space_root, path);
+    ...
+}
+
+Because key.type is 0, searching for a block group whose first free-space
+item sits at slot 0 of a non-initial leaf lands in the previous leaf with
+path->slots[0] equal to btrfs_header_nritems(leaf).  Checking the slot
+bound only at the end of the loop makes the first btrfs_item_key_to_cpu()
+read past the item array, either stopping the walk early or treating
+garbage as free-space items and corrupting the remap tree.
+
+[1] https://sashiko.dev/#/bug/linux-151508af-3854-4fb6-82b1-f1dc1309075c
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/f07172047d96c93a23d74289dc9dc5b00092feed.1794538460.git.wqu@suse.com?part=1
+

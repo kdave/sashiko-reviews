@@ -1,0 +1,68 @@
+From sashiko-bot@kernel.org Wed Nov 11 00:34:28 2026
+Message-ID: <sashiko-outbox-207938@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: zoned: don't fail start_transaction() after a
+ forced commit
+Date: Tue, 10 Nov 2026 23:34:25 +0000
+
+Thank you for your contribution! Sashiko AI review found no new issues
+in this patch, but noticed 1 related pre-existing issue it does not
+introduce:
+- [High] btrfs: freeze deadlock via metadata flushing in
+  start_transaction() [1]
+--
+
+commit 3e45df8203a113d33864eb025dda73f9c08c9de7
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't fail start_transaction() after a forced commit
+
+This commit ignores a second -EAGAIN return from
+btrfs_delayed_refs_rsv_refill() after forcing a transaction commit in
+start_transaction() on zoned filesystems.
+
+> diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+> index cd7dff5ba59b6..d2da7de4b9050 100644
+> --- a/fs/btrfs/transaction.c
+> +++ b/fs/btrfs/transaction.c
+> @@ -725,6 +725,8 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+>  			if (ret)
+>  				goto reserve_fail;
+>  			ret = btrfs_delayed_refs_rsv_refill(fs_info, flush);
+> +			if (ret == -EAGAIN)
+> +				ret = 0;
+>  		}
+
+[Severity: High]
+This problem wasn't introduced by this patch, but can performing metadata
+reservations with BTRFS_RESERVE_FLUSH_ALL in start_transaction() before
+acquiring sb_start_intwrite() cause a freeze deadlock [1]?
+
+btrfs_qgroup_rescan_worker() calls btrfs_start_transaction() with
+num_items == 0, which runs btrfs_delayed_refs_rsv_refill() (or
+btrfs_reserve_trans_metadata() when num_items > 0) with
+BTRFS_RESERVE_FLUSH_ALL before reaching the sb_start_intwrite() check:
+
+fs/btrfs/transaction.c:start_transaction() {
+	...
+	} else if (num_items == 0 && flush == BTRFS_RESERVE_FLUSH_ALL &&
+		   !btrfs_block_rsv_full(delayed_refs_rsv)) {
+		ret = btrfs_delayed_refs_rsv_refill(fs_info, flush);
+		...
+	}
+again:
+	...
+	if (type & TRANS_SB_INTWRITER_MASK)
+		sb_start_intwrite(fs_info->sb);
+}
+
+When metadata space is tight while the filesystem is being frozen (for
+example during system suspend), the flush path can call
+btrfs_join_transaction() and block in sb_start_intwrite(), deadlocking
+against the freeze operation waiting for the btrfs workqueues to drain.
+
+[1] https://sashiko.dev/#/bug/linux-4d44a511-02f2-4b2c-b856-b2097e40033b
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261110074523.1199319-1-johannes.thumshirn@wdc.com?part=1
+

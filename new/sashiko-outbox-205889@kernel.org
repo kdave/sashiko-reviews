@@ -1,0 +1,122 @@
+From sashiko-bot@kernel.org Tue Nov 10 01:45:09 2026
+Message-ID: <sashiko-outbox-205889@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: keep a logged extent allocated when its ordered
+ extent fails
+Date: Tue, 10 Nov 2026 00:45:06 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: skipped BTRFS_ORDERED_LOGGED check in
+  btrfs_finish_one_ordered()
+--
+
+commit 7eeb5f7f2dc5327725e932c22bff660728c830f1
+Author: Leo Martins <loemra.dev@gmail.com>
+
+btrfs: keep a logged extent allocated when its ordered extent fails
+
+This commit keeps the disk range of a failed ordered extent allocated when a
+fast fsync has already logged it, and sets a filesystem error so the
+transaction that logged the extent cannot commit and drop the log.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 19b1eba2dd845..c8af19a05405d 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -3170,6 +3170,30 @@ static int insert_ordered_extent_file_extent(struct btrfs_trans_handle *trans,
+>  					   update_inode_bytes, oe->qgroup_rsv);
+>  }
+>  
+> +/*
+> + * The log may already reference this extent, so keep it out of the free space
+> + * cache until log replay at the next mount.
+> + *
+> + * The transaction that logged it must not commit either, since that would drop
+> + * the log. Every failure after joining it aborts it, and a failed join means it
+> + * already aborted or the filesystem already has an error, unless allocating
+> + * the handle failed. In that case set the error here, so the commit fails to
+> + * write its tree blocks and never writes a superblock.
+> + */
+> +static void keep_logged_extent(struct btrfs_ordered_extent *oe, int error)
+> +{
+> +	struct btrfs_fs_info *fs_info = oe->inode->root->fs_info;
+> +	struct btrfs_block_group *bg;
+> +
+> +	if (!BTRFS_FS_ERROR(fs_info))
+> +		btrfs_handle_fs_error(fs_info, error, NULL);
+> +
+> +	bg = btrfs_lookup_block_group(fs_info, oe->disk_bytenr);
+> +	ASSERT(bg);
+> +	btrfs_free_reserved_bytes(bg, oe->disk_num_bytes, true);
+> +	btrfs_put_block_group(bg);
+> +}
+> +
+>  /*
+>   * As ordered data IO finishes, this gets called so we can finish
+>   * an ordered extent if the range of bytes in the file it covers are
+> @@ -3373,18 +3397,31 @@ int btrfs_finish_one_ordered(struct btrfs_ordered_extent *ordered_extent)
+>  		    clear_reserved_extent &&
+>  		    !test_bit(BTRFS_ORDERED_NOCOW, &ordered_extent->flags) &&
+>  		    !test_bit(BTRFS_ORDERED_PREALLOC, &ordered_extent->flags)) {
+> +			const u64 disk_bytenr = ordered_extent->disk_bytenr;
+> +			const u64 disk_num_bytes = ordered_extent->disk_num_bytes;
+> +			bool logged;
+> +
+>  			/*
+> -			 * Discard the range before returning it back to the
+> -			 * free space pool
+> +			 * A fast fsync may have logged this extent. Pairs with
+> +			 * the end of btrfs_log_changed_extents().
+>  			 */
+> -			if (ret && btrfs_test_opt(fs_info, DISCARD_SYNC))
+> -				btrfs_discard_extent(fs_info,
+> -						ordered_extent->disk_bytenr,
+> -						ordered_extent->disk_num_bytes,
+> -						NULL, true);
+> -			btrfs_free_reserved_extent(fs_info,
+> -					ordered_extent->disk_bytenr,
+> -					ordered_extent->disk_num_bytes, true);
+> +			spin_lock(&inode->ordered_tree_lock);
+> +			logged = test_bit(BTRFS_ORDERED_LOGGED, &ordered_extent->flags);
+> +			spin_unlock(&inode->ordered_tree_lock);
+> +
+> +			if (ret && logged) {
+> +				keep_logged_extent(ordered_extent, ret);
+> +			} else {
+> +				/*
+> +				 * Discard the range before returning it back to
+> +				 * the free space pool
+> +				 */
+> +				if (ret && btrfs_test_opt(fs_info, DISCARD_SYNC))
+> +					btrfs_discard_extent(fs_info, disk_bytenr,
+> +							     disk_num_bytes, NULL, true);
+> +				btrfs_free_reserved_extent(fs_info, disk_bytenr,
+> +							   disk_num_bytes, true);
+> +			}
+
+[Severity: High]
+Does gating the BTRFS_ORDERED_LOGGED check and btrfs_handle_fs_error() call
+behind !BTRFS_ORDERED_NOCOW && !BTRFS_ORDERED_PREALLOC allow the transaction
+to commit and wipe the log when completing a logged prealloc or nocow
+ordered extent fails?
+
+For a write into a preallocated range, btrfs_create_io_em() creates an
+extent map without EXTENT_FLAG_PREALLOC on modified_extents, so a fast fsync
+logs it as BTRFS_FILE_EXTENT_REG along with its checksums and sets
+BTRFS_ORDERED_LOGGED.  Until btrfs_finish_one_ordered() joins the
+transaction and runs btrfs_mark_extent_written(), add_pending_csums(), and
+btrfs_update_inode_fallback(), the subvolume tree still has the unwritten
+BTRFS_FILE_EXTENT_PREALLOC item and no checksums.
+
+If btrfs_join_transaction() fails to allocate a handle (-ENOMEM),
+btrfs_finish_one_ordered() skips this block, never acquires
+inode->ordered_tree_lock to synchronize with btrfs_log_changed_extents(),
+and never calls btrfs_handle_fs_error().  Once btrfs_remove_ordered_extent()
+decrements pending_ordered, the transaction can commit and drop the log
+tree, losing the fsynced data and leaving the extent marked unwritten so
+subsequent reads return zeroes.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/54da67463c57f41302f8456a8a7a1190dcb65ae2.1794266796.git.loemra.dev@gmail.com?part=1
+

@@ -1,0 +1,147 @@
+From sashiko-bot@kernel.org Fri Nov 13 00:15:33 2026
+Message-ID: <sashiko-outbox-211936@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: do not unwind a committed device in
+ btrfs_init_new_device()
+Date: Thu, 12 Nov 2026 23:15:30 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: missing Fixes trailer for commit 7132a262595a in commit
+  message
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [Medium] btrfs: missing bdev_allow_freeze() on error in
+  btrfs_rm_device() [1]
+--
+
+commit d554a66f400dd27d23c7001cdc25c192a503fc36
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: do not unwind a committed device in btrfs_init_new_device()
+>
+> Sashiko reported an use-after-free bug during error handling of
+> btrfs_init_new_device(), that error from btrfs_attach_transaction() can
+> cause use-after-free:
+>
+>  btrfs_init_new_device()
+>  |-btrfs_commit_transaction()
+>  | ^^^ device is now in the chunk tree, chunks are allocated on it
+>  |     and the fsid is changed
+>  |
+>  |-mutex_unlock(&uuid_mutex);
+>  | ^^^ uuid_mutext unlocked.
+>  |
+>  |-btrfs_attach_transaction()
+>  | ^^^ fails with -ENOMEM for allocation failure or -EROFS for
+>  |     aborted transaction.
+>  |
+>  \-goto error_sysfs
+>    |-btrfs_sysfs_remove_device()
+>    |-list_del_rcu(&device->dev_list)
+>    |
+>    |-btrfs_rollback_sprout()
+>    | ^^^ asserts uuid_mutex, which is not held anymore
+>    |
+>    \-btrfs_free_device()
+>      ^^^ chunk maps still point to the freed device
+>
+> Since the device can not be unwound once committed, do not go through
+> the unwind path. We have no transaction handle to abort, so call
+> btrfs_handle_fs_error() to force the fs read-only (a no-op if it
+> already is), release the freeze protection and return the error.
+>
+> Also let the -ENOENT and attach failure exits run btrfs_forget_devices()
+> and update_dev_time() like the success path, as the device is committed.
+>
+> Reported-by: Sashiko <sashiko-bot@kernel.org>
+> Link: https://sashiko.dev/#/bug/linux-c339b137-b739-4f8d-8cc5-0960dee662ee
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+The jump to error_sysfs on btrfs_attach_transaction() failure after the first
+transaction committed the device was introduced by 7132a262595a ("btrfs:
+error out if btrfs_attach_transaction() fails").  Should this include:
+
+  Fixes: 7132a262595a ("btrfs: error out if btrfs_attach_transaction() fails")
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 3d4ef6725de0e..3c4b305eabcd6 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -3165,17 +3165,24 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
+>  				    "Failed to relocate sys chunks after device initialization. This can be fixed using the \"btrfs balance\" command.");
+>  		trans = btrfs_attach_transaction(root);
+>  		if (IS_ERR(trans)) {
+> -			if (PTR_ERR(trans) == -ENOENT) {
+> -				bdev_allow_freeze(file_bdev(bdev_file));
+> -				return 0;
+> -			}
+>  			ret = PTR_ERR(trans);
+> -			trans = NULL;
+> -			goto error_sysfs;
+> +			if (ret == -ENOENT) {
+> +				ret = 0;
+> +				goto device_added;
+> +			}
+> +			/*
+> +			 * The new device is already committed and in use, we
+> +			 * can not unwind it anymore. There is no transaction
+> +			 * handle to abort, so force the fs read-only instead.
+> +			 */
+> +			btrfs_handle_fs_error(fs_info, ret,
+> +	"Failed to attach transaction after device initialization");
+> +			goto device_added;
+>  		}
+>  		ret = btrfs_commit_transaction(trans);
+>  	}
+>  
+> +device_added:
+>  	/*
+>  	 * Now that we have written a new super block to this device, check all
+>  	 * other fs_devices list if device_path alienates any other scanned
+
+[Severity: Medium]
+This problem wasn't introduced by this patch, but does btrfs_rm_device() leak
+the freeze-deny reference on device->bdev [1] when
+btrfs_remove_dev_stat_item() fails?
+
+fs/btrfs/volumes.c:btrfs_rm_device() {
+	...
+	if (device->bdev) {
+		ret = bdev_deny_freeze(device->bdev);
+		if (ret)
+			return ret;
+	}
+	...
+	ret = btrfs_rm_dev_item(trans, device);
+	if (unlikely(ret)) {
+		...
+		btrfs_abort_transaction(trans, ret);
+		btrfs_end_transaction(trans);
+		if (device->bdev)
+			bdev_allow_freeze(device->bdev);
+		return ret;
+	}
+
+	ret = btrfs_remove_dev_stat_item(trans, device->devid);
+	if (unlikely(ret)) {
+		btrfs_abort_transaction(trans, ret);
+		btrfs_end_transaction(trans);
+		return ret;
+	}
+	...
+}
+
+Unlike the btrfs_rm_dev_item() error path right above it, the error branch
+for btrfs_remove_dev_stat_item() returns without calling
+bdev_allow_freeze(device->bdev).  Because unmount closes remaining member
+devices via btrfs_close_bdev() without calling bdev_allow_freeze(),
+bd_fsfreeze_count stays permanently elevated and later attempts to freeze the
+block device fail with -EBUSY.
+
+[1] https://sashiko.dev/#/bug/linux-05adc2aa-31a7-40cc-8073-d1a99e4d7a31
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/02d1a8fbadb25335495cdcf147785216b5cd8934.1794524252.git.wqu@suse.com?part=1
+

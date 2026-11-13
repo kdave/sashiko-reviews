@@ -1,0 +1,90 @@
+From sashiko-bot@kernel.org Tue Nov 10 21:37:30 2026
+Message-ID: <sashiko-outbox-207718@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix race between getting device stats and
+ removing device
+Date: Tue, 10 Nov 2026 20:37:27 +0000
+
+Thank you for your contribution! Sashiko AI review found no new issues
+in this patch, but noticed 1 related pre-existing issue it does not
+introduce:
+- [Critical] btrfs: unsafe RCU list traversal in btrfs_find_device() [1]
+--
+
+commit 4986534927d1cb239c40195ce5df4594e57b4709
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix race between getting device stats and removing device
+
+This commit keeps device_list_mutex held across the device stats read and
+reset in btrfs_get_dev_stats() so that a concurrent device removal cannot
+free the btrfs_device while it is still being accessed.
+
+Link: https://sashiko.dev/#/bug/linux-1ac8d72d-3ab5-4feb-b957-c4862ba1d15b
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 3d4ef6725de0e..9e37aee00824a 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -8658,15 +8658,20 @@ int btrfs_get_dev_stats(struct btrfs_fs_info *fs_info,
+>  	mutex_lock(&fs_devices->device_list_mutex);
+>  	args.devid = stats->devid;
+>  	dev = btrfs_find_device(fs_info->fs_devices, &args);
+
+[Severity: Critical]
+This problem wasn't introduced by this patch, but can btrfs_find_device()
+[1] cause an unsafe RCU list traversal when called under
+rcu_read_lock()?
+
+Callers such as btrfs_ioctl_dev_info() invoke btrfs_find_device() under
+rcu_read_lock() without holding device_list_mutex, relying on RCU to walk
+the device lists while concurrent device additions or removals modify
+them:
+
+fs/btrfs/ioctl.c:btrfs_ioctl_dev_info() {
+	...
+	rcu_read_lock();
+	dev = btrfs_find_device(fs_info->fs_devices, &args);
+	if (!dev) {
+		ret = -ENODEV;
+		goto out;
+	}
+	...
+out:
+	rcu_read_unlock();
+}
+
+However, btrfs_find_device() iterates over fs_devices->devices,
+fs_devices->seed_list, and seed_devs->devices with list_for_each_entry()
+instead of list_for_each_entry_rcu():
+
+fs/btrfs/volumes.c:btrfs_find_device() {
+	...
+	if (dev_args_match_fs_devices(args, fs_devices)) {
+		list_for_each_entry(device, &fs_devices->devices, dev_list) {
+			if (dev_args_match_device(args, device))
+				return device;
+		}
+	}
+
+	list_for_each_entry(seed_devs, &fs_devices->seed_list, seed_list) {
+		if (!dev_args_match_fs_devices(args, seed_devs))
+			continue;
+		list_for_each_entry(device, &seed_devs->devices, dev_list) {
+			if (dev_args_match_device(args, device))
+				return device;
+		}
+	}
+	...
+}
+
+Without list_for_each_entry_rcu(), the list walk lacks the required
+READ_ONCE() / rcu_dereference() barriers, allowing the compiler or CPU to
+reorder loads during a concurrent list update and dereference uninitialized
+or freed memory.
+
+[1] https://sashiko.dev/#/bug/linux-96a9e36b-a712-491c-b210-91c8c4f6070f
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/ad13663d72d23c941b0655ed7b7b46fd7541293d.1794342214.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,84 @@
+From sashiko-bot@kernel.org Wed Nov 11 23:15:37 2026
+Message-ID: <sashiko-outbox-209776@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix loss of fsynced file after link into new dir
+ and unlink
+Date: Wed, 11 Nov 2026 22:15:33 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: log_all_new_ancestors() forces transaction commit on
+  unlinked inode
+--
+
+commit 8efed2954903075cba557bf206ac1ef9529dc344
+Author: Mani Tofigh <mt4022@columbia.edu>
+
+btrfs: fix loss of fsynced file after link into new dir and unlink
+
+This commit skips the single-link fast path in log_all_new_ancestors() when
+the inode has been unlinked or renamed in the current transaction so that new
+parent directories of remaining links are logged from the subvolume tree.
+
+> diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
+> index 85ef3c26e0e46..4f24b277f1b7d 100644
+> --- a/fs/btrfs/tree-log.c
+> +++ b/fs/btrfs/tree-log.c
+> @@ -7543,9 +7543,13 @@ static int log_all_new_ancestors(struct btrfs_trans_handle *trans,
+>  
+>  	/*
+>  	 * For a single hard link case, go through a fast path that does not
+> -	 * need to iterate the fs/subvolume tree.
+> +	 * need to iterate the fs/subvolume tree. But not if the inode had a
+> +	 * link, unlink or rename in the current transaction, since then the
+> +	 * dentry used for the fsync may be an unlinked one, whose parent is
+> +	 * not the parent of the remaining link.
+>  	 */
+> -	if (inode->vfs_inode.i_nlink < 2) {
+> +	if (inode->vfs_inode.i_nlink < 2 &&
+> +	    inode->last_unlink_trans < trans->transid) {
+>  		ret = log_new_ancestors_fast(trans, inode, parent, ctx);
+>  		goto out;
+>  	}
+
+[Severity: Medium]
+Does this force a full transaction commit when fsyncing an open file whose
+last link was unlinked in the current transaction?
+
+When inode->vfs_inode.i_nlink == 0, btrfs_unlink() has set
+inode->last_unlink_trans = trans->transid, and btrfs_log_inode() has already
+flushed the delayed inode to remove the last BTRFS_INODE_REF_KEY from the
+subvolume tree.  Skipping the fast path here enters the subvolume tree search
+for (ino, BTRFS_INODE_REF_KEY, 0), where btrfs_search_slot() returns ret = 1
+and the loop breaks without resetting ret when any item follows the inode
+item in the leaf:
+
+fs/btrfs/tree-log.c:log_all_new_ancestors() {
+	...
+	ret = btrfs_search_slot(NULL, root, &search_key, path, 0, 0);
+	if (ret < 0)
+		goto out;
+	if (ret == 0)
+		path->slots[0]++;
+
+	while (true) {
+		...
+		btrfs_item_key_to_cpu(leaf, &found_key, slot);
+		if (found_key.objectid != ino ||
+		    found_key.type > BTRFS_INODE_EXTREF_KEY)
+			break;
+	...
+out:
+	trace_btrfs_log_all_new_ancestors_exit(trans, inode, ret);
+	return ret;
+}
+
+log_all_new_ancestors() then returns 1 (BTRFS_LOG_FORCE_COMMIT) to
+btrfs_log_inode_parent(), causing btrfs_sync_file() to fall back to a full
+transaction commit instead of syncing the log tree.  Taking the fast path (or
+returning early) when inode->vfs_inode.i_nlink == 0, and resetting ret = 0
+before breaking out of the loop, would avoid this regression.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261111-btrfs-link-unlink-fsync-v1-1-a817d4a890af@columbia.edu?part=1
+

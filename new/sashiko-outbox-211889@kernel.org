@@ -1,0 +1,39 @@
+From sashiko-bot@kernel.org Thu Nov 12 23:09:15 2026
+Message-ID: <sashiko-outbox-211889@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: relocation: release path on copy failure in
+ move_existing_remap()
+Date: Thu, 12 Nov 2026 22:09:12 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: missing Fixes trailer for move_existing_remap() path leak
+  fix
+--
+
+commit e7aa46de398eeb3cd010b043c3c080e61d0701d6
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: relocation: release path on copy failure in move_existing_remap()
+>
+> All other error exits in move_existing_remap() release the path before
+> jumping to the end label, but the copy_remapped_data() failure doesn't.
+> The remap root leaf stays write locked until the caller frees the path,
+> across the transaction abort.
+>
+> Release the path before jumping to the error path like the others.
+>
+> Reported-by: Sashiko <sashiko-bot@kernel.org>
+> Link: https://sashiko.dev/#/bug/linux-a9bb6565-ee24-429b-a2d7-ab427317fa57
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+Since this fixes the unreleased path on the copy_remapped_data() error
+path introduced in bbea42dfb91f ("btrfs: move existing remaps before
+relocating block group"), should this include:
+
+  Fixes: bbea42dfb91f ("btrfs: move existing remaps before relocating block group")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/ea3810fb56f15af9878aafcf4632eb82d2245003.1794520632.git.wqu@suse.com?part=1
+

@@ -1,0 +1,131 @@
+From sashiko-bot@kernel.org Fri Nov  6 16:48:42 2026
+Message-ID: <sashiko-outbox-201732@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 2/2] btrfs: drain in-flight direct IO before zeroing
+ an unaligned EOF block
+Date: Fri, 06 Nov 2026 15:48:39 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: btrfs_write_check() sleeps in inode_dio_wait() on
+  IOCB_NOWAIT writes
+- [Medium] btrfs: btrfs_write_check() drains DIO under shared lock in
+  btrfs_direct_write()
+--
+
+commit 724d7c92002c725e9bcfdf5ab7929aea6a4136bb
+Author: Breno Leitao <leitao@debian.org>
+
+btrfs: drain in-flight direct IO before zeroing an unaligned EOF block
+
+This commit waits for in-flight direct I/O via inode_dio_wait() in
+btrfs_write_check() before calling btrfs_cont_expand() when extending a file
+past a sector-unaligned i_size.
+
+> diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+> index 2017a96814d85..15802db7b664b 100644
+> --- a/fs/btrfs/file.c
+> +++ b/fs/btrfs/file.c
+> @@ -1063,6 +1063,13 @@ int btrfs_write_check(struct kiocb *iocb, size_t count)
+>  		/* Expand hole size to cover write data, preventing empty gap */
+>  		loff_t end_pos = round_up(pos + count, fs_info->sectorsize);
+>  
+> +		/*
+> +		 * Zeroing the block at an unaligned EOF dirties its folio, so
+> +		 * drain in-flight direct IO first, see btrfs_buffered_write().
+> +		 */
+> +		if (!IS_ALIGNED(oldsize, fs_info->sectorsize))
+> +			inode_dio_wait(inode);
+> +
+>  		ret = btrfs_cont_expand(BTRFS_I(inode), oldsize, end_pos);
+>  		if (ret)
+>  			return ret;
+
+[Severity: Medium]
+Can an IOCB_NOWAIT write sleep here in inode_dio_wait() and
+btrfs_cont_expand() instead of returning -EAGAIN?
+
+At the start of btrfs_write_check(), IOCB_NOWAIT writes only bail out with
+-EAGAIN if the inode has neither BTRFS_INODE_NODATACOW nor
+BTRFS_INODE_PREALLOC set:
+
+fs/btrfs/file.c:btrfs_write_check() {
+	if ((iocb->ki_flags & IOCB_NOWAIT) &&
+	    !(BTRFS_I(inode)->flags & (BTRFS_INODE_NODATACOW | BTRFS_INODE_PREALLOC)))
+		return -EAGAIN;
+
+When an RWF_NOWAIT write on a NOCOW or preallocated file starts past an
+unaligned i_size, it reaches the pos > oldsize branch and blocks waiting for
+in-flight direct I/O and EOF zeroing rather than failing with -EAGAIN as
+xfs_file_write_zero_eof() does.
+
+[Severity: Medium]
+Also, can btrfs_direct_write() reach this inode_dio_wait() and
+btrfs_cont_expand() path while holding only BTRFS_ILOCK_SHARED?
+
+btrfs_direct_write() checks whether the write is within i_size before taking
+the inode lock, and only rechecks and upgrades BTRFS_ILOCK_SHARED to an
+exclusive lock after calling btrfs_write_check():
+
+fs/btrfs/direct-io.c:btrfs_direct_write() {
+	if (iocb->ki_pos + iov_iter_count(from) <= i_size_read(inode) && IS_NOSEC(inode))
+		ilock_flags |= BTRFS_ILOCK_SHARED;
+
+relock:
+	ret = btrfs_inode_lock(BTRFS_I(inode), ilock_flags);
+	...
+	ret = btrfs_write_check(iocb, ret);
+	if (ret < 0) {
+		btrfs_inode_unlock(BTRFS_I(inode), ilock_flags);
+		goto out;
+	}
+
+	pos = iocb->ki_pos;
+	/*
+	 * Re-check since file size may have changed just before taking the
+	 * lock or pos may have changed because of O_APPEND in generic_write_check()
+	 */
+	if ((ilock_flags & BTRFS_ILOCK_SHARED) &&
+	    pos + iov_iter_count(from) > i_size_read(inode)) {
+		btrfs_inode_unlock(BTRFS_I(inode), ilock_flags);
+		ilock_flags &= ~BTRFS_ILOCK_SHARED;
+		goto relock;
+	}
+
+If a concurrent truncate shrinks i_size to an unaligned offset below ki_pos
+before btrfs_inode_lock() acquires BTRFS_ILOCK_SHARED, btrfs_write_check()
+drains DIO and dirties the EOF folio without an exclusive lock:
+
+CPU0                                  CPU1
+btrfs_direct_write()
+  ki_pos + count <= i_size_read()
+  ilock_flags |= BTRFS_ILOCK_SHARED
+                                      btrfs_setattr()
+                                        btrfs_inode_lock(..., 0)
+                                        truncate i_size < ki_pos (unaligned)
+                                        btrfs_inode_unlock(..., 0)
+  btrfs_inode_lock(...,SHARED)
+  btrfs_write_check()
+    inode_dio_wait()
+                                      btrfs_direct_write() (block 0 of folio)
+                                        btrfs_inode_lock(...,SHARED)
+                                        iomap_dio_rw() submitted
+    btrfs_cont_expand()
+      btrfs_truncate_block()
+        dirties EOF folio
+  pos + count > i_size_read()
+  btrfs_inode_unlock(...,SHARED)
+                                      iomap_dio_complete()
+                                        kiocb_invalidate_post_direct_write()
+                                          folio is dirty -> mapping -EIO
+
+Because BTRFS_ILOCK_SHARED does not block new direct writes within EOF from
+starting after inode_dio_wait() returns (and also allows multiple writers
+racing with truncate to run btrfs_cont_expand() concurrently), the post-DIO
+page cache invalidation can still see the dirtied folio and record -EIO for
+subsequent fsync() calls. Re-checking i_size and upgrading BTRFS_ILOCK_SHARED
+to an exclusive lock before calling btrfs_write_check() would prevent this.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261106-btrfs_page_cache-v2-0-f57575d0071d@debian.org?part=2
+

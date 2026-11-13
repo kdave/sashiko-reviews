@@ -1,0 +1,83 @@
+From sashiko-bot@kernel.org Tue Nov 10 04:21:25 2026
+Message-ID: <sashiko-outbox-206109@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: bound free space runs by extent count in remap
+ tree setup
+Date: Tue, 10 Nov 2026 03:21:22 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: unreleased path on error in
+  create_remap_tree_entries()
+--
+
+commit 4f4a31f22a353f124209cca96f6ca67fa8a8bc0b
+Author: Xingyuan Mo <hdthky0@gmail.com>
+
+btrfs: bound free space runs by extent count in remap tree setup
+
+This commit bounds the free space runs array in create_remap_tree_entries()
+and parse_bitmap() by the block group's extent_count, returning -EUCLEAN if
+the free space tree contains more runs than advertised.
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 9af207446848d..e5e85a91f4ddb 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+
+[ ... ]
+
+> @@ -4608,7 +4613,11 @@ static int create_remap_tree_entries(struct btrfs_trans_handle *trans,
+>  				space_runs[num_space_runs - 1].end =
+>  					found_key.objectid + found_key.offset;
+>  			} else {
+> -				ASSERT(num_space_runs < extent_count);
+> +				if (num_space_runs >= extent_count) {
+> +					mutex_unlock(&bg->free_space_lock);
+> +					ret = -EUCLEAN;
+> +					goto out;
+> +				}
+>  
+>  				space_runs[num_space_runs].start = found_key.objectid;
+>  				space_runs[num_space_runs].end =
+> @@ -4634,14 +4643,15 @@ static int create_remap_tree_entries(struct btrfs_trans_handle *trans,
+>  
+>  				read_extent_buffer(leaf, bitmap, offset, data_size);
+>  
+> -				parse_bitmap(fs_info->sectorsize, bitmap,
+> -					     data_size * BITS_PER_BYTE,
+> -					     found_key.objectid, space_runs,
+> -					     &num_space_runs);
+> -
+> -				ASSERT(num_space_runs <= extent_count);
+> -
+> +				ret = parse_bitmap(fs_info->sectorsize, bitmap,
+> +						   data_size * BITS_PER_BYTE,
+> +						   found_key.objectid, space_runs,
+> +						   &num_space_runs, extent_count);
+>  				kfree(bitmap);
+> +				if (ret) {
+> +					mutex_unlock(&bg->free_space_lock);
+> +					goto out;
+> +				}
+>  			}
+>  		}
+
+[Severity: Medium]
+Do these new error paths leave path holding a read lock on the space_root
+leaf when jumping to out?
+
+The out label only frees entries and space_runs without calling
+btrfs_release_path(path) (which the existing !bitmap error path in this
+loop also misses).  When create_remap_tree_entries() returns an error,
+start_block_group_remapping() unlocks fs_info->remap_mutex and calls
+btrfs_end_transaction(trans) while path still holds the tree lock, which
+violates lock ordering and can self-deadlock on space_root if
+__btrfs_end_transaction() -> btrfs_create_pending_block_groups() ->
+btrfs_add_block_group_free_space() runs for a pending block group.  Calling
+btrfs_release_path(path) in the out cleanup path would release the leaf on
+all error exits.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261110030459.2640203-1-hdthky0@gmail.com?part=1
+

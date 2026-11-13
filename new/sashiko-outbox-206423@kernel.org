@@ -1,0 +1,94 @@
+From sashiko-bot@kernel.org Tue Nov 10 07:41:11 2026
+Message-ID: <sashiko-outbox-206423@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/4] btrfs: do not allow fast fsync if there is any
+ async dio write
+Date: Tue, 10 Nov 2026 06:41:05 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: unlocked btrfs_set_inode_full_sync() in
+  btrfs_direct_write()
+--
+
+commit 76ce7fa0fec939bedb1556b634b5e0cb3bc23b11
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: do not allow fast fsync if there is any async dio write
+
+This commit sets BTRFS_INODE_NEEDS_FULL_SYNC on the inode when
+btrfs_dio_write() returns -EIOCBQUEUED so that subsequent fsync() calls do
+not use the fast path while an asynchronous direct write is in flight.
+
+Link: https://sashiko.dev/#/bug/linux-ee047626-2fa7-46d5-b543-861136993fc7
+
+> diff --git a/fs/btrfs/direct-io.c b/fs/btrfs/direct-io.c
+> index ed3914257d395..6e796163015ed 100644
+> --- a/fs/btrfs/direct-io.c
+> +++ b/fs/btrfs/direct-io.c
+> @@ -974,6 +974,17 @@ ssize_t btrfs_direct_write(struct kiocb *iocb, struct iov_iter *from)
+>  
+>  	if (IS_ERR_OR_NULL(dio)) {
+>  		ret = PTR_ERR_OR_ZERO(dio);
+> +		/*
+> +		 * The async direct write is not waiting for its IO to finish.
+> +		 *
+> +		 * If fsync() went through the fast path, the direct write OE
+> +		 * will be logged, but the data may not yet reach disks.
+> +		 * And fsync() returned without waiting for the data.
+> +		 *
+> +		 * So for async direct writes, we can not go to fast sync path.
+> +		 */
+> +		if (ret == -EIOCBQUEUED)
+> +			btrfs_set_inode_full_sync(BTRFS_I(inode));
+
+[Severity: High]
+Can calling btrfs_set_inode_full_sync() here while holding only
+BTRFS_ILOCK_SHARED race with a concurrent O_DSYNC/O_SYNC direct write on
+the same inode?
+
+btrfs_set_inode_full_sync() requires callers to hold either the exclusive
+VFS inode lock or inode->i_mmap_lock so that BTRFS_INODE_NEEDS_FULL_SYNC
+cannot change while btrfs_sync_file() is running.  For direct writes
+within EOF, btrfs_direct_write() takes only BTRFS_ILOCK_SHARED and does
+not take i_mmap_lock.  When a synchronous direct write completes via
+iomap_dio_complete() -> generic_write_sync() -> btrfs_sync_file() with
+current->journal_info set to BTRFS_TRANS_DIO_WRITE_STUB, btrfs_sync_file()
+sets skip_ilock = true and only acquires inode->i_mmap_lock:
+
+CPU0 (sync DIO write within EOF)  CPU1 (async DIO write within EOF)
+btrfs_direct_write()              btrfs_direct_write()
+  btrfs_inode_lock(..., SHARED)     btrfs_inode_lock(..., SHARED)
+  iomap_dio_complete()              btrfs_dio_write()
+    ...                               ...
+    btrfs_sync_file()                 btrfs_dio_iomap_begin()
+      down_write(&i_mmap_lock)        btrfs_dio_submit_io()
+      full_sync = test_bit(...)
+      /* full_sync is false, skips
+         btrfs_wait_ordered_range() */
+                                    btrfs_set_inode_full_sync()
+      btrfs_log_dentry_safe()
+        ...
+        btrfs_log_inode()
+          test_bit(NEEDS_FULL_SYNC) <-- now true!
+          clear_bit(NEEDS_FULL_SYNC)
+          copy_inode_items_to_log()
+          /* skips btrfs_log_changed_extents()
+             and purges modified_extents */
+
+Because btrfs_log_inode() re-tests BTRFS_INODE_NEEDS_FULL_SYNC and
+switches from fast_search to copying committed subvolume items without
+btrfs_sync_file() having waited for ordered extents, CPU0's uncommitted
+ordered extent is dropped from the log and removed from modified_extents,
+breaking O_DSYNC durability on power loss and clearing
+BTRFS_INODE_NEEDS_FULL_SYNC while CPU1's async bio is still in flight.
+
+In addition, because CPU1 sets BTRFS_INODE_NEEDS_FULL_SYNC only after
+btrfs_dio_write() returns -EIOCBQUEUED, if CPU0's skip_ilock
+btrfs_sync_file() runs between CPU1's btrfs_dio_iomap_begin() and
+btrfs_set_inode_full_sync(), CPU0 still observes full_sync == false and
+logs CPU1's unwritten extent before its bio finishes.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1794290876.git.wqu@suse.com?part=1
+
