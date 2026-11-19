@@ -31,6 +31,7 @@ done
 
 cd "$here"
 grep -L '^From sashiko-bot@kernel.org' new/* | xargs rm -v --
+grep -L 'btrfs' new/* | xargs rm -v --
 git add new/*
 ./update-readme.sh
 git add README.md
