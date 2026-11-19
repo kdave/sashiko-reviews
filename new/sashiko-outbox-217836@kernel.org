@@ -1,0 +1,268 @@
+From sashiko-bot@kernel.org Tue Nov 17 00:01:51 2026
+Message-ID: <sashiko-outbox-217836@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 6/8] Documentation: btrfs: document waiting for the root
+ filesystem devices
+Date: Mon, 16 Nov 2026 23:01:46 +0000
+
+Thank you for your contribution! Sashiko AI review found 7 potential
+issues to consider:
+- [High] btrfs: Kconfig allows BTRFS_ROOT_SCAN=y with BTRFS_FS=m,
+  breaking modpost
+- [Medium] btrfs: btrfs_scan_all_devices() miscounts opened non-btrfs
+  block devices
+- [Medium] btrfs: uninitialized struct btrfs_scan_result read in
+  btrfs_wait_for_devices()
+- [Medium] init: is_root_dev() and root_wait remain active outside
+  prepare_namespace()
+- [Medium] init: static inline is_root_dev() in do_mounts.c breaks
+  !CONFIG_BLOCK build
+- [Medium] btrfs: btrfs_scan_all_devices() fails to translate '!' in
+  dev_name() paths
+- [Low] Documentation: btrfs: inaccurate Kconfig and devtmpfs mount
+  requirements
+--
+
+commit 0408a949d7c4d2ef58614fc0e035c2a655a8c241
+Author: Ismael Luceno <ismael@iodev.co.uk>
+
+Documentation: btrfs: document waiting for the root filesystem devices
+
+This series adds in-kernel block device scanning and rootwait support for
+mounting multi-device btrfs root filesystems without an initrd, and
+documents the feature.
+
+> diff --git a/Documentation/filesystems/btrfs.rst b/Documentation/filesystems/btrfs.rst
+> index a81db8f54d689..9dcdb87a53c3e 100644
+> --- a/Documentation/filesystems/btrfs.rst
+> +++ b/Documentation/filesystems/btrfs.rst
+> @@ -33,6 +33,37 @@ The main Btrfs features include:
+
+[ ... ]
+
+> +The search needs the device nodes in ``/dev``, which come from devtmpfs.  Where
+> +that is not mounted the search cannot start, and btrfs says so and gives up
+> +rather than waiting for something it can never find.
+> +
+> +The search is built with ``CONFIG_BTRFS_ROOT_SCAN``, which depends on
+> +``CONFIG_DEVTMPFS`` and is on by default.
+
+[Severity: Low]
+Does this match the Kconfig and devtmpfs mount requirements?  In
+fs/btrfs/Kconfig, BTRFS_ROOT_SCAN uses "select DEVTMPFS" rather than
+"depends on DEVTMPFS", and devtmpfs_mount() is a no-op during
+prepare_namespace() unless CONFIG_DEVTMPFS_MOUNT=y or devtmpfs.mount=1 is
+set, which is not mentioned here.  Mounting a root filesystem without an
+initrd also requires CONFIG_BTRFS_FS=y.
+
+> diff --git a/fs/btrfs/Kconfig b/fs/btrfs/Kconfig
+> index 0b8d8905e38e2..8c7e7a2f59f37 100644
+> --- a/fs/btrfs/Kconfig
+> +++ b/fs/btrfs/Kconfig
+> @@ -83,6 +83,31 @@ config BTRFS_ASSERT
+>  
+>  	  If unsure, say N.
+>  
+> +config BTRFS_ROOT_SCAN
+> +	bool "Btrfs multi-device root scan support"
+> +	select DEVTMPFS
+> +	depends on BTRFS_FS
+> +	default y
+
+[Severity: High]
+Does allowing CONFIG_BTRFS_ROOT_SCAN=y when CONFIG_BTRFS_FS=m break the
+build at modpost?
+
+Because BTRFS_FS is tristate, CONFIG_BTRFS_FS=m satisfies "depends on
+BTRFS_FS" and enables BTRFS_ROOT_SCAN=y by default.  Linking btrfs.ko then
+fails with undefined references to unexported symbols: block_class in
+btrfs_scan_all_devices(), and root_wait and is_root_dev() in
+btrfs_get_tree_super().  Should this depend on BTRFS_FS=y instead?
+
+[ ... ]
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index b424cc836bd4a..fb407361bbafd 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+
+[ ... ]
+
+> +static void btrfs_wait_for_devices(struct btrfs_fs_devices *fs_devices,
+> +				   long timeout_ms)
+> +{
+> +	unsigned long end;
+> +	struct btrfs_scan_result res;
+> +	unsigned int last_opened = ~0U;
+> +	unsigned int last_candidates = ~0U;
+> +	u64 last_missing = ~0ULL;
+> +	bool explained = false;
+> +	u64 missing;
+> +
+> +	mutex_lock(&uuid_mutex);
+> +	missing = btrfs_missing_devices(fs_devices);
+> +	mutex_unlock(&uuid_mutex);
+> +
+> +	if (!missing)
+> +		return;
+> +
+> +	/*
+> +	 * A negative timeout is rootwait without a value, which means wait
+> +	 * indefinitely; the loop then has no end.
+> +	 */
+> +	end = timeout_ms < 0 ? jiffies + MAX_JIFFY_OFFSET :
+> +			      jiffies + msecs_to_jiffies(timeout_ms);
+> +
+> +	if (timeout_ms < 0)
+> +		btrfs_info(NULL, "fsid %pU is missing %llu device(s), waiting indefinitely",
+> +			   fs_devices->fsid, missing);
+> +	else
+> +		btrfs_info(NULL, "fsid %pU is missing %llu device(s), waiting up to %ld ms",
+> +			   fs_devices->fsid, missing, timeout_ms);
+> +
+> +	while (!time_after(jiffies, end)) {
+> +		mutex_lock(&uuid_mutex);
+> +		btrfs_scan_all_devices(&res);
+
+[ ... ]
+
+> +	}
+> +
+> +	if (missing)
+> +		btrfs_warn(NULL,
+> +			   "fsid %pU: %u of %u device(s) scanned, %u btrfs, still missing %llu; mounting anyway (%u block devices, %u passed over)",
+> +			   fs_devices->fsid, res.opened, res.candidates, res.found,
+> +			   missing, res.seen, res.skipped);
+
+[Severity: Medium]
+Can this btrfs_warn() read uninitialized fields from res if end elapses
+before the while loop is entered?
+
+res is declared on the stack without initialization, and jiffies can
+advance past end during the btrfs_info() call before the first
+!time_after(jiffies, end) check (for example, on a slow serial console or
+preempted vCPU).  The loop body is then skipped while missing is non-zero,
+logging uninitialized stack values from res and triggering
+-Wmaybe-uninitialized warnings.
+
+[ ... ]
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 3d4ef6725de0e..d7b9d255a9da8 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+
+[ ... ]
+
+> +		/* Longest is "/dev/" plus a BDEVNAME_SIZE name. */
+> +		char path[sizeof("/dev/") + BDEVNAME_SIZE];
+> +
+> +		candidates++;
+> +		snprintf(path, sizeof(path), "/dev/%s", dev_name(dev));
+
+[Severity: Medium]
+Does formatting "/dev/%s" directly from dev_name(dev) fail for block
+devices whose gendisk name contains '/'?
+
+kobject_set_name_vargs() replaces '/' with '!' in dev_name(dev) (such as
+"cciss!c0d0p1"), whereas devtmpfs creates the node using
+device_get_devnode(), which translates '!' back to '/' (creating
+"/dev/cciss/c0d0p1") or invokes the device's devnode callback.  Opening
+"/dev/cciss!c0d0p1" will then fail with -ENOENT.
+
+> +
+> +		device = btrfs_scan_one_device(path, false);
+> +		if (IS_ERR(device)) {
+> +			/*
+> +			 * ENOENT is the node not being there, as opposed to
+> +			 * the node being there and not holding a btrfs
+> +			 * filesystem.  Keep one of each to explain a scan
+> +			 * that reaches nothing, rather than one line each.
+> +			 */
+> +			if (!res->unreachable++) {
+> +				res->first_unreachable = dev_to_bdev(dev)->bd_dev;
+> +				res->first_errno = PTR_ERR(device);
+> +			}
+> +			if (PTR_ERR(device) != -ENOENT)
+> +				btrfs_debug(NULL, "skipping %s: %ld\n", path,
+> +					    PTR_ERR(device));
+> +		} else {
+> +			opened++;
+> +			found++;
+> +		}
+
+[Severity: Medium]
+Does this miscount opened non-btrfs block devices as unreachable?
+
+When btrfs_scan_one_device() opens the /dev node with
+bdev_file_open_by_path() and btrfs_read_disk_super() finds no btrfs magic,
+btrfs_scan_one_device() returns ERR_PTR(-EINVAL).  The IS_ERR(device)
+branch here treats that -EINVAL the same as a missing /dev node: it leaves
+opened unincremented (so res->opened always equals res->found) and records
+the non-btrfs partition in res->unreachable and res->first_unreachable.
+If only non-btrfs partitions are present on the first pass,
+btrfs_wait_for_devices() sees !res.opened, warns that /dev nodes are
+missing, and aborts the wait immediately.
+
+[ ... ]
+
+> diff --git a/init/do_mounts.c b/init/do_mounts.c
+> index b088021b1546d..f1dcb18201ebe 100644
+> --- a/init/do_mounts.c
+> +++ b/init/do_mounts.c
+
+[ ... ]
+
+> @@ -372,10 +372,26 @@ static void __init mount_block_root(char *root_device_name)
+>  		pr_emerg("Failed to create /dev/root: %d\n", err);
+>  	mount_root_generic("/dev/root", root_device_name, root_mountflags);
+>  }
+> +
+> +/*
+> + * Was the filesystem on @dev mounted as the root filesystem?  mount_root()
+> + * above is the only thing that mounts from /dev/root, and that name is given
+> + * to the root mount alone, so a filesystem being handed that device is being
+> + * asked to be the root filesystem.
+> + */
+> +bool is_root_dev(dev_t dev)
+> +{
+> +	return dev && dev == ROOT_DEV;
+> +}
+
+[Severity: Medium]
+Can is_root_dev() and root_wait trigger btrfs_wait_for_devices() on mounts
+outside prepare_namespace()?
+
+create_dev("/dev/root", ROOT_DEV) creates /dev/root with the same dev_t as
+the underlying block device (e.g. /dev/sda1), and btrfs_get_tree_super()
+checks is_root_dev(device->devt) while both ROOT_DEV and root_wait remain
+set after boot (or when an initramfs is used and prepare_namespace() is
+skipped).  Any later non-degraded mount of a btrfs filesystem on that
+dev_t when a partner device is missing will enter btrfs_wait_for_devices()
+and block (indefinitely under a bare rootwait), contradicting the
+documented behavior that the search is only made during the root mount.
+
+>  #else
+>  static inline void mount_block_root(char *root_device_name)
+>  {
+>  }
+> +
+> +static inline bool is_root_dev(dev_t dev)
+> +{
+> +	return false;
+> +}
+>  #endif /* CONFIG_BLOCK */
+
+[Severity: Medium]
+Does defining is_root_dev() as static inline here break the build when
+CONFIG_BLOCK is disabled?
+
+include/linux/root_dev.h declares "bool is_root_dev(dev_t dev);" with
+external linkage, and init/do_mounts.c includes <linux/root_dev.h>, so the
+static definition in the !CONFIG_BLOCK branch fails to compile with a
+static-follows-non-static declaration error (and provides no external
+symbol for other translation units).
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261116224316.11237-10-ismael@iodev.co.uk?part=6
+

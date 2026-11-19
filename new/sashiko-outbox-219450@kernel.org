@@ -1,0 +1,68 @@
+From sashiko-bot@kernel.org Tue Nov 17 20:11:48 2026
+Message-ID: <sashiko-outbox-219450@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 02/27] btrfs: zoned: reject dev-replace onto a target
+ with different zone types
+Date: Tue, 17 Nov 2026 19:11:43 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: zoned: out-of-bounds bitmap read in
+  btrfs_init_dev_replace_tgtdev()
+--
+
+commit a2eeeed6aa0490ac77c4da35f31a5a0db80bf99f
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: reject dev-replace onto a target with different zone types
+
+This commit rejects device replacement when the sequential zone bitmap of
+the target device does not match the source device.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 3c48cc714fef2..a7a76e9572ade 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -318,6 +318,15 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+>  	if (ret)
+>  		goto error;
+>  
+> +	if (srcdev->zone_info &&
+> +	    !bitmap_equal(srcdev->zone_info->seq_zones, device->zone_info->seq_zones,
+> +			  srcdev->zone_info->nr_zones)) {
+> +		btrfs_err(fs_info,
+> +		"dev-replace: zone types of target device mismatch with source device");
+> +		ret = -EINVAL;
+> +		goto error;
+> +	}
+
+[Severity: High]
+Can bitmap_equal() read past the end of device->zone_info->seq_zones?
+
+btrfs_init_dev_replace_tgtdev() only requires bdev_nr_bytes(bdev) to be at
+least btrfs_device_get_total_bytes(srcdev), whereas btrfs_get_dev_zone_info()
+sizes zone_info->nr_zones and zone_info->seq_zones from the raw block device
+capacity bdev_nr_sectors(bdev):
+
+fs/btrfs/zoned.c:btrfs_get_dev_zone_info() {
+    ...
+	nr_sectors = bdev_nr_sectors(bdev);
+	zone_info->zone_size_shift = ilog2(zone_info->zone_size);
+	zone_info->nr_zones = nr_sectors >> ilog2(zone_sectors);
+	if (!IS_ALIGNED(nr_sectors, zone_sectors))
+		zone_info->nr_zones++;
+    ...
+	zone_info->seq_zones = bitmap_zalloc(zone_info->nr_zones, GFP_KERNEL);
+}
+
+If srcdev was formatted or resized to a total_bytes smaller than its
+underlying block device and is replaced with a target disk whose physical
+size lies between srcdev->total_bytes and bdev_nr_bytes(srcdev->bdev),
+device->zone_info->nr_zones will be smaller than srcdev->zone_info->nr_zones.
+Passing srcdev->zone_info->nr_zones to bitmap_equal() then reads out of
+bounds on device->zone_info->seq_zones and compares zones beyond
+srcdev->total_bytes, rejecting valid replacement devices with -EINVAL.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261117185850.4128157-1-johannes.thumshirn@wdc.com?part=2
+

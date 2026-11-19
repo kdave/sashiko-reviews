@@ -1,0 +1,178 @@
+From sashiko-bot@kernel.org Sun Nov 15 19:22:21 2026
+Message-ID: <sashiko-outbox-215710@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [RFC PATCH v4 05/10] btrfs: add provenance time (ptime)
+Date: Sun, 15 Nov 2026 18:22:18 +0000
+
+Thank you for your contribution! Sashiko AI review found 4 potential
+issues to consider:
+- [High] btrfs: single-word handle in Signed-off-by trailer instead of
+  real name
+- [High] btrfs: btrfs_fileattr_set() rejects supported common xflags in
+  fsx_xflags_mask
+- [High] btrfs: broken fa->flags check on symlinks and special files in
+  btrfs_fileattr_set()
+- [High] btrfs: unflagged ptime in btrfs_inode_item loads zero or stale
+  bytes
+--
+
+commit bdb65f02cbaaeb49a0a287924e267f5c19a25fdf
+Author: koraynilay <koray.fra@gmail.com>
+
+> btrfs: add provenance time (ptime)
+>
+> Implement provenance time (ptime) in Btrfs, as introduced in a
+> previous commit ("vfs: add provenance time (ptime)").
+>
+> Update the on-disk format by claiming 12 bytes from the reserved[] space
+> in btrfs_inode_item, putting ptime before other timestamps. When loading
+> stale garbage data from disk for ptime, warn (rate-limited) to dmesg.
+>
+> Advertise support for FS_XFLAG_PTIME using fa_xflags_mask in
+> btrfs_fileattr_get(), and validate that only supported xflags are
+> requested in btrfs_fileattr_set() using a newly introduced
+> BTRFS_SUPPORTED_XFLAGS (containing only FS_XFLAG_PTIME for now).
+>
+> Also, set .fileattr_[gs]et to btrfs_fileattr_[gs]et() for both symlinks
+> and special files and reject any other flag update on them with
+> -EOPNOTSUPP.
+>
+> Assisted-by: Gemini:3.8-flash-high antigravity-cli-1.4.7
+> Signed-off-by: koraynilay <koray.fra@gmail.com>
+
+[Severity: High]
+Per Documentation/process/submitting-patches.rst, the Signed-off-by
+trailer and Author header must use a real human name rather than a
+single-word username or handle.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index abaa334714566..ff8f7a0caad36 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -4057,6 +4057,17 @@ static int btrfs_read_locked_inode(struct btrfs_inode *inode, struct btrfs_path
+>  	inode->i_otime_sec = btrfs_timespec_sec(leaf, &inode_item->otime);
+>  	inode->i_otime_nsec = btrfs_timespec_nsec(leaf, &inode_item->otime);
+>  
+> +	inode->i_ptime_sec = btrfs_timespec_sec(leaf, &inode_item->ptime);
+> +	inode->i_ptime_nsec = btrfs_timespec_nsec(leaf, &inode_item->ptime);
+> +	/* Avoid old garbage on-disk data making btrfs load a bad value */
+> +	if (unlikely(inode->i_ptime_nsec >= NSEC_PER_SEC)) {
+> +		btrfs_warn_rl(fs_info,
+> +			      "invalid ptime.nsec %u on ino %llu from disk, setting ptime to otime",
+> +			      inode->i_ptime_nsec, btrfs_ino(inode));
+> +		inode->i_ptime_sec = inode->i_otime_sec;
+> +		inode->i_ptime_nsec = inode->i_otime_nsec;
+> +	}
+
+[Severity: High]
+How does btrfs_read_locked_inode() distinguish an inode with a valid
+ptime from a legacy or mkfs-created inode whose on-disk reserved[] field
+was never initialized for ptime?
+
+On existing Btrfs filesystems (and the root directory inode created by
+mkfs.btrfs), reserved[] was zeroed, so inode->i_ptime_nsec is 0 (<
+NSEC_PER_SEC).  btrfs_getattr() and btrfs_fileattr_get() then
+unconditionally advertise STATX_PTIME and FS_XFLAG_PTIME with timestamp
+{0, 0} (1970-01-01) instead of falling back to otime or omitting
+STATX_PTIME.
+
+Conversely, for inodes replayed from an older kernel's tree log where
+btrfs_insert_empty_item() did not zero the leaf item and
+tree-log.c:fill_inode_item() did not write reserved[], the on-disk ptime
+field holds uninitialized leaf bytes.  Whenever the stale 32-bit nsec
+word happens to be < NSEC_PER_SEC, btrfs_read_locked_inode() silently
+loads arbitrary stale bytes into i_ptime_sec and i_ptime_nsec.  Mounting
+the filesystem on an older kernel and updating the inode via
+btrfs_delayed_update_inode() will also silently overwrite ptime with {0,
+0} because nothing marks whether ptime is valid.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 6ba883db107b4..f6c5bf9bf2174 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -270,11 +270,17 @@ static int btrfs_check_ioctl_vol_args2_subvol_name(const struct btrfs_ioctl_vol_
+>   * Set flags/xflags from the internal inode flags. The remaining items of
+>   * fsxattr are zeroed.
+>   */
+> +#define BTRFS_SUPPORTED_XFLAGS		(FS_XFLAG_PTIME)
+> +
+>  int btrfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+>  {
+>  	const struct btrfs_inode *inode = BTRFS_I(d_inode(dentry));
+>  
+>  	fileattr_fill_flags(fa, btrfs_inode_flags_to_fsflags(inode));
+> +	fa->fsx_ptime.tv_sec = inode->i_ptime_sec;
+> +	fa->fsx_ptime.tv_nsec = inode->i_ptime_nsec;
+> +	fa->fsx_xflags |= FS_XFLAG_PTIME;
+> +	fa->fsx_xflags_mask |= FS_XFLAG_PTIME;
+>  	return 0;
+>  }
+>  
+> @@ -294,9 +300,21 @@ int btrfs_fileattr_set(const struct mnt_idmap *idmap,
+>  	if (btrfs_root_readonly(root))
+>  		return -EROFS;
+>  
+> -	if (fileattr_has_fsx(fa))
+> +	/*
+> +	 * We now support FS_XFLAG_PTIME, so exclude it from the unsupported
+> +	 * check
+> +	 */
+> +	if (fileattr_has_fsx_mask(fa, BTRFS_SUPPORTED_XFLAGS))
+> +		return -EOPNOTSUPP;
+> +
+> +	if (fa->fsx_xflags_mask & ~BTRFS_SUPPORTED_XFLAGS)
+>  		return -EOPNOTSUPP;
+
+[Severity: High]
+Does this fsx_xflags_mask check reject Btrfs-supported common xflags
+(FS_XFLAG_SYNC, FS_XFLAG_IMMUTABLE, FS_XFLAG_APPEND, FS_XFLAG_NODUMP,
+and FS_XFLAG_NOATIME)?
+
+fileattr_has_fsx_mask() implicitly permits FS_XFLAG_COMMON in
+fa->fsx_xflags, and fileattr_to_file_attr() includes FS_XFLAGS_MASK in
+fa_xflags_mask on file_getattr().  Because BTRFS_SUPPORTED_XFLAGS only
+contains FS_XFLAG_PTIME, any file_setattr() call that sets a supported
+common xflag in fa_xflags_mask—or passes back a struct file_attr filled
+by file_getattr()—fails here with -EOPNOTSUPP.
+
+> +
+> +	if (!S_ISREG(inode->vfs_inode.i_mode) && !S_ISDIR(inode->vfs_inode.i_mode)) {
+> +		if (fa->flags)
+> +			return -EOPNOTSUPP;
+> +	}
+
+[Severity: High]
+Does checking fa->flags on symlinks and special files both reject valid
+ptime updates and allow clearing existing flags when fa->flags is 0?
+
+When a symlink or special file is created in a directory with
+BTRFS_INODE_COMPRESS, BTRFS_INODE_NOCOMPRESS, or BTRFS_INODE_NODATACOW,
+btrfs_create_new_inode() -> btrfs_inherit_iflags() copies those flags to
+the new inode regardless of mode.  When file_setattr() is later called to
+update only FS_XFLAG_PTIME, vfs_fileattr_set() merges old_ma.flags &
+~FS_COMMON_FL into fa->flags:
+
+fs/file_attr.c:vfs_fileattr_set() {
+    ...
+	if (fa->fsx_valid) {
+		err = vfs_fileattr_get(dentry, &old_ma);
+		if (err)
+			return err;
+		fa->flags |= old_ma.flags & ~FS_COMMON_FL;
+    ...
+}
+
+Because FS_COMPR_FL, FS_NOCOMP_FL, and FS_NOCOW_FL are not in
+FS_COMMON_FL, fa->flags becomes non-zero and btrfs_fileattr_set()
+rejects the ptime update with -EOPNOTSUPP.
+
+Conversely, if a caller invokes FS_IOC_SETFLAGS with flags == 0 (or
+FS_IOC_FSSETXATTR / file_setattr() with zero flags and without
+FS_XFLAG_PTIME) on a symlink or special file, fa->flags is 0.
+btrfs_fileattr_set() then proceeds to start a transaction, clear any
+existing inode flags, update ctime/iversion, and return 0 instead of
+-EOPNOTSUPP.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261115180343.576773-1-koray.fra@gmail.com?part=5
+

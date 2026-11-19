@@ -1,0 +1,81 @@
+From sashiko-bot@kernel.org Tue Nov 17 20:43:48 2026
+Message-ID: <sashiko-outbox-219515@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 05/27] btrfs: zoned: skip the append only metadata
+ writeback path for conventional block groups
+Date: Tue, 17 Nov 2026 19:43:42 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: zoned: leaked meta bg counter in
+  btrfs_load_block_group_zone_info()
+--
+
+commit 7de79916651d05387e695d11e3cb7c840b5579e0
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: skip the append only metadata writeback path for conventional block groups
+
+This commit introduces btrfs_zoned_bg_is_append_only() and metadata block
+group counters so metadata block groups backed exclusively by conventional
+zones skip append-only write pointer serialization, active zone tracking,
+and freed extent buffer zeroout.
+
+[ ... ]
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 169afbcd8be7d..a8762033e44d6 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2019,6 +2019,7 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	}
+>  
+>  	if (!ret) {
+> +		btrfs_zoned_account_meta_bg(cache, 1);
+>  		cache->meta_write_pointer = cache->alloc_offset + cache->start;
+>  		if (test_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &cache->runtime_flags)) {
+>  			spin_lock(&fs_info->zone_active_bgs_lock);
+
+[Severity: Medium]
+Does this leak a count in fs_info->zoned_seq_meta_bgs or
+fs_info->zoned_conv_meta_bgs if block group creation fails after
+btrfs_load_block_group_zone_info()?
+
+In btrfs_make_block_group() (and similarly in read_one_block_group()), the
+error paths after btrfs_load_block_group_zone_info() free cache before it
+is inserted into fs_info->block_group_cache_tree:
+
+fs/btrfs/block-group.c:btrfs_make_block_group() {
+    ...
+	ret = btrfs_load_block_group_zone_info(cache, true);
+	if (ret) {
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+
+	ret = exclude_super_stripes(cache);
+	if (ret) {
+		/* We may have excluded something, so call this just in case */
+		btrfs_free_excluded_extents(cache);
+		btrfs_put_block_group(cache);
+		return ERR_PTR(ret);
+	}
+    ...
+}
+
+Since the matching btrfs_zoned_account_meta_bg(block_group, -1) is only
+called when btrfs_remove_block_group() erases the block group from
+fs_info->block_group_cache_tree, a failure in exclude_super_stripes(),
+btrfs_add_new_free_space(), or btrfs_add_block_group_cache() leaves the
+counter elevated for the rest of the mount.  If that counter was otherwise
+zero, btrfs_zoned_meta_is_append_only() will see both counters as non-zero
+and fall back to btrfs_lookup_block_group() on every
+btrfs_clear_buffer_dirty() call.
+
+Accounting the block group in btrfs_add_block_group_cache() when it is
+inserted into fs_info->block_group_cache_tree would pair directly with
+btrfs_remove_block_group().
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261117185850.4128157-1-johannes.thumshirn@wdc.com?part=5
+

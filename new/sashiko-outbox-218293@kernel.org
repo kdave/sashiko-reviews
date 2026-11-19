@@ -1,0 +1,97 @@
+From sashiko-bot@kernel.org Tue Nov 17 08:12:40 2026
+Message-ID: <sashiko-outbox-218293@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4] btrfs: tree-checker: reject file extents with
+ oversized disk_num_bytes
+Date: Tue, 17 Nov 2026 07:12:35 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: tree-checker: check_extent_data_item() allows
+  compressed holes and prealloc extents
+--
+
+commit 6d96aa082eb675d56cac36af1ddf8b1f6c499567
+Author: Cheng Yongkang <teel4res@gmail.com>
+
+btrfs: tree-checker: reject file extents with oversized disk_num_bytes
+
+This commit adds tree-checker validation on file extent items to reject
+oversized or zero disk_num_bytes, oversized ram_bytes, and compressed
+extents whose offset + num_bytes exceeds ram_bytes.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index f021ac14babfa..e7e0bb6be76f3 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+[ ... ]
+> @@ -377,6 +380,58 @@ static int check_extent_data_item(struct extent_buffer *leaf,
+>  		     CHECK_FE_ALIGNED(leaf, slot, fi, num_bytes, sectorsize)))
+>  		return -EUCLEAN;
+>  
+> +	/*
+> +	 * Compressed extents are at most 128K both on disk and uncompressed.
+> +	 * Uncompressed extents should never get close to U32_MAX.
+> +	 */
+> +	if (btrfs_file_extent_compression(leaf, fi) != BTRFS_COMPRESS_NONE) {
+> +		max_disk_num_bytes = BTRFS_MAX_COMPRESSED;
+> +		max_ram_bytes = BTRFS_MAX_UNCOMPRESSED;
+> +	} else {
+> +		max_disk_num_bytes = U32_MAX;
+> +		max_ram_bytes = U32_MAX;
+> +	}
+> +	if (unlikely(btrfs_file_extent_disk_num_bytes(leaf, fi) > max_disk_num_bytes)) {
+> +		file_extent_err(leaf, slot,
+> +		"invalid disk_num_bytes for file extent, have %llu expect <= %u",
+> +				btrfs_file_extent_disk_num_bytes(leaf, fi),
+> +				max_disk_num_bytes);
+> +		return -EUCLEAN;
+> +	}
+> +
+> +	/*
+> +	 * The remaining checks only apply to extents with data on disk. Holes
+> +	 * are skipped, as without NO_HOLES their ram_bytes is the hole size.
+> +	 */
+> +	if (btrfs_file_extent_disk_bytenr(leaf, fi)) {
+> +		if (unlikely(btrfs_file_extent_disk_num_bytes(leaf, fi) == 0)) {
+> +			file_extent_err(leaf, slot,
+> +		"invalid zero disk_num_bytes for file extent with disk_bytenr %llu",
+> +					btrfs_file_extent_disk_bytenr(leaf, fi));
+> +			return -EUCLEAN;
+> +		}
+
+[Severity: Medium]
+Can a file extent item with disk_bytenr == 0 and compression !=
+BTRFS_COMPRESS_NONE bypass this check with disk_num_bytes == 0?
+
+During an incremental send with BTRFS_SEND_FLAG_COMPRESSED, if a parent
+snapshot had a data extent at that offset, process_extent() sees the extent
+as changed and calls send_write_or_clone() -> send_extent_data():
+
+fs/btrfs/send.c:send_extent_data() {
+	...
+		} else if (!is_inline &&
+			   btrfs_file_extent_disk_num_bytes(leaf, ei) <= len) {
+			return send_encoded_extent(sctx, path, offset, len);
+		}
+	...
+}
+
+send_encoded_extent() then calls btrfs_encoded_read_regular_fill_pages()
+with disk_io_size == 0 and submits an empty bio to btrfs_submit_bbio(),
+triggering the length != 0 assertion failure in assert_bbio_alignment().
+
+Also, check_extent_data_item() allows BTRFS_FILE_EXTENT_PREALLOC items to
+have compression != BTRFS_COMPRESS_NONE, which causes
+btrfs_extent_item_to_extent_map() to mark the extent map as compressed
+instead of setting EXTENT_FLAG_PREALLOC, so reads attempt to decompress
+unwritten preallocated blocks.
+
+Should check_extent_data_item() require compression == BTRFS_COMPRESS_NONE
+for holes (disk_bytenr == 0) and BTRFS_FILE_EXTENT_PREALLOC extents, and
+require disk_num_bytes == 0, offset == 0, and fi_type ==
+BTRFS_FILE_EXTENT_REG when disk_bytenr == 0?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261117064613.771336-1-teel4res@gmail.com?part=1
+

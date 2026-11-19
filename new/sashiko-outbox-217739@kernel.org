@@ -1,0 +1,40 @@
+From sashiko-bot@kernel.org Mon Nov 16 22:40:32 2026
+Message-ID: <sashiko-outbox-217739@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/2] btrfs: defrag: fix missed extent when the lookup
+ lands on the next inode
+Date: Mon, 16 Nov 2026 21:40:28 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: defrag: missing Fixes trailer for defrag_get_extent() bug
+  fix
+--
+
+commit 6bea4166f3e49fdb3749771e1c4c09adbd710634
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: defrag: fix missed extent when the lookup lands on the next inode
+>
+> In defrag_get_extent(), if @start is inside the last extent of an inode
+> and the next inode's items are in the same leaf, btrfs_search_slot()
+> points to the next inode's item.
+>
+> The code then checks the item at the current slot to decide whether to
+> go one slot back, which is never an EXTENT_DATA of our inode in this
+> case. So the extent covering @start is skipped and we return NULL.
+>
+> Fix it by checking the previous item instead, which is the one that can
+> cover @start.
+>
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+This fixes a bug in defrag_get_extent() introduced when the helper was
+added.  Should this include:
+
+  Fixes: d5633b0dee02 ("btrfs: defrag: bring back the old file extent search behavior")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1794864101.git.wqu@suse.com?part=2
+

@@ -1,0 +1,57 @@
+From sashiko-bot@kernel.org Mon Nov 16 22:42:44 2026
+Message-ID: <sashiko-outbox-217744@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/2] btrfs: defrag: break the loop early in
+ defrag_get_extent()
+Date: Mon, 16 Nov 2026 21:42:41 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: defrag: missing Fixes trailer for defrag_get_extent()
+  check order
+--
+
+commit 537664004ca7b9d3709bcccd37cd49a1845ffa6d
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: defrag: break the loop early in defrag_get_extent()
+>
+> Inside defrag_get_extent() we have the following checks determining
+> whether we should continue searching:
+>
+>                 if (WARN_ON(key.objectid < ino) || key.type < BTRFS_EXTENT_DATA_KEY)
+>                         goto next;
+>
+>                 /* It's beyond our target range, definitely not extent found */
+>                 if (key.objectid > ino || key.type > BTRFS_EXTENT_DATA_KEY)
+>                         goto not_found;
+>
+> However the above order is incorrect.
+>
+> If we are already at the next inode, but the current key type is still
+> smaller than BTRFS_EXTENT_DATA_KEY, e.g. BTRFS_INODE_ITEM_KEY and
+> followed by BTRFS_DIR_ITEM_KEY, then we will continue iterating, even
+> it's definitely not necessary.
+>
+> This is only a performance related bug, and requires the next inode to
+> be a very large directory to really cause observable performance
+> degradation.
+>
+> Fix it by doing the not-found check first.
+>
+> Reported-by: Sashiko <sashiko-bot@kernel.org>
+> Link: https://sashiko.dev/#/bug/linux-e166e8db-2bdf-4c02-8eb1-9701b3939ea4
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+defrag_get_extent() and the reversed check order were introduced in
+d5633b0dee02 ("btrfs: defrag: bring back the old file extent search
+behavior") before the helper was moved to fs/btrfs/defrag.c in
+a6a01ca61f49 ("btrfs: move the file defrag code into defrag.c").  Should
+this include:
+
+  Fixes: d5633b0dee02 ("btrfs: defrag: bring back the old file extent search behavior")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1794864101.git.wqu@suse.com?part=1
+

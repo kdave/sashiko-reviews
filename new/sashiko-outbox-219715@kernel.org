@@ -1,0 +1,184 @@
+From sashiko-bot@kernel.org Tue Nov 17 22:51:53 2026
+Message-ID: <sashiko-outbox-219715@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 27/27] btrfs: zoned: provide zoned specific reclaim
+ sweep
+Date: Tue, 17 Nov 2026 21:51:50 +0000
+
+Thank you for your contribution! Sashiko AI review found 4 potential
+issues to consider:
+- [High] btrfs: zoned: non-relocatable block groups counted in
+  zoned_bg_reclaimable()
+- [High] btrfs: zoned: btrfs_zoned_reuse_reclaimed_bg() rejects reloc
+  sub-group bgs
+- [Medium] btrfs: zoned: zoned_sweep_space_info() scales threshold by
+  bg->length
+- [Medium] btrfs: zoned: unscaled reclaim target in
+  btrfs_zoned_reclaim_sweep() for RAID0/10
+--
+
+commit 5aacd7882de69c2fbe5fd64b2f6f1ce9daf3a8c9
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: provide zoned specific reclaim sweep
+
+This commit introduces btrfs_zoned_reclaim_sweep() and replaces the
+btrfs_reclaim_sweep() call in the RECLAIM_ZONES flush state so full data
+and data-relocation block groups with garbage are queued for reclaim.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 5ca1a37fe9ee7..ef2cc51be7bc6 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> @@ -3773,6 +3774,130 @@ void btrfs_show_zoned_stats(struct btrfs_fs_info *fs_info, struct seq_file *seq)
+>  	spin_unlock(&fs_info->zone_active_bgs_lock);
+>  }
+>  
+> +static u64 zoned_bg_garbage(const struct btrfs_block_group *bg)
+> +{
+> +	const u64 slack = bg->length - bg->zone_capacity;
+> +
+> +	if (bg->zone_unusable <= slack)
+> +		return 0;
+> +
+> +	return bg->zone_unusable - slack;
+> +}
+> +
+> +static bool zoned_bg_reclaimable(const struct btrfs_block_group *bg)
+> +{
+> +	if (bg->ro)
+> +		return false;
+> +
+> +	if (!btrfs_zoned_bg_is_full(bg))
+> +		return false;
+> +
+> +	if (test_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC, &bg->runtime_flags))
+> +		return false;
+> +
+> +	return zoned_bg_garbage(bg) > 0;
+> +}
+
+[Severity: High]
+Can zoned_bg_reclaimable() count block groups that
+btrfs_reclaim_block_group() will refuse to relocate?
+
+btrfs_reclaim_block_group() skips any block group with bg->used == 0,
+bg->pinned > 0, or bg->reserved > 0 without relocating it or putting it on
+retry_list.  Because flush_space() calls btrfs_zoned_reclaim_sweep()
+before btrfs_delete_unused_bgs(), a full block group whose extents were
+just unpinned by the preceding COMMIT_TRANS state still has bg->used == 0
+and sits on fs_info->unused_bgs.  Also, a block group still on unused_bgs
+has a non-empty bg->bg_list, so btrfs_mark_bg_to_reclaim() is a no-op on
+it.
+
+In all of these cases, zoned_sweep_space_info() and
+btrfs_zoned_reclaim_sweep() still add bg_garbage toward the two-zone
+target, which stops the sweep from queuing actual relocatable candidates
+from cands[] and can leave RECLAIM_ZONES reclaiming nothing before failing
+waiting data tickets with -ENOSPC.
+
+> +
+> +struct zoned_gc_candidate {
+> +	struct btrfs_block_group *bg;
+> +	u64 garbage;
+> +};
+> +
+> +static int zoned_gc_candidate_cmp(const void *a, const void *b)
+> +{
+> +	const struct zoned_gc_candidate *ca = a;
+> +	const struct zoned_gc_candidate *cb = b;
+> +
+> +	if (ca->garbage > cb->garbage)
+> +		return -1;
+> +	if (ca->garbage < cb->garbage)
+> +		return 1;
+> +	return 0;
+> +}
+> +
+> +static u64 zoned_sweep_space_info(struct btrfs_space_info *sinfo, int thresh_pct,
+> +				  struct zoned_gc_candidate *cands, size_t *nr,
+> +				  size_t max)
+> +{
+> +	struct btrfs_block_group *bg;
+> +	u64 garbage = 0;
+> +
+> +	down_read(&sinfo->groups_sem);
+> +	for (int i = 0; i < BTRFS_NR_RAID_TYPES; i++) {
+> +		list_for_each_entry(bg, &sinfo->block_groups[i], list) {
+> +			u64 bg_garbage;
+> +			bool below;
+> +
+> +			spin_lock(&bg->lock);
+> +			if (!zoned_bg_reclaimable(bg)) {
+> +				spin_unlock(&bg->lock);
+> +				continue;
+> +			}
+> +			bg_garbage = zoned_bg_garbage(bg);
+> +			below = bg->used < mult_perc(bg->length, thresh_pct);
+> +			if (below)
+> +				btrfs_mark_bg_to_reclaim(bg);
+
+[Severity: Medium]
+Should the threshold check scale by bg->zone_capacity instead of
+bg->length, matching __btrfs_add_free_space_zoned()?
+
+On zoned devices where zone_capacity is smaller than zone_size (for
+example, ZNS SSDs where bg->zone_capacity is below 75% of bg->length),
+bg->used can never exceed bg->zone_capacity.  Comparing bg->used against
+mult_perc(bg->length, thresh_pct) makes below true for every full block
+group with any garbage, queueing all of them for immediate reclaim instead
+of sorting candidates up to target.
+
+[ ... ]
+> +void btrfs_zoned_reclaim_sweep(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct btrfs_space_info *data_sinfo = fs_info->data_sinfo;
+> +	struct btrfs_space_info *sinfos[] = {
+> +		data_sinfo,
+> +		data_sinfo->sub_group[0],
+> +	};
+
+[Severity: High]
+What happens after a block group from data_sinfo->sub_group[0] is
+relocated?
+
+When btrfs_relocate_chunk_finish() finishes relocating a block group, it
+calls btrfs_zoned_reuse_reclaimed_bg(), which rejects anything not in
+fs_info->data_sinfo:
+
+fs/btrfs/zoned.c:btrfs_zoned_reuse_reclaimed_bg() {
+	...
+	if (space_info != fs_info->data_sinfo)
+		return false;
+	...
+}
+
+Because that returns false for data_sinfo->sub_group[0],
+btrfs_relocate_chunk_finish() falls back to btrfs_remove_chunk().  The
+freed device zone then remains pinned until transaction commit (after
+btrfs_reclaim_block_groups() finishes), so subsequent relocations in the
+batch cannot reuse it as the next data_reloc_bg and can fail with -ENOSPC.
+In addition, when btrfs_remove_block_group() removes the last block group
+from data_sinfo->sub_group[0]->block_groups[index], it calls
+clear_avail_alloc_bits(), clearing fs_info->avail_data_alloc_bits even
+though data_sinfo still has block groups of that profile.
+
+> +	struct zoned_gc_candidate *cands;
+> +	const u64 target = 2 * fs_info->zone_size;
+
+[Severity: Medium]
+Does target need to scale with the number of data stripes on RAID0 and
+RAID10 filesystems?
+
+On multi-stripe zoned profiles, zoned_bg_garbage() returns logical bytes
+across all data_stripes zones in the block group, and both
+btrfs_zoned_data_chunk_allowed() and data_reloc_bg require space across
+all stripes (chunk_bytes = fs_info->zone_size * num_stripes).  With target
+fixed at 2 * fs_info->zone_size, a 4-disk RAID0 array stops queuing
+candidates after half a block group's worth of garbage, which is not
+enough to free a single multi-stripe block group.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261117185850.4128157-1-johannes.thumshirn@wdc.com?part=27
+

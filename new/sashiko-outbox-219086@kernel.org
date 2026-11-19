@@ -1,0 +1,72 @@
+From sashiko-bot@kernel.org Tue Nov 17 16:33:12 2026
+Message-ID: <sashiko-outbox-219086@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: avoid copying too much memory in the logical to
+ ino ioctl
+Date: Tue, 17 Nov 2026 15:33:05 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: out-of-bounds copy_to_user() size in
+  btrfs_ioctl_logical_to_ino()
+--
+
+commit 6e7a34864a76b845c6fb3fb8036d44e9bf6c5ab9
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: avoid copying too much memory in the logical to ino ioctl
+
+This commit reduces the copy_to_user() length in btrfs_ioctl_logical_to_ino()
+to copy only the header and populated inode entries rather than the full
+container size.
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 651a780dd7b14..3bbc66f1f2d1c 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+> @@ -3349,8 +3349,15 @@ static long btrfs_ioctl_logical_to_ino(struct btrfs_fs_info *fs_info,
+>  	if (ret < 0)
+>  		return ret;
+>  
+> +	/*
+> +	 * Copy only what we found instead of the whole data container. If for
+> +	 * example 'size' is 16M and we found only 1 inode, it's wasteful to
+> +	 * copy 16M instead of sizeof(*inodes) + 1 * (3 * sizeof(u64)).
+> +	 * For each inode we find we add 3 elements to the inodes->val array:
+> +	 * inode number, offset and root ID.
+> +	 */
+>  	ret = copy_to_user((void __user *)(unsigned long)loi->inodes, inodes,
+> -			   size);
+> +			   sizeof(*inodes) + inodes->elem_cnt * (3 * sizeof(u64)));
+
+[Severity: High]
+Can this read past the end of inodes and write past the user buffer at
+loi->inodes?
+
+build_ino_list() already increments inodes->elem_cnt by 3 for each inode
+stored in inodes->val[]:
+
+fs/btrfs/backref.c:build_ino_list() {
+    ...
+	if (inodes->bytes_left >= c) {
+		inodes->bytes_left -= c;
+		inodes->val[inodes->elem_cnt] = inum;
+		inodes->val[inodes->elem_cnt + 1] = offset;
+		inodes->val[inodes->elem_cnt + 2] = root;
+		inodes->elem_cnt += 3;
+	}
+    ...
+}
+
+Multiplying inodes->elem_cnt by 3 * sizeof(u64) instead of sizeof(u64)
+triples the payload byte count, so whenever the resolved inodes fill more
+than one third of the container capacity, copy_to_user() reads past the
+allocated inodes buffer and overwrites user memory past loi->size.
+
+In addition, init_data_container() allows size < sizeof(*inodes) with
+inodes->elem_cnt == 0, in which case copying sizeof(*inodes) bytes without
+clamping to size writes past the user buffer.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/d20ac8e45fe2df6dbfde223e4a786f2b542756b8.1794928978.git.fdmanana@suse.com?part=1
+

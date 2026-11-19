@@ -1,0 +1,93 @@
+From sashiko-bot@kernel.org Thu Nov 19 17:22:33 2026
+Message-ID: <sashiko-outbox-223518@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: wait for async dio before dirtying folio in
+ btrfs_cont_expand()
+Date: Thu, 19 Nov 2026 16:22:30 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: missing inode_dio_wait() in direct
+  btrfs_truncate_block() paths
+--
+
+commit 5f8b5d8e82ed4e8dd60e484240385e0949fd6176
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: wait for async dio before dirtying folio in btrfs_cont_expand()
+
+This commit adds an inode_dio_wait() call in btrfs_cont_expand() when the
+existing file size is not sector-size aligned so that in-flight async
+direct I/O writes complete before btrfs_truncate_block() dirties the tail
+folio.
+
+Link: https://sashiko.dev/#/bug/linux-05440703-4fc3-41f8-a693-9ffe4d9f4426
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 19b1eba2dd845..66fa0e5641e70 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -5242,6 +5242,23 @@ int btrfs_cont_expand(struct btrfs_inode *inode, loff_t oldsize, loff_t size)
+>  	u64 hole_size;
+>  	int ret = 0;
+>  
+> +	/*
+> +	 * Before zeroing the tail of the block, wait for any async direct IO
+> +	 * writes in progress to complete, otherwise if they complete after we
+> +	 * dirty the folio, they will trigger a warning when trying to
+> +	 * invalidate the page cache and call errseq_set() on the mapping (which
+> +	 * makes the next fsync fail with -EIO), because the folio is dirty:
+> +	 *
+> +	 * iomap_dio_complete()
+> +	 *    kiocb_invalidate_post_direct_write()
+> +	 *       invalidate_inode_pages2_range()
+> +	 *       dio_warn_stale_pagecache()
+> +	 *          --> calls errseq_set() making next fsync fail
+> +	 *          --> triggers warning
+> +	 */
+> +	if (!IS_ALIGNED(oldsize, fs_info->sectorsize))
+> +		inode_dio_wait(&inode->vfs_inode);
+
+[Severity: Medium]
+Should inode_dio_wait() live in btrfs_truncate_block() rather than
+btrfs_cont_expand()?
+
+When fallocate() extends a file whose i_size is unaligned and
+alloc_start <= inode->i_size (for example, fallocating from EOF onward),
+btrfs_fallocate() bypasses btrfs_cont_expand() and calls
+btrfs_truncate_block() directly before waiting on ordered extents:
+
+fs/btrfs/file.c:btrfs_fallocate() {
+	...
+	if (alloc_start > inode->i_size) {
+		ret = btrfs_cont_expand(BTRFS_I(inode), i_size_read(inode),
+					alloc_start);
+		if (ret)
+			goto out;
+	} else if (offset + len > inode->i_size) {
+		ret = btrfs_truncate_block(BTRFS_I(inode), inode->i_size,
+					   inode->i_size, (u64)-1);
+		if (ret)
+			goto out;
+	}
+	...
+}
+
+That path still races with completing async direct I/O in
+iomap_dio_complete(), triggering dio_warn_stale_pagecache() and marking
+the mapping with -EIO for the next fsync().
+
+Other direct callers of btrfs_truncate_block() such as btrfs_punch_hole()
+and btrfs_zero_range() also remain exposed despite calling
+btrfs_wait_ordered_range() first, because btrfs_dio_end_io() calls
+btrfs_finish_ordered_extent() before iomap_dio_bio_end_io(), allowing the
+ordered extent to finish before iomap_dio_complete() runs
+kiocb_invalidate_post_direct_write() and inode_dio_end().
+
+Calling inode_dio_wait() inside btrfs_truncate_block() once
+need_truncate_head or need_truncate_tail is known to be true would cover
+all of these paths.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/a6b31fe34ababf35e0d9577589890ad637b09e20.1795104168.git.fdmanana@suse.com?part=1
+

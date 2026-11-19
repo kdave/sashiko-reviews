@@ -1,0 +1,227 @@
+From sashiko-bot@kernel.org Wed Nov 18 14:52:39 2026
+Message-ID: <sashiko-outbox-221090@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: wait for block group relocation on remount
+ read-only
+Date: Wed, 18 Nov 2026 13:52:33 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [High] btrfs: early async reclaim cancel in btrfs_remount_ro() causes
+  deadlock
+- [Medium] btrfs: lockdep circular dependency in btrfs_remount_ro() on
+  reclaim_bgs_work
+It also noticed 2 related pre-existing issues this patch does not
+introduce:
+- [High] btrfs: zoned: freeze deadlock in btrfs_reclaim_block_groups()
+  [1]
+- [Critical] btrfs: use-after-free in relocating_repair_kthread() [2]
+--
+
+commit 1978c3185216b8b44c35af3faabd5ecd461e963b
+Author: Miroslav Cimerman <mc@raidlab.org>
+
+btrfs: wait for block group relocation on remount read-only
+
+This commit serializes read-only remounts against in-progress block group
+relocation under reclaim_bgs_lock, stops the zoned repair kthread when the
+filesystem becomes read-only, and cancels reclaim_bgs_work after waiting for
+the cleaner thread.
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 027830a53f7dc..fca8ccc4da536 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -2018,10 +2018,11 @@ static int btrfs_reclaim_block_group(struct btrfs_block_group *bg, int *reclaime
+>  	/*
+>  	 * Get out fast, in case we're read-only or unmounting the
+>  	 * filesystem. It is OK to drop block groups from the list even
+> -	 * for the read-only case. As we did take the super write lock,
+> -	 * "mount -o remount,ro" won't happen and read-only filesystem
+> -	 * means it is forced read-only due to a fatal error. So, it
+> -	 * never gets back to read-write to let us reclaim again.
+> +	 * for the read-only case, after a remount read-write they come
+> +	 * back when they are marked for reclaim again. The super write
+> +	 * lock doesn't hold off "mount -o remount,ro", but
+> +	 * btrfs_remount_ro() sets read-only under reclaim_bgs_lock, which
+> +	 * we hold, so a remount waits for the block group we relocate.
+>  	 */
+>  	if (btrfs_need_cleaner_sleep(fs_info)) {
+>  		up_write(&space_info->groups_sem);
+
+[Severity: High]
+This problem wasn't introduced by this patch, but can acquiring the super
+write lock in btrfs_reclaim_block_groups() cause a freeze deadlock
+[1] when invoked from async_data_reclaim_work?
+
+fs/btrfs/block-group.c:btrfs_reclaim_block_groups() {
+	...
+	if (!btrfs_should_reclaim(fs_info))
+		return;
+
+	guard(super_write)(fs_info->sb);
+	...
+}
+
+When a writer holding SB_FREEZE_WRITE runs low on data space on a zoned
+filesystem, reserve_bytes() queues async_data_reclaim_work and sleeps in
+wait_reserve_ticket().  If freeze_super() starts concurrently, it blocks in
+sb_wait_write() waiting for that writer, while the reclaim worker reaches the
+RECLAIM_ZONES stage in flush_space() and blocks on sb_start_write() in
+btrfs_reclaim_block_groups():
+
+CPU0 (writer)                CPU1 (freeze)        CPU2 (kworker)
+vfs_write()
+  sb_start_write()
+  ...
+  btrfs_reserve_data_bytes()
+    queue_work(
+      async_data_reclaim_work)
+                             freeze_super()
+                               sb_wait_write()
+                                                  flush_space()
+                                                    btrfs_reclaim_block_groups()
+                                                      sb_start_write()
+                                                        <-- blocks on freeze
+    wait_reserve_ticket()
+      <-- waits for kworker
+
+Also, because btrfs_remount_ro() and close_ctree() call cancel_work_sync() on
+async_data_reclaim_work while holding sb->s_umount, taking SB_FREEZE_WRITE in
+the worker inverts the sb_writers -> sb->s_umount -> async_data_reclaim_work
+lock ordering.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index b424cc836bd4a..e696d1133055a 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+> @@ -1342,7 +1342,19 @@ static int btrfs_remount_ro(struct btrfs_fs_info *fs_info)
+>  	/* Avoid complains from lockdep et al. */
+>  	up(&fs_info->uuid_tree_rescan_sem);
+>  
+> +	/*
+> +	 * Nothing holds off a remount read-only while the reclaim work or a
+> +	 * zoned repair relocates a block group, not even the super write lock
+> +	 * they take. Every relocation runs under reclaim_bgs_lock, so wait for
+> +	 * the one in progress and set read-only under the lock. The reclaim
+> +	 * work and the zoned repair check for read-only under it before they
+> +	 * relocate. Do this before setting read-only, as a relocation may wait
+> +	 * for unfinished snapshot drops, which the cleaner stops working on
+> +	 * once the filesystem is read-only.
+> +	 */
+> +	mutex_lock(&fs_info->reclaim_bgs_lock);
+>  	btrfs_set_sb_rdonly(fs_info->sb);
+> +	mutex_unlock(&fs_info->reclaim_bgs_lock);
+
+[Severity: High]
+Can waiting on reclaim_bgs_lock after canceling async_reclaim_work and
+async_data_reclaim_work at the top of btrfs_remount_ro() deadlock when an
+in-progress relocation is waiting on a space reservation ticket?
+
+While holding reclaim_bgs_lock, btrfs_relocate_block_group() reserves space
+with BTRFS_RESERVE_FLUSH_ALL (for example via btrfs_block_rsv_refill()).  When
+space is tight, reserve_bytes() sets space_info->flush = true, queues
+async_reclaim_work, and sleeps in wait_reserve_ticket():
+
+CPU0 (relocation)                   CPU1 (remount,ro)
+btrfs_reclaim_bgs_work()
+  mutex_lock(&reclaim_bgs_lock)
+  ...
+  btrfs_block_rsv_refill()
+    reserve_bytes()
+      space_info->flush = true
+      queue_work(async_reclaim_work)
+                                    btrfs_remount_ro()
+                                      cancel_work_sync(&async_reclaim_work)
+                                      ...
+                                      mutex_lock(&reclaim_bgs_lock)
+      wait_reserve_ticket()
+        <-- never woken
+
+If cancel_work_sync() cancels async_reclaim_work before the worker runs,
+space_info->flush stays true and the ticket is never served, leaving both
+threads blocked.  Conversely, if relocation queues async_reclaim_work or
+async_data_reclaim_work after the initial cancel_work_sync() calls while
+btrfs_remount_ro() is waiting on reclaim_bgs_lock, nothing cancels those works
+again before btrfs_commit_super(), so they can start transactions after the
+last commit.
+
+>  
+>  	/*
+>  	 * Setting SB_RDONLY will put the cleaner thread to sleep at the next
+> @@ -1364,6 +1376,14 @@ static int btrfs_remount_ro(struct btrfs_fs_info *fs_info)
+>  	 */
+>  	wait_on_bit(&fs_info->flags, BTRFS_FS_CLEANER_RUNNING, TASK_UNINTERRUPTIBLE);
+>  
+> +	/*
+> +	 * The reclaim work doesn't relocate on a read-only filesystem, but
+> +	 * it still deletes unused block groups between the ones it skips, and
+> +	 * the cleaner may have queued it again before going to sleep. Stop
+> +	 * it, so it can't start a transaction after btrfs_commit_super().
+> +	 */
+> +	cancel_work_sync(&fs_info->reclaim_bgs_work);
+
+[Severity: Medium]
+Does calling cancel_work_sync(&fs_info->reclaim_bgs_work) under sb->s_umount
+trigger a lockdep circular dependency report with sb_writers?
+
+btrfs_reclaim_bgs_work() calls btrfs_reclaim_block_groups(), which acquires
+SB_FREEZE_WRITE via guard(super_write)(fs_info->sb), while freeze_super()
+acquires sb->s_umount under sb_wait_write(sb, SB_FREEZE_WRITE):
+
+CPU0 (reclaim_bgs_work)      CPU1 (freeze_super)       CPU2 (btrfs_remount_ro)
+-----------------------      -------------------       -----------------------
+lock(reclaim_bgs_work)
+                             lock(sb_writers)
+                                                       lock(&sb->s_umount)
+                                                       lock(reclaim_bgs_work)
+                             lock(&sb->s_umount)
+lock(sb_writers)
+
+ *** DEADLOCK ***
+
+If reclaim_bgs_work is actively executing when btrfs_remount_ro() calls
+cancel_work_sync(), start_flush_work() acquires reclaim_bgs_work's lockdep map
+under sb->s_umount and completes the cycle.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 3d4ef6725de0e..7bc7b7e887958 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -9046,6 +9046,10 @@ static int relocating_repair_kthread(void *data)
+>  	if (!cache)
+>  		goto out;
+>  
+> +	/* Don't relocate after a remount read-only, see btrfs_remount_ro(). */
+> +	if (btrfs_need_cleaner_sleep(fs_info))
+> +		goto out;
+> +
+>  	if (!test_bit(BLOCK_GROUP_FLAG_RELOCATING_REPAIR, &cache->runtime_flags))
+>  		goto out;
+
+[Severity: Critical]
+This problem wasn't introduced by this patch, but nothing waits for the
+detached relocating_repair_kthread() during unmount, which can cause a
+use-after-free of cache, fs_info, and fs_info->sb [2]:
+
+CPU0 (unmount)                      CPU1 (repair kthread)
+                                    [spawned via btrfs_repair_one_zone()]
+close_ctree()
+  btrfs_stop_all_workers()
+  ...
+  <frees fs_info and sb>
+                                    relocating_repair_kthread()
+                                      fs_info = cache->fs_info;  <-- UAF
+                                      ...
+                                      guard(super_write)(fs_info->sb);
+
+Because btrfs_repair_one_zone() starts relocating_repair_kthread() with
+kthread_run() outside the btrfs workqueues, close_ctree() can finish tearing
+down the filesystem before the kthread starts running.
+
+[1] https://sashiko.dev/#/bug/linux-57a2b5e0-4d13-455a-ae74-4d927a2685ce
+[2] https://sashiko.dev/#/bug/linux-c823bee4-a1c4-4350-9a7c-6a68eea1320c
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261118125816.6878-1-mc@raidlab.org?part=1
+

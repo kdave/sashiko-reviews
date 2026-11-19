@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Sat Nov 14 17:37:32 2026
+Message-ID: <sashiko-outbox-214763@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: Clean up delayed inode items on transaction
+ abort
+Date: Sat, 14 Nov 2026 16:37:27 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: incomplete error check in btrfs_evict_inode() skips
+  delayed item cleanup
+--
+
+commit 8a7ba68a4656e7aff554e1d3822460887e85192a
+Author: Yalagada Pavan Kumar <pavankumaryalagada@gmail.com>
+
+btrfs: Clean up delayed inode items on transaction abort
+
+This commit calls btrfs_kill_delayed_inode_items() in btrfs_evict_inode()
+when BTRFS_FS_STATE_TRANS_ABORTED is set, even if
+btrfs_commit_inode_delayed_inode() fails.
+
+Link: https://lore.kernel.org/all/6af131f2.44d55313.247daf.0001.GAE@google.com/T/
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 19b1eba2dd845..eda635728e377 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -5607,16 +5607,21 @@ void btrfs_evict_inode(struct inode *inode)
+>  	 * the inode update is released.
+>  	 */
+>  	ret = btrfs_commit_inode_delayed_inode(BTRFS_I(inode));
+> -	if (ret)
+> -		goto out;
+>  
+>  	/*
+>  	 * This drops any pending insert or delete operations we have for this
+>  	 * inode.  We could have a delayed dir index deletion queued up, but
+>  	 * we're removing the inode completely so that'll be taken care of in
+>  	 * the truncate.
+> +	 *
+> +	 * We must also clean up delayed inode items when the transaction is
+> +	 * aborted.
+>  	 */
+> -	btrfs_kill_delayed_inode_items(BTRFS_I(inode));
+> +	if (!ret || test_bit(BTRFS_FS_STATE_TRANS_ABORTED, &fs_info->fs_state))
+> +		btrfs_kill_delayed_inode_items(BTRFS_I(inode));
+> +
+> +	if (ret)
+> +		goto out;
+
+[Severity: Medium]
+Can this still skip btrfs_kill_delayed_inode_items() and leak the delayed
+node when btrfs_commit_inode_delayed_inode() fails without
+BTRFS_FS_STATE_TRANS_ABORTED set?
+
+btrfs_join_transaction() -> start_transaction() returns -EROFS whenever
+BTRFS_FS_ERROR(fs_info) is non-zero, and btrfs_force_shutdown() or a direct
+btrfs_handle_fs_error() call sets fs_info->fs_error without setting
+BTRFS_FS_STATE_TRANS_ABORTED.  Separately, __btrfs_update_delayed_inode()
+returns -ENOENT without aborting the transaction when the on-disk inode
+item is missing, releasing the delayed inode update while leaving any
+delayed dir index items queued on the delayed_node.
+
+In either case, pending items keep delayed_node->count non-zero, so
+btrfs_remove_delayed_node() cannot free the node and btrfs_put_root() later
+hits WARN_ON(!xa_empty(&root->delayed_nodes)).  Should this also check
+BTRFS_FS_ERROR(fs_info) (or call btrfs_kill_delayed_inode_items()
+unconditionally before checking ret)?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261114154207.73644-1-pavankumaryalagada@gmail.com?part=1
+

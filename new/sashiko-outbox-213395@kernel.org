@@ -1,0 +1,91 @@
+From sashiko-bot@kernel.org Fri Nov 13 19:11:36 2026
+Message-ID: <sashiko-outbox-213395@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: improve the algorithmic efficiency of
+ btrfs_check_rw_degradable()
+Date: Fri, 13 Nov 2026 18:11:32 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: chunk map refcount and memory leak in
+  btrfs_check_rw_degradable()
+--
+
+commit 4f14414b7c8a6367719dcd1b9f81a2ed39e1f77a
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: improve the algorithmic efficiency of btrfs_check_rw_degradable()
+
+This commit iterates over fs_info->mapping_tree using rb_first_cached()
+and rb_next() under mapping_tree_lock in btrfs_check_rw_degradable(),
+falling back to btrfs_find_chunk_map_nolock() when rescheduling.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 3d4ef6725de0e..e000c5c6af1ae 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -8151,16 +8151,21 @@ int btrfs_read_sys_array(struct btrfs_fs_info *fs_info)
+>  bool btrfs_check_rw_degradable(struct btrfs_fs_info *fs_info,
+>  					struct btrfs_device *failing_dev)
+>  {
+> +	struct rb_node *node;
+>  	struct btrfs_chunk_map *map;
+> -	u64 next_start;
+>  	bool ret = true;
+>  
+> -	map = btrfs_find_chunk_map(fs_info, 0, U64_MAX);
+> +	read_lock(&fs_info->mapping_tree_lock);
+> +	node = rb_first_cached(&fs_info->mapping_tree);
+>  	/* No chunk at all? Return false anyway */
+> -	if (!map)
+> +	if (!node) {
+> +		read_unlock(&fs_info->mapping_tree_lock);
+>  		return false;
+> +	}
+> +	map = rb_entry(node, struct btrfs_chunk_map, rb_node);
+>  
+>  	while (map) {
+> +		const u64 next_start = map->start + map->chunk_len;
+>  		int missing = 0;
+>  		int max_tolerated;
+>  		int i;
+> @@ -8183,15 +8188,24 @@ bool btrfs_check_rw_degradable(struct btrfs_fs_info *fs_info,
+>  				btrfs_warn(fs_info,
+>  	"chunk %llu missing %d devices, max tolerance is %d for writable mount",
+>  				   map->start, missing, max_tolerated);
+> -			btrfs_free_chunk_map(map);
+> -			return false;
+> +			ret = false;
+> +			break;
+>  		}
+> -		next_start = map->start + map->chunk_len;
+> -		btrfs_free_chunk_map(map);
+>  
+> -		map = btrfs_find_chunk_map(fs_info, next_start, U64_MAX - next_start);
+> +		if (cond_resched_rwlock_read(&fs_info->mapping_tree_lock)) {
+> +			map = btrfs_find_chunk_map_nolock(fs_info, next_start,
+> +							  U64_MAX - next_start);
+> +		} else {
+> +			node = rb_next(&map->rb_node);
+> +			if (node)
+> +				map = rb_entry(node, struct btrfs_chunk_map, rb_node);
+> +			else
+> +				map = NULL;
+> +		}
+>  	}
+
+[Severity: High]
+Does the reschedule path leak a reference on map?
+
+btrfs_find_chunk_map_nolock() increments map->refs before returning the
+chunk map, and because all btrfs_free_chunk_map() calls were removed,
+that lookup reference is never dropped, preventing the struct
+btrfs_chunk_map from being freed on chunk removal or unmount.  Calling
+btrfs_free_chunk_map(map) right after btrfs_find_chunk_map_nolock()
+while still holding mapping_tree_lock (as
+btrfs_dev_replace_update_device_in_mapping_tree() does) would drop the
+extra reference.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/33b22f1310f84ccf116f1beeb1c2ccfbe50bca9d.1794592972.git.fdmanana@suse.com?part=1
+

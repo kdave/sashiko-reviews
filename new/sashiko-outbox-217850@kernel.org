@@ -1,0 +1,298 @@
+From sashiko-bot@kernel.org Tue Nov 17 00:09:43 2026
+Message-ID: <sashiko-outbox-217850@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 5/8] btrfs: wait for the root filesystem to have all its
+ devices
+Date: Mon, 16 Nov 2026 23:09:40 +0000
+
+Thank you for your contribution! Sashiko AI review found 5 potential
+issues to consider:
+- [High] btrfs: modpost link failure when CONFIG_BTRFS_FS=m with
+  CONFIG_BTRFS_ROOT_SCAN
+- [High] btrfs: infinite wait on seed-backed root fs in
+  btrfs_missing_devices()
+- [Medium] btrfs: non-btrfs devices counted as unreachable in
+  btrfs_scan_all_devices()
+- [Medium] btrfs: uninitialized scan result read in
+  btrfs_wait_for_devices()
+- [Medium] btrfs: use-after-free of device in btrfs_get_tree_super()
+  after unlock
+--
+
+commit 02ecdcf94372e541733419af800bd9007de27d69
+Author: Ismael Luceno <ismael@iodev.co.uk>
+
+btrfs: wait for the root filesystem to have all its devices
+
+This commit adds a loop in btrfs_get_tree_super() to periodically scan all
+block devices when mounting a non-degraded multi-device root filesystem with
+rootwait enabled.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index b424cc836bd4a..fb407361bbafd 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+
+[ ... ]
+
+> @@ -1849,6 +1853,133 @@ static int btrfs_fc_test_super(struct super_block *sb, struct fs_context *fc)
+>  	return fs_info->fs_devices == p->fs_devices;
+>  }
+>  
+> +#ifdef CONFIG_BTRFS_ROOT_SCAN
+> +/*
+> + * How many devices of the filesystem are not registered yet.
+> + *
+> + * Caller must hold uuid_mutex.
+> + */
+> +static u64 btrfs_missing_devices(struct btrfs_fs_devices *fs_devices)
+> +{
+> +	if (fs_devices->num_devices >= fs_devices->total_devices)
+> +		return 0;
+> +
+> +	return fs_devices->total_devices - fs_devices->num_devices;
+> +}
+
+[Severity: High]
+Does btrfs_missing_devices() ever reach zero on a sprouted root filesystem
+backed by a seed device?
+
+fs_devices->total_devices comes from the superblock's num_devices and
+includes seed devices, whereas fs_devices->num_devices only counts devices
+under the sprout fsid and excludes seed devices.  When btrfs_scan_all_devices()
+scans a seed device, it registers that device under its own fsid in a
+separate btrfs_fs_devices; seed devices are only linked onto the sprout's
+fs_devices->seed_list later during open_ctree() -> open_seed_devices().
+Consequently, btrfs_missing_devices() remains equal to at least the number
+of seed devices even after every device is scanned, causing a bare rootwait
+boot to hang indefinitely in btrfs_wait_for_devices().
+
+Also, btrfs_get_tree_super() does not check !fs_devices->opened before
+waiting, so a subsequent mount when device->devt matches the root device
+would wait again even though device_list_add() rejects adding devices to an
+already-opened fs_devices.
+
+> +
+> +/*
+> + * Scan the block devices until every device of the filesystem is registered,
+> + * or until @timeout_ms has passed.
+> + *
+> + * btrfs only knows about the devices it was handed: the mount source, the
+> + * device= mount options, or the device scanner running in userspace.  When
+> + * btrfs is the root filesystem and no initrd is around to run that scanner,
+> + * the remaining devices have to be discovered here, and they may not have
+> + * shown up yet when we are first called.
+> + *
+> + * The filesystem is left in whatever state it is in when this returns, so the
+> + * caller can still mount it in a degraded fashion.
+> + */
+> +static void btrfs_wait_for_devices(struct btrfs_fs_devices *fs_devices,
+> +				   long timeout_ms)
+> +{
+> +	unsigned long end;
+> +	struct btrfs_scan_result res;
+> +	unsigned int last_opened = ~0U;
+> +	unsigned int last_candidates = ~0U;
+> +	u64 last_missing = ~0ULL;
+> +	bool explained = false;
+> +	u64 missing;
+> +
+> +	mutex_lock(&uuid_mutex);
+> +	missing = btrfs_missing_devices(fs_devices);
+> +	mutex_unlock(&uuid_mutex);
+> +
+> +	if (!missing)
+> +		return;
+> +
+> +	/*
+> +	 * A negative timeout is rootwait without a value, which means wait
+> +	 * indefinitely; the loop then has no end.
+> +	 */
+> +	end = timeout_ms < 0 ? jiffies + MAX_JIFFY_OFFSET :
+> +			      jiffies + msecs_to_jiffies(timeout_ms);
+> +
+> +	if (timeout_ms < 0)
+> +		btrfs_info(NULL, "fsid %pU is missing %llu device(s), waiting indefinitely",
+> +			   fs_devices->fsid, missing);
+> +	else
+> +		btrfs_info(NULL, "fsid %pU is missing %llu device(s), waiting up to %ld ms",
+> +			   fs_devices->fsid, missing, timeout_ms);
+> +
+> +	while (!time_after(jiffies, end)) {
+> +		mutex_lock(&uuid_mutex);
+> +		btrfs_scan_all_devices(&res);
+> +		missing = btrfs_missing_devices(fs_devices);
+> +		mutex_unlock(&uuid_mutex);
+
+[ ... ]
+
+> +	}
+> +
+> +	if (missing)
+> +		btrfs_warn(NULL,
+> +			   "fsid %pU: %u of %u device(s) scanned, %u btrfs, still missing %llu; mounting anyway (%u block devices, %u passed over)",
+> +			   fs_devices->fsid, res.opened, res.candidates, res.found,
+> +			   missing, res.seen, res.skipped);
+> +	else
+> +		btrfs_info(NULL, "all devices of fsid %pU found", fs_devices->fsid);
+> +}
+
+[Severity: Medium]
+Can btrfs_warn() read uninitialized fields from res if jiffies passes end
+before the while loop runs?
+
+end is computed before calling btrfs_info().  With a small rootwait= timeout
+and a slow serial console or preemption during btrfs_info(),
+!time_after(jiffies, end) can be false on the first check, skipping
+btrfs_scan_all_devices(&res) entirely and printing uninitialized stack
+values from res.  Using a do-while loop guarantees at least one scan pass
+and initializes res on every path that reaches the final btrfs_warn().
+
+> +
+> +#endif /* CONFIG_BTRFS_ROOT_SCAN */
+> +
+>  static int btrfs_get_tree_super(struct fs_context *fc)
+>  {
+>  	struct btrfs_fs_info *fs_info = fc->s_fs_info;
+> @@ -1884,6 +2015,39 @@ static int btrfs_get_tree_super(struct fs_context *fc)
+>  	fs_info->fs_devices = fs_devices;
+>  	mutex_unlock(&uuid_mutex);
+>  
+> +	/*
+> +	 * Only the root filesystem needs this, and only when the user asked
+> +	 * for a rootwait: any other mount of a multi-device filesystem has
+> +	 * either been given all its devices or is being asked to mount
+> +	 * degraded, and neither should be delayed.  A "degraded" mount is one
+> +	 * where the user knows a device is missing and wants the filesystem
+> +	 * anyway, so it skips the wait too.
+> +	 */
+> +#ifdef CONFIG_BTRFS_ROOT_SCAN
+> +	if (root_wait && is_root_dev(device->devt) &&
+> +	    !btrfs_raw_test_opt(ctx->mount_opt, DEGRADED)) {
+> +		btrfs_wait_for_devices(fs_devices, root_wait);
+> +	} else {
+> +		u64 missing;
+> +
+> +		mutex_lock(&uuid_mutex);
+> +		missing = btrfs_missing_devices(fs_devices);
+> +		mutex_unlock(&uuid_mutex);
+> +
+> +		/*
+> +		 * A filesystem that is missing devices but is not being
+> +		 * waited for is either going to mount degraded, which is
+> +		 * what was asked for, or is about to fail.  Say which, so a
+> +		 * wait that did not happen is not a mystery either.
+> +		 */
+> +		if (missing)
+> +			btrfs_info(NULL,
+> +				   "not waiting for %llu missing device(s): is_root_dev=%u root_wait=%d degraded=%u",
+> +				   missing, is_root_dev(device->devt), root_wait,
+> +				   !!btrfs_raw_test_opt(ctx->mount_opt, DEGRADED));
+> +	}
+> +#endif
+
+[Severity: High]
+Does building with CONFIG_BTRFS_FS=m and CONFIG_BTRFS_ROOT_SCAN=y fail at
+modpost?
+
+BTRFS_ROOT_SCAN defaults to y whenever BTRFS_FS is enabled, including when
+BTRFS_FS=m.  However, root_wait and is_root_dev() (in init/do_mounts.c) as
+well as block_class used by btrfs_scan_all_devices() (in block/genhd.c) are
+not exported with EXPORT_SYMBOL, causing btrfs.ko to fail to link with
+undefined symbol errors.  Should BTRFS_ROOT_SCAN depend on BTRFS_FS=y?
+
+[Severity: Medium]
+Can reading device->devt after unlocking uuid_mutex cause a use-after-free?
+
+btrfs_fs_devices_inc_holding() only pins fs_devices, not individual
+btrfs_device structs.  Once uuid_mutex is dropped, a concurrent mount or
+device removal can free device under uuid_mutex before is_root_dev(device->devt)
+is evaluated:
+
+CPU0                                  CPU1
+btrfs_get_tree_super()
+  mutex_lock(&uuid_mutex)
+  device = btrfs_scan_one_device(...)
+  btrfs_fs_devices_inc_holding(...)
+  mutex_unlock(&uuid_mutex)
+                                      /* concurrent mount or device removal */
+                                      ...
+                                        __btrfs_free_extra_devids()
+                                          btrfs_free_device(device)
+  is_root_dev(device->devt)  <-- use-after-free
+
+Caching device->devt (or is_root_dev(device->devt)) in a local variable
+before releasing uuid_mutex avoids dereferencing device unlocked.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 143c052e460bb..d7b9d255a9da8 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -1571,15 +1571,26 @@ static bool btrfs_can_scan_disk(struct gendisk *disk, struct block_device *bdev)
+
+[ ... ]
+
+> @@ -1591,21 +1602,47 @@ void btrfs_scan_all_devices(void)
+>  	while ((dev = class_dev_iter_next(&iter))) {
+>  		struct gendisk *disk = dev_to_disk(dev);
+>  		struct block_device *bdev = dev_to_bdev(dev);
+> +		struct btrfs_device *device;
+>  
+> -		if (btrfs_can_scan_disk(disk, bdev)) {
+> -			/* Longest is "/dev/" plus a BDEVNAME_SIZE name. */
+> -			char path[sizeof("/dev/") + BDEVNAME_SIZE];
+> -			struct btrfs_device *device;
+> +		res->seen++;
+> +		if (!btrfs_can_scan_disk(disk, bdev)) {
+> +			res->skipped++;
+> +			continue;
+> +		}
+> +
+> +		/* Longest is "/dev/" plus a BDEVNAME_SIZE name. */
+> +		char path[sizeof("/dev/") + BDEVNAME_SIZE];
+>  
+> -			snprintf(path, sizeof(path), "/dev/%s", dev_name(dev));
+> +		candidates++;
+> +		snprintf(path, sizeof(path), "/dev/%s", dev_name(dev));
+>  
+> -			device = btrfs_scan_one_device(path, false);
+> -			if (IS_ERR(device))
+> +		device = btrfs_scan_one_device(path, false);
+> +		if (IS_ERR(device)) {
+> +			/*
+> +			 * ENOENT is the node not being there, as opposed to
+> +			 * the node being there and not holding a btrfs
+> +			 * filesystem.  Keep one of each to explain a scan
+> +			 * that reaches nothing, rather than one line each.
+> +			 */
+> +			if (!res->unreachable++) {
+> +				res->first_unreachable = dev_to_bdev(dev)->bd_dev;
+> +				res->first_errno = PTR_ERR(device);
+> +			}
+> +			if (PTR_ERR(device) != -ENOENT)
+>  				btrfs_debug(NULL, "skipping %s: %ld\n", path,
+>  					    PTR_ERR(device));
+> +		} else {
+> +			opened++;
+> +			found++;
+>  		}
+>  	}
+
+[Severity: Medium]
+Does this count every non-btrfs partition as an unreachable /dev node?
+
+When btrfs_scan_one_device() opens a block device that does not contain a
+btrfs superblock (such as an EFI System Partition, swap, or ext4),
+btrfs_read_disk_super() returns ERR_PTR(-EINVAL).  Because the IS_ERR(device)
+branch treats all errors identically and only the else branch increments
+opened and found together, res->opened is always equal to res->found and
+every non-btrfs device is counted in res->unreachable.  If no btrfs device
+can be opened via /dev/<dev_name> on the first pass (for example, if the
+root device uses a subdirectory devnode path such as /dev/cciss/c0d0p1),
+btrfs_wait_for_devices() sees !res.opened, warns that non-btrfs partitions
+have no node under /dev with errno -22 (-EINVAL), and aborts the wait loop
+immediately.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261116224316.11237-10-ismael@iodev.co.uk?part=5
+

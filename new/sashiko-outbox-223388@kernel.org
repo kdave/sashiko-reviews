@@ -1,0 +1,79 @@
+From sashiko-bot@kernel.org Thu Nov 19 16:35:08 2026
+Message-ID: <sashiko-outbox-223388@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: report writeback errors on initial COW
+ allocation failure
+Date: Thu, 19 Nov 2026 15:35:03 +0000
+
+Thank you for your contribution! Sashiko AI review found no new issues
+in this patch, but noticed 1 related pre-existing issue it does not
+introduce:
+- [High] btrfs: double unlock of locked_folio on retry failure in
+  run_delalloc_cow() [1]
+--
+
+commit 5c0b6b30ac97a6ae1f95ebf04077eae12aef97e3
+Author: guolingxing <guolingxing@tju.edu.cn>
+
+btrfs: report writeback errors on initial COW allocation failure
+
+This commit records a writeback error in the inode mapping when the
+initial extent allocation in cow_file_range() fails before any ordered
+extent is created.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 19b1eba2dd845..85454d8dc972e 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -1440,6 +1440,14 @@ static noinline int cow_file_range(struct btrfs_inode *inode,
+>  	return ret;
+>  
+>  out_unlock:
+> +	/*
+> +	 * If the initial allocation fails, no ordered extent exists to
+> +	 * report the error. Record it before ending writeback for the
+> +	 * failed range.
+> +	 */
+> +	if (start == orig_start && !cur_alloc_size)
+> +		mapping_set_error(inode->vfs_inode.i_mapping, ret);
+> +
+>  	/*
+>  	 * Now, we have three regions to clean up:
+>  	 *
+
+[Severity: High]
+This problem wasn't introduced by this patch, but can run_delalloc_cow()
+double unlock locked_folio [1] on a zoned filesystem when
+cow_file_range() fails on a subsequent loop iteration?
+
+fs/btrfs/inode.c:run_delalloc_cow() {
+    ...
+	while (start <= end) {
+		ret = cow_file_range(inode, locked_folio, start, end,
+				     &done_offset, COW_FILE_RANGE_KEEP_LOCKED);
+		if (ret)
+			return ret;
+		extent_write_locked_range(&inode->vfs_inode, locked_folio,
+					  start, done_offset, wbc);
+		start = done_offset + 1;
+	}
+    ...
+}
+
+When active zones are exhausted mid-range, cow_file_range() sets
+done_offset to the end of the allocated prefix and returns 0.
+extent_write_locked_range() then submits and unlocks the folios in
+[start, done_offset] via btrfs_folio_end_lock(), including locked_folio.
+
+If the next iteration of cow_file_range() fails, run_delalloc_cow()
+returns the error to extent_writepage() or submit_uncompressed_range(),
+which assume locked_folio is still locked on error and unlock it a second
+time.  This triggers a bug check in folio_unlock() or underflows
+bfs->nr_locked on subpage and large folios, permanently wedging the folio
+lock.
+
+[1] https://sashiko.dev/#/bug/linux-781df778-b21e-48f6-a94f-b7bbf2b72a81
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261119151750.4178311-1-guolingxing@tju.edu.cn?part=1
+

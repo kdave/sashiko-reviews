@@ -1,0 +1,210 @@
+From sashiko-bot@kernel.org Tue Nov 17 22:20:28 2026
+Message-ID: <sashiko-outbox-219685@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 22/27] btrfs: zoned: return finished relocation block
+ groups to the data space_info
+Date: Tue, 17 Nov 2026 21:20:25 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [High] btrfs: zoned: btrfs_zoned_return_data_reloc_bgs() strands
+  relocation BGs
+- [High] btrfs: zoned: infinite loop in
+  btrfs_zoned_reserve_data_reloc_bg()
+- [High] btrfs: zoned: race migrating bg->space_info outside
+  reclaim_bgs_lock
+--
+
+commit 89e361e7723bc4ef55c835f00a5f1f9f66a53d82
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: return finished relocation block groups to the data space_info
+
+This commit adds btrfs_zoned_return_data_reloc_bgs() to return finished
+relocation block groups from the data relocation sub-space_info back to the
+primary data space_info after each block-group reclaim run, followed by
+reserving a new data relocation block group.
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 88ed3609fe507..562ec70ff0a57 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -2164,6 +2164,10 @@ void btrfs_reclaim_block_groups(struct btrfs_fs_info *fs_info, unsigned int limi
+>  	spin_lock(&fs_info->unused_bgs_lock);
+>  	list_splice_tail(&retry_list, &fs_info->reclaim_bgs);
+>  	spin_unlock(&fs_info->unused_bgs_lock);
+> +
+> +	btrfs_zoned_return_data_reloc_bgs(fs_info);
+
+[Severity: High]
+Can calling btrfs_zoned_return_data_reloc_bgs() and
+btrfs_zoned_reserve_data_reloc_bg() after unlocking
+fs_info->reclaim_bgs_lock race with btrfs_delete_unused_bgs() or
+inc_block_group_ro() on bg->space_info?
+
+btrfs_delete_unused_bgs() serializes on fs_info->reclaim_bgs_lock without
+taking BTRFS_EXCLOP_BALANCE, and caches block_group->space_info before
+dropping unused_bgs_lock and before acquiring groups_sem:
+
+CPU0                                  CPU1
+btrfs_delete_unused_bgs()             btrfs_reclaim_block_groups()
+  spin_lock(&unused_bgs_lock)           ...
+  space_info = bg->space_info;          mutex_unlock(&reclaim_bgs_lock)
+  spin_unlock(&unused_bgs_lock)         btrfs_zoned_return_data_reloc_bgs()
+                                          zoned_move_bg_to_space_info()
+                                            bg->space_info = data_sinfo;
+                                            list_move_tail(&bg->list, ...);
+  down_write(&space_info->groups_sem)
+  spin_lock(&space_info->lock)
+  list_is_singular(&bg->list)
+    <-- unlocked read on data_sinfo list
+  space_info->total_bytes - bg->length
+    <-- u64 underflow on stale reloc_sinfo
+
+btrfs_delete_unused_bgs() then updates bytes_pinned and bytes_readonly on
+the stale space_info while bg belongs to the new space_info.
+inc_block_group_ro() similarly caches sinfo = cache->space_info before
+taking sinfo->lock, so a concurrent space_info migration accounts
+bytes_readonly and links cache->ro_list on the old space_info while a
+subsequent btrfs_dec_block_group_ro() decrements and unlinks on the new
+space_info.
+
+> +	btrfs_zoned_reserve_data_reloc_bg(fs_info);
+
+[Severity: High]
+Can btrfs_zoned_reserve_data_reloc_bg() spin in an infinite loop when called
+at runtime while data_sinfo has active delalloc reservations or pinned
+extents?
+
+fs/btrfs/zoned.c:btrfs_zoned_reserve_data_reloc_bg() {
+	...
+again:
+	...
+	list_for_each_entry(tmp, bg_list, list) {
+		bool usable;
+
+		spin_lock(&tmp->lock);
+		usable = (tmp->alloc_offset == 0 && tmp->used == 0 &&
+			  tmp->reserved == 0 && !tmp->ro);
+		spin_unlock(&tmp->lock);
+		if (!usable)
+			continue;
+		bg = tmp;
+		btrfs_get_block_group(bg);
+		break;
+	}
+	up_read(&space_info->groups_sem);
+
+	if (bg) {
+		bool set = btrfs_set_data_reloc_bg(fs_info, bg);
+
+		btrfs_put_block_group(bg);
+		if (!set)
+			goto again;
+		return;
+	}
+}
+
+In btrfs_set_data_reloc_bg(), btrfs_inc_block_group_ro_notrans(bg) fails
+with -ENOSPC whenever bg's free space is needed to back existing
+bytes_may_use or bytes_pinned in data_sinfo, and zoned_move_bg_to_space_info()
+also rejects bg if bg->pinned > 0.  In either case btrfs_set_data_reloc_bg()
+returns false without changing bg's state or list position, so jumping to
+again re-selects the same first candidate from data_sinfo->block_groups[index]
+forever while holding super_write(fs_info->sb) and BTRFS_EXCLOP_BALANCE.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index dd05687f398bf..027aa78cbb3a8 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+[ ... ]
+
+> @@ -3268,6 +3273,58 @@ void btrfs_zoned_reserve_data_reloc_bg(struct btrfs_fs_info *fs_info)
+>  	}
+>  }
+>  
+> +void btrfs_zoned_return_data_reloc_bgs(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct btrfs_space_info *data_sinfo = fs_info->data_sinfo;
+> +	struct btrfs_space_info *reloc_sinfo;
+> +
+> +	if (!btrfs_is_zoned(fs_info) || !data_sinfo)
+> +		return;
+> +
+> +	reloc_sinfo = data_sinfo->sub_group[0];
+> +	if (!reloc_sinfo || reloc_sinfo->subgroup_id != BTRFS_SUB_GROUP_DATA_RELOC)
+> +		return;
+> +
+> +again:
+> +	for (int raid = 0; raid < BTRFS_NR_RAID_TYPES; raid++) {
+> +		struct btrfs_block_group *bg;
+> +		struct btrfs_block_group *found = NULL;
+> +		bool moved;
+> +
+> +		down_read(&reloc_sinfo->groups_sem);
+> +		list_for_each_entry(bg, &reloc_sinfo->block_groups[raid], list) {
+> +			spin_lock(&bg->lock);
+> +			/*
+> +			 * Only return written but now empty block groups that are
+> +			 * no longer the active relocation destination.
+> +			 */
+> +			if (!bg->ro && bg->alloc_offset && !btrfs_is_block_group_used(bg) &&
+> +			    bg->start != READ_ONCE(fs_info->data_reloc_bg)) {
+> +				found = bg;
+> +				btrfs_get_block_group(bg);
+> +				spin_unlock(&bg->lock);
+> +				break;
+> +			}
+> +			spin_unlock(&bg->lock);
+> +		}
+> +		up_read(&reloc_sinfo->groups_sem);
+> +
+> +		if (!found)
+> +			continue;
+> +
+> +		if (btrfs_inc_block_group_ro_notrans(found)) {
+> +			btrfs_put_block_group(found);
+> +			return;
+> +		}
+> +		moved = zoned_move_bg_to_space_info(fs_info, found, reloc_sinfo, data_sinfo);
+> +		zoned_dec_bg_ro(found);
+> +		btrfs_put_block_group(found);
+> +		if (!moved)
+> +			return;
+> +		goto again;
+> +	}
+> +}
+
+[Severity: High]
+Does btrfs_zoned_return_data_reloc_bgs() leave relocation block groups
+stranded instead of returning their space to data_sinfo?
+
+When a relocation block group is retired during btrfs_reclaim_block_groups(),
+it contains the newly relocated live extents, so btrfs_is_block_group_used(bg)
+is true.  Both btrfs_zoned_return_data_reloc_bgs() and
+zoned_move_bg_to_space_info() require !btrfs_is_block_group_used(bg), so
+filled or partially-filled relocation block groups stay in reloc_sinfo while
+btrfs_zoned_reserve_data_reloc_bg() reserves another one.
+
+When all extents in that former relocation block group are later freed,
+btrfs_delete_unused_bgs() runs inside btrfs_reclaim_block_groups() before
+btrfs_zoned_return_data_reloc_bgs().  If the block group is the only entry
+in reloc_sinfo->block_groups[raid], btrfs_delete_unused_bgs() pops it from
+fs_info->unused_bgs and skips it at list_is_singular(&block_group->list)
+without re-queuing it.  btrfs_zoned_return_data_reloc_bgs() then moves found
+to data_sinfo without resetting its zones or calling
+btrfs_mark_bg_unused(found), and zoned_dec_bg_ro() restores
+found->zone_unusable to found->alloc_offset + (found->length -
+found->zone_capacity).  Because found has used == 0 and is off
+fs_info->unused_bgs, it is never reset or deleted.
+
+Finally, if btrfs_reset_unused_block_groups() resets an unused block group
+in reloc_sinfo in place while fs_info->data_reloc_bg is already set,
+zoned_reset_bg_in_place() sets bg->alloc_offset = 0.  The bg->alloc_offset
+check here then skips it, and btrfs_zoned_reserve_data_reloc_bg() only
+searches data_sinfo, stranding the reset empty block group in reloc_sinfo.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261117185850.4128157-1-johannes.thumshirn@wdc.com?part=22
+

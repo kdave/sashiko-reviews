@@ -1,0 +1,216 @@
+From sashiko-bot@kernel.org Tue Nov 17 00:12:57 2026
+Message-ID: <sashiko-outbox-217854@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 8/8] btrfs: resolve root=UUID= and root=LABELDate: Mon, 16 Nov 2026 23:12:53 +0000
+
+Thank you for your contribution! Sashiko AI review found 4 potential
+issues to consider:
+- [High] btrfs: superblock read on unopened bdev in
+  btrfs_find_dev_by_spec()
+- [High] btrfs: btrfs_find_dev_by_spec() sleeps under RCU and mismatches
+  caller
+- [Medium] btrfs: unsynchronized static buffer in btrfs_sb_uuid_string()
+- [Low] btrfs: unvalidated non-UUID key treated as LABEL in
+  btrfs_dev_spec_matches()
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [Medium] btrfs: off-by-one boundary check in btrfs_read_disk_super()
+  [1]
+--
+
+commit 71ddb7bc8e1095a571b40505cd2e0cb28d4fbec6
+Author: Ismael Luceno <ismael@iodev.co.uk>
+
+btrfs: resolve root=UUID= and root=LABEL=
+
+This commit adds btrfs_find_dev_by_spec() and wires it to
+btrfs_fs_type.find_by_spec so root=UUID= and root=LABEL= can be resolved by
+scanning block devices for a matching btrfs superblock.
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index d7b9d255a9da8..53aaa9ebe3457 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+
+[ ... ]
+
+> @@ -1647,6 +1646,87 @@ unsigned int btrfs_scan_all_devices(struct btrfs_scan_result *res)
+>  
+>  #endif /* CONFIG_BTRFS_ROOT_SCAN */
+>  
+> +/*
+> + * Format the filesystem UUID of a disk superblock, in the same textual form
+> + * blkid and the rest of btrfs print it as.
+> + */
+> +static const char *btrfs_sb_uuid_string(struct btrfs_super_block *disk_super)
+> +{
+> +	static char buf[UUID_STRING_LEN + 1];
+> +
+> +	/* The fsid is stored in the same layout a uuid_t is printed from. */
+> +	snprintf(buf, sizeof(buf), "%pU", (uuid_t *)disk_super->fsid);
+> +	return buf;
+> +}
+
+[Severity: Medium]
+Can concurrent callers race on the static buf[] in btrfs_sb_uuid_string()?
+Neither btrfs_find_dev_by_spec() nor the exported find_dev_by_fs_spec() holds
+a lock that serializes access to buf[], so concurrent lookups can overwrite
+buf[] while strcasecmp() is comparing it.  Parsing value once with
+uuid_parse() in btrfs_find_dev_by_spec() and comparing against
+disk_super->fsid would avoid both the shared static buffer and formatting
+every device's UUID.
+
+> +
+> +/*
+> + * Read the primary superblock of @bdev and compare the field named by @key
+> + * against @value.  @value is in the usual textual form: a UUID, or a label.
+> + *
+> + * Return 0 on a match, -ENOENT if the device is not btrfs or does not match,
+> + * or an error.
+> + */
+> +static int btrfs_dev_spec_matches(struct block_device *bdev, const char *key,
+> +				  const char *value)
+> +{
+> +	struct btrfs_super_block *disk_super;
+> +	bool matches;
+> +	int ret;
+> +
+> +	disk_super = btrfs_read_disk_super(bdev, 0, false);
+> +	if (IS_ERR(disk_super))
+> +		return PTR_ERR(disk_super);
+
+[Severity: Medium]
+This problem wasn't introduced by this patch, but btrfs_read_disk_super() has
+an off-by-one boundary check [1] that rejects a superblock when its end
+offset equals bdev_nr_bytes(bdev):
+
+fs/btrfs/volumes.c:btrfs_read_disk_super() {
+	...
+	if (bytenr + BTRFS_SUPER_INFO_SIZE >= bdev_nr_bytes(bdev))
+		return ERR_PTR(-EINVAL);
+	...
+}
+
+Because the check uses >= instead of >, a valid superblock copy that ends
+right at the end of the block device is rejected with -EINVAL even though
+write_dev_supers() allows writing it there.
+
+> +
+> +	if (!strcmp(key, "UUID"))
+> +		matches = !strcasecmp(value, btrfs_sb_uuid_string(disk_super));
+> +	else
+> +		matches = !strncmp(value, disk_super->label,
+> +				   BTRFS_LABEL_SIZE);
+
+[Severity: Low]
+Does the else branch treat any non-"UUID" key as "LABEL"?  If a caller passes
+an unrecognized key string to btrfs_find_dev_by_spec(), it will scan all
+block devices and compare value against disk_super->label instead of
+returning -EINVAL.
+
+> +
+> +	ret = matches ? 0 : -ENOENT;
+> +
+> +	btrfs_release_disk_super(disk_super);
+> +	return ret;
+> +}
+> +
+> +/*
+> + * Find the block device holding the btrfs filesystem identified by @key and
+> + * @value, for "root=UUID=" and "root=LABEL=".  Both are in the superblock
+> + * rather than in the partition table, so unlike PARTUUID= and PARTLABEL= they
+> + * can only be recognised by reading devices, and it has to be done by btrfs
+> + * rather than by init/.
+> + *
+> + * Return 0 and the dev_t on a match, -ENODEV if no device matches.
+> + */
+> +int btrfs_find_dev_by_spec(const char *key, const char *value, dev_t *devt)
+> +{
+> +	struct class_dev_iter iter;
+> +	struct device *dev;
+> +	int ret = -ENODEV;
+> +
+> +	if (!key || !value || !value[0])
+> +		return -EINVAL;
+> +
+> +	/* Every block device, disks and partitions alike: see the comment on
+> +	 * btrfs_scan_all_devices() for why the type filter cannot be used. */
+> +	class_dev_iter_init(&iter, &block_class, NULL, NULL);
+> +	while ((dev = class_dev_iter_next(&iter))) {
+> +		struct gendisk *disk = dev_to_disk(dev);
+> +		struct block_device *bdev = dev_to_bdev(dev);
+> +
+> +		if (!btrfs_can_scan_disk(disk, bdev))
+> +			continue;
+> +		if (btrfs_dev_spec_matches(bdev, key, value) == 0) {
+> +			*devt = bdev->bd_dev;
+> +			ret = 0;
+> +			break;
+> +		}
+
+[Severity: High]
+Is it safe to read from bdev->bd_mapping without opening the block device
+first via bdev_file_open_by_dev()?
+
+blkdev_get_whole() and blkdev_get_part() only call set_init_blocksize() when
+bd_openers transitions from 0 to 1:
+
+block/bdev.c:blkdev_get_part() {
+	...
+	if (!atomic_read(&part->bd_openers)) {
+		disk->open_partitions++;
+		set_init_blocksize(part);
+	}
+	...
+}
+
+Reading bdev->bd_mapping while bd_openers is 0 populates order-0 pagecache
+folios (and PAGE_SIZE buffer_heads) before set_init_blocksize() configures
+i_blkbits and folio_min_order, and because the device is never closed, those
+folios are not evicted.  When any probed device is later opened for the first
+time, set_init_blocksize() changes i_blkbits and folio_min_order without
+invalidating the mapping, leaving cached folios whose geometry conflicts with
+the block device's configured blocksize.  Skipping open also bypasses
+disk->open_mutex, disk->fops->open(), and partition scan synchronization.
+
+> +	}
+> +	class_dev_iter_exit(&iter);
+> +
+> +	return ret;
+> +}
+
+[Severity: High]
+Does wiring btrfs_find_dev_by_spec() to btrfs_fs_type.find_by_spec sleep
+inside an RCU read-side critical section and invert the return value expected
+by find_dev_by_fs_spec()?
+
+fs/filesystems.c:find_dev_by_fs_spec() {
+	...
+	guard(rcu)();
+	hlist_for_each_entry_rcu(p, &file_systems, list) {
+		if (!(p->fs_flags & FS_REQUIRES_DEV) || !p->find_by_spec)
+			continue;
+		...
+		if (!try_module_get(p->owner))
+			continue;
+		if (p->find_by_spec(key, value, &dev) && dev)
+			break;
+		module_put(p->owner);
+	}
+	...
+}
+
+find_dev_by_fs_spec() calls p->find_by_spec() under guard(rcu)(), while
+btrfs_find_dev_by_spec() -> btrfs_dev_spec_matches() ->
+btrfs_read_disk_super() takes the sleeping rw_semaphore
+filemap_invalidate_lock_shared() and performs synchronous block I/O via
+mapping_read_folio_gfp().  In addition, btrfs_find_dev_by_spec() returns 0 on
+a match and negative errno on failure, whereas find_dev_by_fs_spec() checks
+for a non-zero return value, so a match does not break out of the loop (and a
+break on a non-zero return skips module_put(p->owner)).
+
+[1] https://sashiko.dev/#/bug/linux-2d915102-fe48-454c-ba6c-941e86a9ac43
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261116224316.11237-10-ismael@iodev.co.uk?part=8
+

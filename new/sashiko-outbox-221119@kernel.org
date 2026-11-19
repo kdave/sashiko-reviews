@@ -1,0 +1,54 @@
+From sashiko-bot@kernel.org Wed Nov 18 15:00:53 2026
+Message-ID: <sashiko-outbox-221119@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix double free of reserved data space on error
+ in btrfs_zero_range()
+Date: Wed, 18 Nov 2026 14:00:49 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: inaccurate Fixes trailer citing b778cf962d71
+--
+
+commit cd025ec6c4de29ae1c39ec9f2dfd1e3b5631a3cd
+Author: Filipe Manana <fdmanana@suse.com>
+
+> btrfs: fix double free of reserved data space on error in btrfs_zero_range()
+>
+> If we reserved data space ('space_reserved' is set to true) and then got
+> an error from btrfs_fallocate_update_isize(), we end up attempting to free
+> the reserved data space by calling btrfs_free_reserved_data_space(), but
+> that is wrong because btrfs_prealloc_file_range() will deal with that, as
+> it either consumes the reserved data space in case it succeeds (by doing
+> extent allocation) or frees the reserved space if it errors out by calling
+> btrfs_free_reserved_data_space() - that means the second call we do in
+> btrfs_zero_range() will either result in an underflow of
+> space_info->bytes_may_use (in btrfs_space_info_update_bytes_may_use()) or
+> free space reserved by other task.
+>
+> Fix this by always setting 'space_reserved' to false after calling
+> btrfs_prealloc_file_range(), as it clears the space reservation both when
+> it succeeds and when it errors out.
+>
+> Fixes: b778cf962d71 ("btrfs: fix bytes_may_use underflow in prealloc error condtition")
+> Fixes: 9f13ce743b1b ("Btrfs: fix missing inode i_size update after zero range operation")
+> Link: https://sashiko.dev/#/bug/linux-c6462d6d-8e2a-45f7-8918-88f8788394a4
+> Signed-off-by: Filipe Manana <fdmanana@suse.com>
+
+[Severity: Low]
+Should the Fixes tag for b778cf962d71 ("btrfs: fix bytes_may_use underflow
+in prealloc error condtition") be dropped?
+
+When btrfs_prealloc_file_range() failed, btrfs_zero_range() already set
+space_reserved = false and jumped to out.  The double free only happens
+when btrfs_prealloc_file_range() succeeds and
+btrfs_fallocate_update_isize() fails, which was introduced by 9f13ce743b1b
+("Btrfs: fix missing inode i_size update after zero range operation").
+Commit b778cf962d71 ("btrfs: fix bytes_may_use underflow in prealloc error
+condtition") only adjusted the error cleanup range inside
+__btrfs_prealloc_file_range() and did not change its success path or
+btrfs_zero_range().
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/09aefee29f14e92778f56805b7b8fe7a539e5a8e.1795009782.git.fdmanana@suse.com?part=1
+

@@ -1,0 +1,150 @@
+From sashiko-bot@kernel.org Sat Nov 14 13:03:51 2026
+Message-ID: <sashiko-outbox-214477@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 26/33] btrfs: don't set SB_RDONLY after filesystem
+ errors
+Date: Sat, 14 Nov 2026 12:03:48 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: btrfs_super_sync_fs() and btrfs_freeze() return 0 on
+  shutdown or error
+- [Medium] btrfs: race between BTRFS_FS_STATE_RO and
+  sb_set_emergency_ro() on fs error
+--
+
+commit 3d297b218ce5c34d64ff204c632eaa6ac7a2526b
+Author: Christian Brauner <brauner@kernel.org>
+
+btrfs: don't set SB_RDONLY after filesystem errors
+
+This commit stops setting SB_RDONLY in __btrfs_handle_fs_error(), using
+BTRFS_FS_STATE_RO and sb_set_emergency_ro() instead, and updates shutdown,
+remount, sync_fs, and freeze handling for the new read-only state.
+
+> diff --git a/fs/btrfs/fs.h b/fs/btrfs/fs.h
+> index 024c3ec7d0583..39fd1a04d25ba 100644
+> --- a/fs/btrfs/fs.h
+> +++ b/fs/btrfs/fs.h
+[ ... ]
+> @@ -1233,15 +1232,12 @@ static inline bool btrfs_is_shutdown(const struct btrfs_fs_info *fs_info)
+>  static inline void btrfs_force_shutdown(struct btrfs_fs_info *fs_info)
+>  {
+>  	/*
+> -	 * Here we do not want to use handle_fs_error(), which will mark the fs
+> -	 * read-only.
+> -	 * Some call sites like shutdown ioctl will mark the fs shutdown when
+> -	 * the fs is frozen. But thaw path will handle RO and RW fs
+> -	 * differently.
+> -	 *
+> -	 * So here we only mark the fs error without flipping it RO.
+> +	 * A shutdown isn't an error, so don't use btrfs_handle_fs_error().
+> +	 * BTRFS_FS_STATE_RO doesn't touch SB_RDONLY, so it's fine while the
+> +	 * filesystem is frozen, e.g. for the shutdown ioctl.
+>  	 */
+>  	WRITE_ONCE(fs_info->fs_error, -EIO);
+> +	set_bit(BTRFS_FS_STATE_RO, &fs_info->fs_state);
+>  	if (!test_and_set_bit(BTRFS_FS_STATE_EMERGENCY_SHUTDOWN, &fs_info->fs_state)) {
+>  		btrfs_crit(fs_info, "emergency shutdown");
+>  		fserror_report_shutdown(fs_info->sb, GFP_KERNEL);
+[ ... ]
+> diff --git a/fs/btrfs/messages.c b/fs/btrfs/messages.c
+> index cedca40508315..3a768e2ac1ccf 100644
+> --- a/fs/btrfs/messages.c
+> +++ b/fs/btrfs/messages.c
+> @@ -173,8 +173,12 @@ void __btrfs_handle_fs_error(struct btrfs_fs_info *fs_info, const char *function
+>  
+>  	btrfs_discard_stop(fs_info);
+>  
+> -	/* Handle error by forcing the filesystem readonly. */
+> -	btrfs_set_sb_rdonly(sb);
+> +	/*
+> +	 * Handle error by forcing the filesystem readonly. SB_RDONLY needs
+> +	 * s_umount, see sb_set_emergency_ro().
+> +	 */
+> +	set_bit(BTRFS_FS_STATE_RO, &fs_info->fs_state);
+> +	sb_set_emergency_ro(sb);
+>  	btrfs_info(fs_info, "forced readonly");
+
+[Severity: Medium]
+Can setting BTRFS_FS_STATE_RO before sb_set_emergency_ro(sb) let concurrent
+callers observe btrfs_fs_rdonly() == true while sb_emergency_ro(sb) is still
+false?
+
+set_bit() is a relaxed atomic operation and __btrfs_handle_fs_error() returns
+early when btrfs_fs_rdonly(fs_info) is already set:
+
+CPU0                                  CPU1
+__btrfs_handle_fs_error()
+  set_bit(BTRFS_FS_STATE_RO, ...)
+                                      ksys_syncfs()
+                                        sync_filesystem(sb)
+                                          btrfs_super_sync_fs(sb, 1)
+                                            if (btrfs_fs_rdonly(...))
+                                              return 0;
+                                        if (sb_emergency_ro(sb))
+                                          /* still false, returns 0 */
+  sb_set_emergency_ro(sb)
+
+During this window, syncfs(2) and freeze_super() can see btrfs_fs_rdonly() ==
+true in btrfs_super_sync_fs() and sb_emergency_ro(sb) == false in the VFS, so
+they return 0 without syncing instead of failing with -EROFS.  Similarly, a
+second thread entering __btrfs_handle_fs_error() sees btrfs_fs_rdonly(fs_info)
+and returns early to its caller before CPU0 sets SB_STATE_EMERGENCY_RO, so a
+subsequent btrfs_ioctl_shutdown() or VFS call on CPU1 can still observe
+sb_emergency_ro(sb) == false.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index b424cc836bd4a..ff61ec9ebfa79 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+> @@ -1041,6 +1041,18 @@ int btrfs_sync_fs(struct super_block *sb, int wait)
+>  	return btrfs_commit_transaction(trans);
+>  }
+>  
+> +/*
+> + * Nothing can be committed after an error, don't fail syncfs(2) and freezing.
+> + * BTRFS_IOC_SYNC calls btrfs_sync_fs() directly and still gets the error.
+> + */
+> +static int btrfs_super_sync_fs(struct super_block *sb, int wait)
+> +{
+> +	if (btrfs_fs_rdonly(btrfs_sb(sb)))
+> +		return 0;
+> +
+> +	return btrfs_sync_fs(sb, wait);
+> +}
+[ ... ]
+> @@ -2308,6 +2326,9 @@ static int btrfs_freeze(struct super_block *sb)
+>  	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
+>  
+>  	set_bit(BTRFS_FS_FROZEN, &fs_info->flags);
+> +	/* Nothing can be committed after an error. */
+> +	if (btrfs_fs_rdonly(fs_info))
+> +		return 0;
+>  	/*
+>  	 * We don't need a barrier here, we'll wait for any transaction that
+>  	 * could be in progress on other threads (and do delayed iputs that
+
+[Severity: Medium]
+Does returning 0 when btrfs_fs_rdonly() is true cause syncfs(2) and
+freeze_super() to succeed without flushing after a forced shutdown?
+
+btrfs_force_shutdown() now sets BTRFS_FS_STATE_RO without calling
+sb_set_emergency_ro(sb).  After BTRFS_IOC_SHUTDOWN with
+BTRFS_SHUTDOWN_FLAGS_NOLOGFLUSH (or btrfs_shutdown()), dirty data and
+transactions were not flushed, yet sb_emergency_ro(sb) and sb_rdonly(sb) are
+both false.  Calling syncfs(2) or FIFREEZE then reaches btrfs_super_sync_fs()
+and btrfs_freeze(), which see btrfs_fs_rdonly() == true and return 0 instead
+of failing as btrfs_sync_fs() and btrfs_commit_current_transaction() did via
+BTRFS_FS_ERROR(fs_info).
+
+In addition, if an in-flight transaction aborts while freeze_super() is
+waiting in sb_wait_write(sb, SB_FREEZE_FS) (after freeze_super() already
+checked sb_emergency_ro(sb)), btrfs_freeze() now returns 0 and lets the freeze
+succeed on an errored filesystem.  The comment above btrfs_super_sync_fs()
+also says not to fail syncfs(2) and freezing after an error, whereas the VFS
+fails both with -EROFS when sb_emergency_ro(sb) is set.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261113-work-fs-sb_rdonly-v3-0-0be92bb73709@kernel.org?part=26
+

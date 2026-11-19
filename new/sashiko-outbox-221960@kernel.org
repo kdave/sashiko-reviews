@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Wed Nov 18 21:57:33 2026
+Message-ID: <sashiko-outbox-221960@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2] btrfs: wait for block group relocation on remount
+ read-only
+Date: Wed, 18 Nov 2026 20:57:29 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: lockdep circular dependency in btrfs_remount_ro() on
+  reclaim_bgs_work
+--
+
+commit 2499d1d39f08bb5ce534fcf0c31343f8ce92a18d
+Author: Miroslav Cimerman <mc@raidlab.org>
+
+btrfs: wait for block group relocation on remount read-only
+
+This commit serializes remounting read-only against block group
+relocation by taking reclaim_bgs_lock in btrfs_remount_ro(), checking
+btrfs_need_cleaner_sleep() in relocating_repair_kthread(), and flushing
+reclaim_bgs_work and the async reclaim works before the final superblock
+commit.
+
+> diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+> index b424cc836bd4a..e80df13d36e46 100644
+> --- a/fs/btrfs/super.c
+> +++ b/fs/btrfs/super.c
+
+[ ... ]
+
+> @@ -1364,6 +1369,14 @@ static int btrfs_remount_ro(struct btrfs_fs_info *fs_info)
+>  	 */
+>  	wait_on_bit(&fs_info->flags, BTRFS_FS_CLEANER_RUNNING, TASK_UNINTERRUPTIBLE);
+>  
+> +	/*
+> +	 * The reclaim work doesn't relocate on a read-only filesystem, but
+> +	 * it still deletes unused block groups between the ones it skips, and
+> +	 * the cleaner may have queued it again before going to sleep. Stop
+> +	 * it, so it can't start a transaction after btrfs_commit_super().
+> +	 */
+> +	cancel_work_sync(&fs_info->reclaim_bgs_work);
+
+[Severity: Medium]
+Can calling cancel_work_sync(&fs_info->reclaim_bgs_work) here under
+sb->s_umount trigger a lockdep circular dependency splat?
+
+btrfs_reclaim_bgs_work() calls btrfs_reclaim_block_groups(), which takes
+sb_start_write(fs_info->sb) (sb_writers[SB_FREEZE_WRITE - 1]) while
+reclaim_bgs_work is running.  freeze_super() orders
+sb_writers[SB_FREEZE_WRITE - 1] before sb->s_umount, and flushing a
+running reclaim_bgs_work from reconfigure_super() -> btrfs_remount_ro()
+acquires reclaim_bgs_work.lockdep_map under sb->s_umount:
+
+CPU0                         CPU1                         CPU2
+----                         ----                         ----
+process_one_work()
+  lock(reclaim_bgs_work)
+                             freeze_super()
+                               sb_wait_write(...,
+                                 SB_FREEZE_WRITE)
+                                                          reconfigure_super()
+                                                            lock(&sb->s_umount)
+                                                            btrfs_remount_ro()
+                                                              cancel_work_sync(
+                                                                &reclaim_bgs_work)
+                               __super_lock_excl(sb)
+  btrfs_reclaim_block_groups()
+    sb_start_write(sb)
+
+ *** DEADLOCK ***
+
+reconfigure_super() and freeze_super() cannot actually deadlock at
+runtime because reconfigure_super() rejects frozen filesystems under
+sb->s_umount, so this only trips lockdep when cancel_work_sync() catches
+reclaim_bgs_work executing (for example while iterating remaining block
+groups or running btrfs_delete_unused_bgs() after dropping
+reclaim_bgs_lock) on a kernel that has also run freeze_super().
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261118202548.82001-1-mc@raidlab.org?part=1
+

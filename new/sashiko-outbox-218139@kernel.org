@@ -1,0 +1,87 @@
+From sashiko-bot@kernel.org Tue Nov 17 04:24:35 2026
+Message-ID: <sashiko-outbox-218139@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3] btrfs: tree-checker: reject file extents with
+ oversized disk_num_bytes
+Date: Tue, 17 Nov 2026 03:24:32 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: tree-checker: check_extent_data_item() allows zero
+  disk_num_bytes
+- [Medium] btrfs: missing offset and num_bytes check in
+  check_extent_data_item()
+--
+
+commit 582dd801aa06d0b2385299335815dda6c25dec91
+Author: Cheng Yongkang <teel4res@gmail.com>
+
+btrfs: tree-checker: reject file extents with oversized disk_num_bytes
+
+This commit adds upper-bound checks on ram_bytes and disk_num_bytes for
+regular and preallocated file extent items in check_extent_data_item().
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index f021ac14babfa..e5d17bf4051b3 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+
+[ ... ]
+
+> @@ -377,6 +378,30 @@ static int check_extent_data_item(struct extent_buffer *leaf,
+>  		     CHECK_FE_ALIGNED(leaf, slot, fi, num_bytes, sectorsize)))
+>  		return -EUCLEAN;
+>  
+> +	/*
+> +	 * Compressed extents are at most 128K both on disk and uncompressed.
+> +	 * Uncompressed extents should never get close to U32_MAX.
+> +	 */
+> +	if (btrfs_file_extent_compression(leaf, fi) != BTRFS_COMPRESS_NONE) {
+> +		if (unlikely(btrfs_file_extent_ram_bytes(leaf, fi) > BTRFS_MAX_UNCOMPRESSED)) {
+> +			file_extent_err(leaf, slot,
+> +		"invalid ram_bytes for compressed file extent, have %llu expect <= %u",
+> +					btrfs_file_extent_ram_bytes(leaf, fi),
+> +					BTRFS_MAX_UNCOMPRESSED);
+> +			return -EUCLEAN;
+> +		}
+> +		max_disk_num_bytes = BTRFS_MAX_COMPRESSED;
+
+[Severity: Medium]
+Does bounding ram_bytes alone suffice for compressed extents without also
+checking that offset + num_bytes <= ram_bytes?
+
+btrfs_extent_item_to_extent_map() populates em->offset and em->len from the
+on-disk offset and num_bytes fields, and btrfs_submit_compressed_read()
+derives cb->start = em->start - em->offset from them rather than
+em->ram_bytes.  If offset + num_bytes exceeds ram_bytes,
+validate_extent_map() hits ASSERT(0) on CONFIG_BTRFS_DEBUG=y builds, and on
+non-debug builds u32 bvec_offset in zstd_map_dest() can still wrap 32 bits
+and trigger ASSERT(off < bvec.bv_len) or an out-of-bounds kmap write.
+
+> +	} else {
+> +		max_disk_num_bytes = U32_MAX;
+> +	}
+> +	if (unlikely(btrfs_file_extent_disk_num_bytes(leaf, fi) > max_disk_num_bytes)) {
+> +		file_extent_err(leaf, slot,
+> +		"invalid disk_num_bytes for file extent, have %llu expect <= %u",
+> +				btrfs_file_extent_disk_num_bytes(leaf, fi),
+> +				max_disk_num_bytes);
+> +		return -EUCLEAN;
+> +	}
+
+[Severity: Medium]
+Can a non-hole file extent with disk_bytenr != 0 and disk_num_bytes == 0
+still pass check_extent_data_item()?
+
+IS_ALIGNED(0, sectorsize) is true and this check only enforces an upper
+bound.  Because btrfs_extent_item_to_extent_map() only treats disk_bytenr ==
+0 as EXTENT_MAP_HOLE, a compressed extent with disk_bytenr != 0 and
+disk_num_bytes == 0 creates a non-hole extent_map with em->disk_num_bytes ==
+0, which causes btrfs_submit_compressed_read() to submit an empty bio and
+hit the same length != 0 assertion in assert_bbio_alignment(), or causes
+btrfs_encoded_read_regular() to allocate ZERO_SIZE_PTR for pages and
+dereference pages[0].
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261117023841.467366-1-teel4res@gmail.com?part=1
+

@@ -1,0 +1,159 @@
+From sashiko-bot@kernel.org Tue Nov 17 21:59:56 2026
+Message-ID: <sashiko-outbox-219666@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v7 19/27] btrfs: zoned: factor out resetting a block
+ group in place
+Date: Tue, 17 Nov 2026 20:59:52 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: zoned: wrong space_info filter in
+  btrfs_reset_unused_block_groups()
+--
+
+commit ece2201f7242b9533ba11a34a2734f6d7866f968
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: factor out resetting a block group in place
+
+This commit factors the zone reset and space accounting logic out of
+btrfs_reset_unused_block_groups() into zoned_reset_bg_in_place().
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index cc96a47320e97..8532ef57db486 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -2972,6 +2972,72 @@ void btrfs_clear_data_reloc_bg(struct btrfs_block_group *bg)
+>  	spin_unlock(&fs_info->relocation_bg_lock);
+>  }
+>  
+> +static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+> +{
+> +	struct btrfs_fs_info *fs_info = bg->fs_info;
+> +	struct btrfs_space_info *space_info = bg->space_info;
+
+[ ... ]
+
+> +	bg->free_space_ctl->free_space += *reclaimed;
+> +	btrfs_space_info_update_bytes_zone_unusable(space_info, -*reclaimed);
+> +	spin_unlock(&bg->lock);
+> +	btrfs_return_free_space(space_info, *reclaimed);
+> +	spin_unlock(&space_info->lock);
+> +
+> +	return 0;
+> +}
+
+[ ... ]
+
+> @@ -3359,65 +3423,9 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		list_del_init(&bg->bg_list);
+>  		spin_unlock(&fs_info->unused_bgs_lock);
+>  
+> -		/*
+> -		 * Since the block group is fully zone_unusable and we cannot
+> -		 * allocate from this block group anymore, we don't need to set
+> -		 * this block group read-only.
+> -		 */
+> -
+> -		down_read(&fs_info->dev_replace.rwsem);
+> -		map = bg->physical_map;
+> -		for (int i = 0; i < map->num_stripes; i++) {
+> -			struct btrfs_io_stripe *stripe = &map->stripes[i];
+> -			unsigned int nofs_flags;
+> -
+> -			nofs_flags = memalloc_nofs_save();
+> -			ret = blkdev_zone_mgmt(stripe->dev->bdev, REQ_OP_ZONE_RESET,
+> -					       stripe->physical >> SECTOR_SHIFT,
+> -					       zone_size_sectors);
+> -			memalloc_nofs_restore(nofs_flags);
+> -
+> -			if (ret) {
+> -				up_read(&fs_info->dev_replace.rwsem);
+> -				goto requeue;
+> -			}
+> -		}
+> -		up_read(&fs_info->dev_replace.rwsem);
+> -
+> -		spin_lock(&space_info->lock);
+> -		spin_lock(&bg->lock);
+> -		ASSERT(!btrfs_is_block_group_used(bg));
+> -		if (bg->ro) {
+> -			spin_unlock(&bg->lock);
+> -			spin_unlock(&space_info->lock);
+> +		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+> +		if (ret || !reclaimed)
+>  			goto requeue;
+> -		}
+> -
+> -		reclaimed = bg->alloc_offset;
+> -		bg->zone_unusable = bg->length - bg->zone_capacity;
+> -		bg->alloc_offset = 0;
+> -		/*
+> -		 * The zone was just reset to empty, so alloc_offset went back to
+> -		 * the start of the zone. For metadata/system block groups the
+> -		 * write pointer must follow it back to the start of the zone;
+> -		 * otherwise it stays stale at the previous (finished) zone end,
+> -		 * and metadata written into the reused zone would sit behind the
+> -		 * write pointer, could never be written out in sequential order,
+> -		 * and would be stranded (pinning its folio) until unmount.
+> -		 */
+> -		if (bg->flags & (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM))
+> -			bg->meta_write_pointer = bg->start;
+> -		/*
+> -		 * This holds because we currently reset fully used then freed
+> -		 * block group.
+> -		 */
+> -		ASSERT(reclaimed == bg->zone_capacity,
+> -		       "reclaimed=%llu bg->zone_capacity=%llu", reclaimed, bg->zone_capacity);
+> -		bg->free_space_ctl->free_space += reclaimed;
+> -		btrfs_space_info_update_bytes_zone_unusable(space_info, -reclaimed);
+> -		spin_unlock(&bg->lock);
+> -		btrfs_return_free_space(space_info, reclaimed);
+> -		spin_unlock(&space_info->lock);
+>  
+>  		btrfs_put_block_group(bg);
+
+[Severity: Medium]
+Can btrfs_reset_unused_block_groups() deduct space reclaimed for a sibling
+space_info from the caller's num_bytes target and stop before freeing space
+in the requested space_info?
+
+Previously, btrfs_reset_unused_block_groups() updated bytes_zone_unusable
+and called btrfs_return_free_space() on the caller-passed space_info, while
+zoned_reset_bg_in_place() now uses bg->space_info.  On zoned filesystems,
+sub-group space_infos (BTRFS_SUB_GROUP_TREELOG under METADATA and
+BTRFS_SUB_GROUP_DATA_RELOC under DATA) share the same space_info->flags as
+their parent space_info and place unused block groups on the shared
+fs_info->unused_bgs list, where btrfs_reset_unused_block_groups() filters
+candidates only by BTRFS_BLOCK_GROUP_TYPE_MASK:
+
+fs/btrfs/zoned.c:btrfs_reset_unused_block_groups() {
+	...
+		list_for_each_entry(bg, &fs_info->unused_bgs, bg_list) {
+			if ((bg->flags & BTRFS_BLOCK_GROUP_TYPE_MASK) != space_info->flags)
+				continue;
+	...
+		ret = zoned_reset_bg_in_place(bg, &reclaimed);
+		if (ret || !reclaimed)
+			goto requeue;
+
+		btrfs_put_block_group(bg);
+
+		if (num_bytes <= reclaimed)
+			break;
+		num_bytes -= reclaimed;
+}
+
+When flushing a primary or sub-group space_info in the RESET_ZONES state
+hits an unused block group belonging to its sibling space_info, the
+reclaimed bytes are returned to bg->space_info, but subtracted from the
+caller's num_bytes.  The loop then exits early without granting tickets in
+the caller's space_info, which can cause premature -ENOSPC failures.
+
+Checking bg->space_info != space_info when scanning fs_info->unused_bgs
+would ensure only block groups belonging to the requested space_info are
+reset.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261117185850.4128157-1-johannes.thumshirn@wdc.com?part=19
+

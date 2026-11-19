@@ -1,0 +1,127 @@
+From sashiko-bot@kernel.org Mon Nov 16 14:04:53 2026
+Message-ID: <sashiko-outbox-217035@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: add missing unlikely tag to branches leading to
+ transaction aborts
+Date: Mon, 16 Nov 2026 13:04:47 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: inverted unlikely() on trans check in
+  move_existing_remap()
+It also noticed 2 related pre-existing issues this patch does not
+introduce:
+- [Medium] btrfs: unreleased delayed iref on error in
+  __btrfs_update_delayed_inode() [1]
+- [High] btrfs: unreleased path on copy_remapped_data() error in
+  move_existing_remap() [2]
+--
+
+commit f39c803f66158acbbdf70a2086e543edece60d7e
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: add missing unlikely tag to branches leading to transaction aborts
+
+This commit adds unlikely() annotations to error checks that lead to
+btrfs_abort_transaction() across several btrfs files.
+
+> diff --git a/fs/btrfs/delayed-inode.c b/fs/btrfs/delayed-inode.c
+> index 333ce8b524899..51b1f9a911fdc 100644
+> --- a/fs/btrfs/delayed-inode.c
+> +++ b/fs/btrfs/delayed-inode.c
+> @@ -1076,7 +1076,7 @@ static int __btrfs_update_delayed_inode(struct btrfs_trans_handle *trans,
+>  	 * in the same item doesn't exist.
+>  	 */
+>  	ret = btrfs_del_item(trans, root, path);
+> -	if (ret < 0)
+> +	if (unlikely(ret < 0))
+>  		btrfs_abort_transaction(trans, ret);
+>  out:
+>  	btrfs_release_delayed_iref(node);
+
+[Severity: Medium]
+This problem wasn't introduced by this patch, but does
+__btrfs_update_delayed_inode() skip btrfs_release_delayed_iref(node)
+[1] when btrfs_search_slot() fails earlier in this function?
+
+fs/btrfs/delayed-inode.c:__btrfs_update_delayed_inode() {
+    ...
+		ret = btrfs_search_slot(trans, root, &key, path, -1, 1);
+		if (unlikely(ret < 0)) {
+			btrfs_abort_transaction(trans, ret);
+			goto err_out;
+		}
+    ...
+out:
+	btrfs_release_delayed_iref(node);
+	btrfs_release_path(path);
+err_out:
+	btrfs_delayed_inode_release_metadata(fs_info, node, (ret < 0));
+	btrfs_release_delayed_inode(node);
+	return ret;
+}
+
+Jumping to err_out instead of out leaves node->count and
+delayed_root->items elevated after btrfs_release_delayed_inode() clears
+the dirty flag, leaking the delayed node on unmount if the inode was
+already evicted.
+
+[ ... ]
+
+> diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+> index 9af207446848d..fbab55d6404d5 100644
+> --- a/fs/btrfs/relocation.c
+> +++ b/fs/btrfs/relocation.c
+
+[ ... ]
+
+> @@ -4445,7 +4445,7 @@ static int move_existing_remap(struct btrfs_fs_info *fs_info,
+>  	if (unlikely(ret)) {
+>  		btrfs_free_reserved_extent(fs_info, dest_addr, dest_length, 0);
+>  
+> -		if (trans) {
+> +		if (unlikely(trans)) {
+>  			btrfs_abort_transaction(trans, ret);
+>  			btrfs_end_transaction(trans);
+>  		}
+
+[Severity: Low]
+Should if (trans) be left without unlikely() here, as done in
+walk_down_log_tree() and free_log_tree() in this patch?
+
+The outer if (unlikely(ret)) already marks the error path as unlikely, and
+inside it trans is non-NULL for every error after btrfs_join_transaction().
+
+[Severity: High]
+This problem wasn't introduced by this patch, but does
+move_existing_remap() jump to end with path still write-locked [2]
+when copy_remapped_data() fails?
+
+fs/btrfs/relocation.c:move_existing_remap() {
+    ...
+	ret = btrfs_search_slot(trans, fs_info->remap_root, &key, path, 0, 1);
+	if (ret == 1) {
+		btrfs_release_path(path);
+		ret = 0;
+		goto end;
+	} else if (unlikely(ret)) {
+		goto end;
+	}
+
+	ret = copy_remapped_data(fs_info, new_addr, dest_addr, dest_length);
+	if (unlikely(ret))
+		goto end;
+    ...
+}
+
+When btrfs_search_slot() returns 0, path holds a write lock on the leaf in
+fs_info->remap_root.  If copy_remapped_data() fails, jumping to end without
+calling btrfs_release_path(path) leaves the leaf write-locked across
+btrfs_free_reserved_extent() and btrfs_end_transaction().
+
+[1] https://sashiko.dev/#/bug/linux-3520c6eb-7928-477d-b369-9caff2b98d10
+[2] https://sashiko.dev/#/bug/linux-a9bb6565-ee24-429b-a2d7-ab427317fa57
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/df971dad64e73d71fe7e9bd9188efe5f22e9bea4.1794833257.git.fdmanana@suse.com?part=1
+

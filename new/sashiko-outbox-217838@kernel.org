@@ -1,0 +1,156 @@
+From sashiko-bot@kernel.org Tue Nov 17 00:02:58 2026
+Message-ID: <sashiko-outbox-217838@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 4/8] btrfs: add a helper to scan all block devices
+Date: Mon, 16 Nov 2026 23:02:50 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [High] btrfs: modpost failure in btrfs_scan_all_devices() on
+  unexported block_class
+- [Medium] btrfs: race in btrfs_can_scan_disk() with
+  disk_scan_partitions()
+- [Low] btrfs: untranslated '!' in /dev path in btrfs_scan_all_devices()
+--
+
+commit 15c0411d79a2815d379039a7bb8a1e289efffb76
+Author: Ismael Luceno <ismael@iodev.co.uk>
+
+btrfs: add a helper to scan all block devices
+
+This commit adds btrfs_scan_all_devices() and btrfs_can_scan_disk() under
+CONFIG_BTRFS_ROOT_SCAN to iterate over block devices and pass candidates to
+btrfs_scan_one_device().
+
+> diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+> index 3d4ef6725de0e..143c052e460bb 100644
+> --- a/fs/btrfs/volumes.c
+> +++ b/fs/btrfs/volumes.c
+> @@ -1531,6 +1531,85 @@ struct btrfs_device *btrfs_scan_one_device(const char *path,
+>  	return device;
+>  }
+>  
+> +#ifdef CONFIG_BTRFS_ROOT_SCAN
+> +/*
+> + * Return true if @disk is worth handing to btrfs_scan_one_device().
+> + *
+> + * A partition always is.  A whole disk only is when it carries no partition
+> + * table: if it does, the first partition may well have a signature in the
+> + * area btrfs reads from, and picking the disk up as a btrfs device would be
+> + * wrong.
+> + */
+> +static bool btrfs_can_scan_disk(struct gendisk *disk, struct block_device *bdev)
+> +{
+> +	struct block_device *part;
+> +	unsigned long idx;
+> +
+> +	if (!get_capacity(disk) || (disk->flags & GENHD_FL_HIDDEN))
+> +		return false;
+> +	if (bdev_is_partition(bdev))
+> +		return true;
+> +
+> +	rcu_read_lock();
+> +	xa_for_each_start(&disk->part_tbl, idx, part, 1) {
+> +		if (bdev_nr_sectors(part)) {
+> +			rcu_read_unlock();
+> +			return false;
+> +		}
+> +	}
+> +	rcu_read_unlock();
+> +
+> +	return true;
+> +}
+
+[Severity: Medium]
+Can btrfs_can_scan_disk() race with disk registration and approve a
+partitioned whole disk before its partitions have been scanned?
+
+In __add_disk(), device_add() publishes the disk on block_class before
+add_disk_final() calls disk_scan_partitions() and sets GD_ADDED:
+
+CPU0                              CPU1
+__add_disk()
+  device_add(ddev)
+  add_disk_final()
+    bdev_add(disk->part0, ...)
+    disk_scan_partitions()
+      ...
+                                  btrfs_scan_all_devices()
+                                    btrfs_can_scan_disk(disk, bdev)
+                                      xa_for_each_start(&disk->part_tbl, ...)
+                                      --> sees empty part_tbl, returns true
+                                    btrfs_scan_one_device()
+      add_partition()
+    set_bit(GD_ADDED, &disk->state)
+
+While check_partition() is doing synchronous I/O to read the partition
+table, disk->part_tbl is still empty, so btrfs_can_scan_disk() returns true
+for the whole disk.  btrfs_scan_one_device() then waits on disk->open_mutex
+and scans the whole disk once disk_scan_partitions() finishes, registering
+the whole disk instead of the partition if a btrfs superblock sits at
+64 KiB (or failing with -ENXIO if opened between device_add() and
+bdev_add()).  Checking test_bit(GD_ADDED, &disk->state) in
+btrfs_can_scan_disk() would skip disks that have not finished registration.
+
+> +
+> +/*
+> + * Register every block device that holds a btrfs superblock.
+> + *
+> + * This is the kernel side of the device scanner userspace normally drives with
+> + * the BTRFS_IOC_SCAN_DEV ioctl.  It exists for the case where there is no
+> + * userspace around to do it, e.g. a multi-device root filesystem mounted
+> + * without an initrd.
+> + *
+> + * Devices are opened by their /dev name, which is what the rest of btrfs
+> + * records in device->name.
+> + */
+> +void btrfs_scan_all_devices(void)
+> +{
+> +	struct class_dev_iter iter;
+> +	struct device *dev;
+> +
+> +	lockdep_assert_held(&uuid_mutex);
+> +
+> +	/*
+> +	 * Every block device, not just whole disks: partitions are registered
+> +	 * with part_type rather than disk_type, and a btrfs filesystem usually
+> +	 * lives on one, so a type filter here would skip exactly the devices
+> +	 * we are looking for.  A disk that has partitions is filtered out by
+> +	 * btrfs_can_scan_disk() below, which can say why.
+> +	 */
+> +	class_dev_iter_init(&iter, &block_class, NULL, NULL);
+
+[Severity: High]
+Does referencing block_class here break the build when CONFIG_BTRFS_FS=m
+and CONFIG_BTRFS_ROOT_SCAN=y?
+
+block_class in block/genhd.c is not exported with EXPORT_SYMBOL_GPL(), so
+linking fs/btrfs/volumes.o into btrfs.ko fails at modpost with an undefined
+symbol error for block_class.
+
+> +	while ((dev = class_dev_iter_next(&iter))) {
+> +		struct gendisk *disk = dev_to_disk(dev);
+> +		struct block_device *bdev = dev_to_bdev(dev);
+> +
+> +		if (btrfs_can_scan_disk(disk, bdev)) {
+> +			/* Longest is "/dev/" plus a BDEVNAME_SIZE name. */
+> +			char path[sizeof("/dev/") + BDEVNAME_SIZE];
+> +			struct btrfs_device *device;
+> +
+> +			snprintf(path, sizeof(path), "/dev/%s", dev_name(dev));
+
+[Severity: Low]
+Will formatting path with dev_name(dev) fail to open block devices whose
+names contain '/' or use a custom devnode callback?
+
+When a block driver uses '/' in disk->disk_name (such as cciss, ida, or
+aoe), kobject_set_name_vargs() replaces '/' with '!' in dev_name(dev),
+whereas devtmpfs_create_node() calls device_get_devnode() to translate '!'
+back to '/' when creating the node under /dev.  Using dev_name(dev)
+directly produces a path with '!' that fails in btrfs_scan_one_device()
+with -ENOENT; using "/dev/%pg" with bdev (or device_get_devnode()) matches
+the devtmpfs path.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261116224316.11237-10-ismael@iodev.co.uk?part=4
+

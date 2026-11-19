@@ -1,0 +1,50 @@
+From sashiko-bot@kernel.org Mon Nov 16 23:50:57 2026
+Message-ID: <sashiko-outbox-217815@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 1/8] btrfs: add config options for the root device scan
+Date: Mon, 16 Nov 2026 22:50:51 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: Kconfig: BTRFS_ROOT_SCAN allows BTRFS_FS=m and selects
+  DEVTMPFS
+--
+
+commit 0acf11cd7feee68d707a45e46989d2e337898f2c
+Author: Ismael Luceno <ismael@iodev.co.uk>
+
+btrfs: add config options for the root device scan
+
+This commit adds the BTRFS_ROOT_SCAN and BTRFS_ROOT_SCAN_INTERVAL_MS
+Kconfig options to configure scanning block devices for a multi-device
+btrfs root filesystem without an initrd.
+
+> diff --git a/fs/btrfs/Kconfig b/fs/btrfs/Kconfig
+> index 0b8d8905e38e2..8c7e7a2f59f37 100644
+> --- a/fs/btrfs/Kconfig
+> +++ b/fs/btrfs/Kconfig
+> @@ -83,6 +83,31 @@ config BTRFS_ASSERT
+>  
+>  	  If unsure, say N.
+>  
+> +config BTRFS_ROOT_SCAN
+> +	bool "Btrfs multi-device root scan support"
+> +	select DEVTMPFS
+> +	depends on BTRFS_FS
+> +	default y
+
+[Severity: Medium]
+Should BTRFS_ROOT_SCAN depend on BTRFS_FS=y && DEVTMPFS instead of
+allowing BTRFS_FS=m and selecting DEVTMPFS?
+
+BTRFS_FS is tristate, so default y enables BTRFS_ROOT_SCAN even when
+btrfs is built as a module, where mounting a root filesystem without an
+initrd is not possible and later patches in this series fail to link
+btrfs.ko due to unexported symbols (root_wait, is_root_dev() and
+block_class).  In addition, DEVTMPFS is a user-visible option in
+drivers/base/Kconfig, so force-selecting it by default enables devtmpfs
+and spawns kdevtmpfs whenever btrfs is enabled.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261116224316.11237-10-ismael@iodev.co.uk?part=1
+
