@@ -1,0 +1,102 @@
+From sashiko-bot@kernel.org Wed Nov 25 11:46:59 2026
+Message-ID: <sashiko-outbox-233161@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8 18/27] btrfs: zoned: don't account superblock zones
+ as available data space
+Date: Wed, 25 Nov 2026 10:46:56 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: dereference of zinfo before NULL check in
+  btrfs_zoned_dev_avail_bytes()
+- [Medium] btrfs: unlocked double read of bytes_used in
+  btrfs_zoned_dev_avail_bytes()
+--
+
+commit 3fb8fdc18844807fb355fb934b3aea5751dfe448
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't account superblock zones as available data space
+
+This commit introduces btrfs_zoned_dev_avail_bytes() to exclude the zones
+reserved for the log-structured superblock when calculating available data
+space on a zoned filesystem.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index bd3e9203a6507..7a70cb30b358a 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -968,6 +968,54 @@ static inline bool is_sb_log_zone(struct btrfs_zoned_device_info *zinfo,
+>  	return true;
+>  }
+>  
+> +u64 btrfs_zoned_dev_avail_bytes(struct btrfs_device *device, u64 avail)
+> +{
+> +	struct btrfs_zoned_device_info *zinfo = device->zone_info;
+> +	const u64 total = round_down(btrfs_device_get_total_bytes(device),
+> +				     zinfo->zone_size);
+> +	const u64 total_zones = total >> zinfo->zone_size_shift;
+> +	u32 excluded_zones[BTRFS_SUPER_MIRROR_MAX * (BTRFS_NR_SB_LOG_ZONES + 1)];
+> +	int nr_excluded = 0;
+> +	u64 sb_bytes = 0;
+> +
+> +	if (!zinfo || device->bytes_used >= total)
+> +		return 0;
+
+[Severity: Medium]
+Can zinfo be dereferenced before the NULL check here?  Initializing total
+and total_zones reads zinfo->zone_size and zinfo->zone_size_shift before
+checking !zinfo, causing a NULL pointer dereference if device->zone_info is
+NULL and allowing the compiler to optimize away the check.
+
+> +
+> +	for (int i = 0; i < BTRFS_SUPER_MIRROR_MAX; i++) {
+> +		const u32 sb_zone = sb_zone_number(zinfo->zone_size_shift, i);
+> +		const u32 reg_zone = btrfs_sb_offset(i) >> zinfo->zone_size_shift;
+> +
+> +		for (int j = 0; j < BTRFS_NR_SB_LOG_ZONES; j++) {
+> +			u32 zone = sb_zone + j;
+> +
+> +			if (zone < total_zones)
+> +				excluded_zones[nr_excluded++] = zone;
+> +		}
+> +
+> +		if (reg_zone < total_zones)
+> +			excluded_zones[nr_excluded++] = reg_zone;
+> +	}
+> +
+> +	for (int i = 0; i < nr_excluded; i++) {
+> +		bool dup = false;
+> +
+> +		for (int j = 0; j < i; j++) {
+> +			if (excluded_zones[j] == excluded_zones[i]) {
+> +				dup = true;
+> +				break;
+> +			}
+> +		}
+> +		if (!dup)
+> +			sb_bytes += zinfo->zone_size;
+> +	}
+> +
+> +	avail = total - device->bytes_used;
+> +	if (avail <= sb_bytes)
+> +		return 0;
+> +
+> +	return avail - sb_bytes;
+> +}
+
+[Severity: Medium]
+Can total - device->bytes_used underflow when device->bytes_used is read a
+second time without chunk_mutex?
+
+btrfs_calc_avail_data_space() calls btrfs_zoned_dev_avail_bytes() under
+rcu_read_lock() without holding chunk_mutex.  Because device->bytes_used is
+read twice directly (bypassing btrfs_device_get_bytes_used()), a concurrent
+chunk allocation in btrfs_create_chunk() can increase device->bytes_used
+past total between the initial check and the subtraction, wrapping avail
+near U64_MAX and reporting bogus free space via statfs().  In addition,
+overwriting avail discards the value passed in by the caller.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261125102956.266389-1-johannes.thumshirn@wdc.com?part=18
+

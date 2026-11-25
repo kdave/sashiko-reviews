@@ -1,0 +1,42 @@
+From sashiko-bot@kernel.org Fri Nov 20 10:46:38 2026
+Message-ID: <sashiko-outbox-224879@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/3] btrfs: qgroup: handle the transaction commit
+ error during rescan
+Date: Fri, 20 Nov 2026 09:46:36 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: missing Fixes: trailer for unchecked
+  btrfs_commit_transaction() in btrfs_qgroup_rescan_worker()
+--
+
+commit c5788e372045cb7a0f5e6980a20b9ad839fabd14
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: qgroup: handle the transaction commit error during rescan
+>
+> After qgroup_rescan_leaf() return 1, meaning it has done the scanning,
+> btrfs_qgroup_rescan_worker() will call btrfs_commit_transaction() to
+> update the qgroup infos.
+>
+> But if that btrfs_commit_transaction() failed, @ret is still 1, which
+> will treat the rescan as ended successfully, clearing the INCONSISTENT
+> flag.
+>
+> Fix the error handling by also check the return value of
+> btrfs_commit_transaction(). If that failed, update @ret to the error
+> code so we treat the rescan as failed.
+>
+> Link: https://sashiko.dev/#/bug/linux-b578ca93-4f5a-4a46-9dfc-71c1ac9af095
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+This fixes the unchecked btrfs_commit_transaction() call in
+btrfs_qgroup_rescan_worker().  Should this include:
+
+  Fixes: 2f2320360b0c ("Btrfs: rescan for qgroups")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795167390.git.wqu@suse.com?part=1
+

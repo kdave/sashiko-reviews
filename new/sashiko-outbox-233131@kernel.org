@@ -1,0 +1,81 @@
+From sashiko-bot@kernel.org Wed Nov 25 11:34:30 2026
+Message-ID: <sashiko-outbox-233131@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 3/4] btrfs: zoned: remove obsolete non-data block
+ group activation helper
+Date: Wed, 25 Nov 2026 10:34:27 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: zoned: missing Fixes trailer for ro_block_group_mutex
+  deadlock fix
+--
+
+commit bf0c5232d51f9c01b49bfa3b60b516dfd3ecb9c6
+Author: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+> btrfs: zoned: remove obsolete non-data block group activation helper
+>
+> On an HC620 with max_active_zones=128, file writes occupied all 128
+> active-zone slots. With four direct-I/O writers still running, starting
+> a balance with
+>
+>   btrfs balance start -f -dusage=0 -musage=0 -susage=100 <mountpoint>
+>
+> left the balance task blocked in D state. SysRq-w reported:
+>
+>   task:btrfs           state:D stack:0     pid:8145
+>   Call Trace:
+>    <TASK>
+>    __schedule+0x50e/0xfe0
+>    schedule+0x22/0xa0
+>    schedule_preempt_disabled+0x10/0x20
+>    __mutex_lock.constprop.0+0x380/0x920
+>    btrfs_inc_block_group_ro+0x6a/0x270 [btrfs]
+>    do_zone_finish+0x2b6/0x4c0 [btrfs]
+>    btrfs_zone_finish_one_bg+0x184/0x1f0 [btrfs]
+>    btrfs_zoned_activate_one_bg+0x189/0x1d0 [btrfs]
+>    reserve_chunk_space+0xdb/0x180 [btrfs]
+>    btrfs_inc_block_group_ro+0x252/0x270 [btrfs]
+>    btrfs_relocate_block_group+0xc2/0x2260 [btrfs]
+>    btrfs_relocate_chunk+0x39/0x1c0 [btrfs]
+>    btrfs_balance+0x911/0x1810 [btrfs]
+>    </TASK>
+>
+> The blocked balance task also stalls transaction commit and data writers,
+> so the filesystem can no longer make write progress or unmount cleanly.
+>
+> This happens because the outer btrfs_inc_block_group_ro() holds
+> ro_block_group_mutex while reserve_chunk_space() tries to activate a
+> system block group. When no active-zone slot is available,
+> btrfs_zoned_activate_one_bg() starts finishing a partially written data
+> block group.
+>
+> do_zone_finish() then enters btrfs_inc_block_group_ro() again. The same
+> task waits for ro_block_group_mutex that it already holds and
+> self-deadlocks.
+>
+> These allocation-time activation calls were needed for
+> active_total_bytes accounting, which has been removed. Metadata and
+> system block groups can instead be activated during writeback.
+>
+> Remove both calls and the unused helper. This avoids recursively
+> entering btrfs_inc_block_group_ro() while holding ro_block_group_mutex
+> and leaves activation to the writeback path, where normal metadata
+> and system block group switching is handled.
+>
+> Assisted-by: LLM
+> Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+> Tested-by: Jochen Philipp <a2jphilipp@gmail.com>
+> Signed-off-by: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+[Severity: Low]
+Since this fixes the ro_block_group_mutex self-deadlock introduced by the
+btrfs_zoned_activate_one_bg() calls in btrfs_inc_block_group_ro() and
+reserve_chunk_space(), should it include:
+
+  Fixes: b6a98021e401 ("btrfs: zoned: activate necessary block group")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795600611.git.zhudongjiang@fygo.io?part=3
+

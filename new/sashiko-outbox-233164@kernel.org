@@ -1,0 +1,73 @@
+From sashiko-bot@kernel.org Wed Nov 25 11:47:59 2026
+Message-ID: <sashiko-outbox-233164@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8 01/27] btrfs: zoned: don't wait for a zone finish
+ after a filesystem error
+Date: Wed, 25 Nov 2026 10:47:55 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: zoned: double unlock of locked_folio on cow_file_range()
+  error
+--
+
+commit 7f1f0652a6e839fd4d62f725ddadbd9da4a80563
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't wait for a zone finish after a filesystem error
+
+This commit clears and wakes waiters on BTRFS_FS_NEED_ZONE_FINISH when a
+filesystem error or emergency shutdown occurs, and makes cow_file_range()
+and btrfs_new_extent_direct() bail out with the recorded error after
+waiting.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 40dd87276cc9c..730a72f1cb646 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -1409,6 +1409,9 @@ static noinline int cow_file_range(struct btrfs_inode *inode,
+>  				wait_on_bit_io(&inode->root->fs_info->flags,
+>  					       BTRFS_FS_NEED_ZONE_FINISH,
+>  					       TASK_UNINTERRUPTIBLE);
+> +				ret = BTRFS_FS_ERROR(fs_info);
+> +				if (unlikely(ret))
+> +					goto out_unlock;
+>  				continue;
+>  			}
+>  			if (done_offset) {
+
+[Severity: High]
+Can this cause a double unlock of locked_folio when cow_file_range()
+fails on the second or later iteration of run_delalloc_cow()?
+
+fs/btrfs/inode.c:run_delalloc_cow() {
+	while (start <= end) {
+		ret = cow_file_range(inode, locked_folio, start, end,
+				     &done_offset, COW_FILE_RANGE_KEEP_LOCKED);
+		if (ret)
+			return ret;
+		extent_write_locked_range(&inode->vfs_inode, locked_folio,
+					  start, done_offset, wbc);
+		start = done_offset + 1;
+	}
+}
+
+If the first cow_file_range() call makes partial progress before running
+out of active zones, it returns 0 with done_offset < end, and
+extent_write_locked_range() calls btrfs_folio_end_lock() on locked_folio
+for [start, done_offset].  On the next iteration of run_delalloc_cow(),
+start == orig_start inside cow_file_range(), so -EAGAIN waits on
+BTRFS_FS_NEED_ZONE_FINISH.
+
+If that wait wakes on a filesystem error and cow_file_range() returns a
+negative error via out_unlock (which leaves locked_folio untouched),
+run_delalloc_cow() propagates the error to extent_writepage() or
+submit_uncompressed_range().  Both callers assume locked_folio is still
+locked across the entire initial range on error and unlock it again via
+btrfs_folio_end_lock_bitmap() or btrfs_folio_end_lock(), triggering
+VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio) or underflowing
+bfs->nr_locked in subpage mode and leaking the folio lock.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261125102956.266389-1-johannes.thumshirn@wdc.com?part=1
+

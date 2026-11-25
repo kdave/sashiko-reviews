@@ -1,0 +1,44 @@
+From sashiko-bot@kernel.org Mon Nov 23 21:53:32 2026
+Message-ID: <sashiko-outbox-230033@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 1/2] btrfs: reject too high tree level during backref
+ walk
+Date: Mon, 23 Nov 2026 20:53:27 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: typo in error message in handle_indirect_tree_backref()
+--
+
+commit ed875612015be8b5b4540536582334dd28b4f6cf
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: reject too high tree level during backref walk
+
+This commit rejects parent tree levels >= BTRFS_MAX_LEVEL in
+handle_indirect_tree_backref() before calling btrfs_search_slot() to avoid
+out-of-bounds accesses on path->slots[] and path->nodes[].
+
+Link: https://sashiko.dev/#/bug/linux-8a4f92b4-daf7-4f57-8369-8e6ef323652f
+
+> diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+> index a0fb90b7a9ed1..e9434e0333723 100644
+> --- a/fs/btrfs/backref.c
+> +++ b/fs/btrfs/backref.c
+> @@ -3316,6 +3316,11 @@ static int handle_indirect_tree_backref(struct btrfs_trans_handle *trans,
+>  	}
+>  
+>  	level = cur->level + 1;
+> +	if (unlikely(level >= BTRFS_MAX_LEVEL)) {
+> +		btrfs_put_root(root);
+> +		btrfs_err(fs_info, "invalid searcch level %d", level);
+> +		return -EUCLEAN;
+> +	}
+
+[Severity: Low]
+This isn't a bug, but there is a typo in the error message ("searcch"
+instead of "search").
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795466145.git.wqu@suse.com?part=1
+

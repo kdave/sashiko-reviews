@@ -1,0 +1,136 @@
+From sashiko-bot@kernel.org Sun Nov 22 20:09:26 2026
+Message-ID: <sashiko-outbox-228224@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [BUG] btrfs: interrupted subvolume drop resets drop_progress to
+ 0, next mount aborts with "has 0 references" (-117)
+Date: Sun, 22 Nov 2026 19:09:23 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [High] btrfs: missing Signed-off-by trailer in commit message
+- [Low] btrfs: missing Fixes trailer in btrfs_drop_snapshot() fix
+- [Low] btrfs: raw email formatting and incomplete sentence in commit
+  message
+--
+
+commit 2f2d9df734bb71620f130925d00c9262c3ca32d4
+Author: Markus Kern <markus.kern1@gmx.at>
+
+> btrfs: interrupted subvolume drop resets drop_progress to 0, next mount aborts with "has 0 references" (-117)
+>
+> Hello btrfs kernel team,
+>
+> Impact:
+> after an interrupted drop of a deleted subvolume, every later rw mount
+> aborts the transaction (-117) and forces the fs read-only; it cannot be
+> used rw anymore and btrfs check reports ~1000 extent ref errors (all on
+> the deleted subvolume; remaining data readable ro). Hit twice in the
+> field by a bare-metal restore tool, i.e. a freshly restored system is
+> unusable.
+> Plain userspace sequence, no fault injection needed; current master is
+> affected.
+>
+> Details:
+> A resumed snapshot/subvolume drop can write drop_progress = 0 /
+> drop_level = 0 back to the root item after earlier runs already dropped
+> the leftmost subtrees. If the snapshot sharing those subtrees COWs them
+> before the next resume, the drop restarts at slot 0, finds a block with
+> 0 references and aborts the transaction (-EUCLEAN). Seen in the wild
+> after bare-metal restores (btrfs receive -> rw snapshot -> delete
+> received subvol -> short mount/umount cycles -> writes), reproduced on
+> 6.12.100 (Debian), 6.19.10 and 7.2.13 (Fedora), code unchanged in
+> current master. Downstream report with forensics:
+> https://bugzilla.redhat.com/show_bug.cgi?id=2496404
+>
+> Cause: in btrfs_drop_snapshot(), the resume branch (drop_progress != 0)
+> only seeds wc->update_progress. wc->drop_progress / wc->drop_level stay
+> zero from kzalloc. The loop does
+>
+> if (wc->stage == DROP_REFERENCE) { set wc->drop_level / wc->drop_progress }
+> btrfs_cpu_key_to_disk(&root_item->drop_progress, &wc->drop_progress);
+> btrfs_set_root_drop_level(root_item, wc->drop_level);
+> if (btrfs_should_end_transaction(trans) ||
+> btrfs_need_cleaner_sleep(fs_info))
+>         btrfs_update_root(...);   /* and -EAGAIN when closing */
+>
+> When the resumed walk first descends into a shared node, the first
+> iteration ends in UPDATE_BACKREF, zeros are copied into the root item
+> and, if the fs is unmounted at that moment (btrfs_need_cleaner_sleep()
+> true while closing), committed. kprobe on btrfs_update_root after a
+> resume with saved progress (5421 INODE_ITEM 0) level 2:
+> btrfs_drop_snapshot rootid=256 (resume) btrfs_update_root rootid=256
+> dp=0 dlvl=0 <-- first write after resume btrfs_update_root rootid=256
+> dp=16032 dlvl=2
+>
+> On the next resume check_ref_exists() would skip already dropped blocks,
+> but if they were freed by COW from the sharing snapshot,
+> btrfs_lookup_extent_info() returns refs 0 and do_walk_down() returns
+> -EUCLEAN first.
+>
+> Reproducer (btrfs-drop-resume-repro.sh attached, self-contained, two
+> loop images): mkfs.btrfs -n 4096; receive a large (~1.5M files)
+> subvolume; snapshot it rw; delete the received subvolume; umount mount
+> -o commit=1; sleep 3; umount # drop runs, progress saved (level 3)
+> mount; umount # resume interrupted -> drop_progress 0 on disk mount;
+> touch many files in the snapshot; umount mount # "bytenr X has 0
+> references, expect > 0", abort -117 Results: 7.2.13-200.fc44 (untainted,
+> QEMU): 3/3 drop_progress reset to 0, 0/3 aborts same, target behind
+> dm-delay 1 ms: 2/2 drop_progress reset to 0, 2/2 aborts 6.19.10-300.fc44
+> (SATA SSD, no delay): reset + abort in the first iteration same
+> sequence, fixed module: 4/4 clean, progress kept, drop completes Debian
+> 6.12.100 in QEMU (throttled disk): stock aborts, fixed build 60 cycles
+> clean The reset happens reliably; the abort additionally needs the COW
+> in the snapshot to free the already dropped nodes before the resumed
+> drop skips past them, so slow storage makes it likely.
+>
+> Splat (7.2.13, dm-delay run, trimmed): WARNING:
+> fs/btrfs/extent-tree.c:223 at btrfs_lookup_extent_info+0x505/0x530,
+> CPU#6: btrfs-cleaner/100182 CPU: 6 UID: 0 PID: 100182 Comm:
+> btrfs-cleaner Not tainted 7.2.13-200.fc44.x86_64 #1 PREEMPT(lazy) Call
+> Trace: do_walk_down+0x182/0x7d0 walk_down_tree+0xc5/0x170
+> btrfs_drop_snapshot+0x24d/0xdc0
+> btrfs_clean_one_deleted_snapshot+0xce/0x160 cleaner_kthread+0x91/0x1b0
+> kthread+0xe4/0x120 ret_from_fork+0x1a1/0x270 ret_from_fork_asm+0x1a/0x30
+> BTRFS error (device dm-0): bytenr 2293555200 has 0 references, expect >
+> 0 WARNING: fs/btrfs/extent-tree.c:6385 at
+> btrfs_drop_snapshot+0x760/0xdc0, CPU#6: btrfs-cleaner/100182 BTRFS error
+> (device dm-0 state A): Transaction 25 aborted (error -117) BTRFS: error
+> (device dm-0 state A) in btrfs_drop_snapshot:6385: errno=-117 Filesystem
+> corrupted BTRFS info (device dm-0 state EA): forced readonly
+>
+> Field validation: a vendor recovery image (Debian 6.12.100) with only
+> btrfs.ko rebuilt with the fix below was used for a real bare-metal
+> restore of the affected machine (~500 GB, same sequence, 6 mount/umount
+> cycles at the end). drop_progress stayed at (387120 INODE_ITEM 0) level
+> 2 across those remounts, btrfs check was clean, the drop completed and
+> the system boots. With the stock module the same restore procedure
+> corrupted the filesystem twice.
+>
+> Proposed fix (tested as above; also attached as
+> btrfs-seed-drop-progress-on-resume.patch, made against 6.19, code
+> identical in master):
+
+[Severity: High]
+The commit message is missing a Signed-off-by trailer, which is required
+under Documentation/process/submitting-patches.rst before a patch can be
+merged.
+
+[Severity: Low]
+Since this fixes the uninitialized wc->drop_progress and wc->drop_level
+fields when resuming an interrupted drop in btrfs_drop_snapshot(), should
+it include:
+
+  Fixes: aea6f028d01d ("btrfs: save drop_progress if we drop refs at all")
+
+[Severity: Low]
+This isn't a bug, but the commit message is formatted as a raw bug-report
+email: it begins with a salutation ("Hello btrfs kernel team,"), ends with
+an incomplete sentence referring to email attachments
+(btrfs-drop-resume-repro.sh and btrfs-seed-drop-progress-on-resume.patch),
+and collapses the multi-line reproducer commands, kprobe output, and call
+trace into reflowed single-line paragraphs. Could this be cleaned up into
+a standard kernel changelog?
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/04c9933a-ec63-4d97-94b7-6b6e406b7328@gmx.at?part=1
+

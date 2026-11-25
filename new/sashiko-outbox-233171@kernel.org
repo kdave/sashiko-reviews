@@ -1,0 +1,82 @@
+From sashiko-bot@kernel.org Wed Nov 25 11:51:43 2026
+Message-ID: <sashiko-outbox-233171@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 1/4] btrfs: zoned: track only sequential zones as
+ active
+Date: Wed, 25 Nov 2026 10:51:40 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: zoned: prepare_allocation_zoned() skips conventional
+  data BGs
+--
+
+commit 45f8ff214f2c9fed1e0aabeae0d6ece707daea4c
+Author: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+btrfs: zoned: track only sequential zones as active
+
+This commit changes zoned active-zone tracking so that only block groups
+and device stripes backed by sequential zones are marked active and placed
+on fs_info->zone_active_bgs.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index e6ce6f05ad75d..3475e7785f58d 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -1980,7 +1980,6 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  		} else if (map->num_stripes == num_conventional) {
+>  			cache->alloc_offset = last_alloc;
+>  			cache->zone_capacity = cache->length;
+> -			set_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &cache->runtime_flags);
+>  			goto out;
+>  		}
+>  	}
+
+[ ... ]
+
+> @@ -2431,6 +2447,9 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+>  	if (unlikely(btrfs_is_testing(fs_info)))
+>  		return true;
+>  
+> +	if (!test_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &block_group->runtime_flags))
+> +		return true;
+
+[Severity: Medium]
+As reported by Naohiro Aota on v2 [1], does excluding conventional-only
+block groups from fs_info->zone_active_bgs prevent
+prepare_allocation_zoned() from selecting them as allocation hints?
+
+prepare_allocation_zoned() sets ffe_ctl->hint_byte for data allocations
+solely by scanning fs_info->zone_active_bgs:
+
+fs/btrfs/extent-tree.c:prepare_allocation_zoned() {
+    ...
+	spin_lock(&fs_info->zone_active_bgs_lock);
+	list_for_each_entry(block_group, &fs_info->zone_active_bgs, active_bg_list) {
+		u64 avail = block_group->zone_capacity - block_group->alloc_offset;
+
+		if (block_group_bits(block_group, ffe_ctl->flags) &&
+		    block_group->space_info == space_info &&
+		    avail >= ffe_ctl->num_bytes) {
+			ffe_ctl->hint_byte = block_group->start;
+			break;
+		}
+	}
+	spin_unlock(&fs_info->zone_active_bgs_lock);
+    ...
+}
+
+When an active sequential data block group has enough free space,
+prepare_allocation_zoned() will always point ffe_ctl->hint_byte to it and
+skip open conventional data block groups until all active sequential data
+block groups fill up.  When no sequential data block group satisfies the
+request, ffe_ctl->hint_byte stays 0 and find_free_extent() falls back from
+an rbtree lookup to a linear scan across space_info->block_groups[] on
+every data extent allocation.
+
+[1] https://lore.kernel.org/r/DL0AVDP5O9C2.1VT2TYQXCL4B4@wdc.com
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795600611.git.zhudongjiang@fygo.io?part=1
+

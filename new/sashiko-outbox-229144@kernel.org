@@ -1,0 +1,59 @@
+From sashiko-bot@kernel.org Mon Nov 23 12:31:33 2026
+Message-ID: <sashiko-outbox-229144@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/3] btrfs: use boolean type for struct
+ btrfs_device::dev_stats_valid
+Date: Mon, 23 Nov 2026 11:31:30 +0000
+
+Thank you for your contribution! Sashiko AI review found no new issues
+in this patch, but noticed 1 related pre-existing issue it does not
+introduce:
+- [Critical] btrfs: missing list_add_rcu() in
+  btrfs_init_dev_replace_tgtdev() [1]
+--
+
+commit 5caf2fa0cb04cf3afdb6c004086c9ba01a5e9ee1
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: use boolean type for struct btrfs_device::dev_stats_valid
+
+This commit changes the type of struct btrfs_device::dev_stats_valid from
+int to bool and updates its assignments to use true.
+
+> diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+> index 1961d615e97f9..64fc7e3098870 100644
+> --- a/fs/btrfs/dev-replace.c
+> +++ b/fs/btrfs/dev-replace.c
+> @@ -311,7 +311,7 @@ static int btrfs_init_dev_replace_tgtdev(struct btrfs_fs_info *fs_info,
+>  	set_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);
+>  	/* Check the comment in btrfs_init_new_device() for the reason. */
+>  	atomic_inc(&device->dev_stats_ccnt);
+> -	device->dev_stats_valid = 1;
+> +	device->dev_stats_valid = true;
+>  	device->fs_devices = fs_devices;
+>  
+>  	ret = btrfs_get_dev_zone_info(device, false);
+
+[Severity: Critical]
+This problem wasn't introduced by this patch, but right below this hunk
+should btrfs_init_dev_replace_tgtdev() use list_add_rcu() instead of
+list_add() when linking device->dev_list into fs_devices->devices [1]?
+
+fs/btrfs/dev-replace.c:btrfs_init_dev_replace_tgtdev() {
+	...
+	mutex_lock(&fs_devices->device_list_mutex);
+	list_add(&device->dev_list, &fs_devices->devices);
+	fs_devices->num_devices++;
+	...
+}
+
+Without list_add_rcu(), the list pointer updates can become visible before
+the initialization of struct btrfs_device completes, allowing concurrent RCU
+readers walking fs_devices->devices via list_for_each_entry_rcu() to observe
+uninitialized fields and trigger a NULL pointer dereference.
+
+[1] https://sashiko.dev/#/bug/linux-6abc56aa-eb75-4c57-a09f-41ab686f38bc
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795433118.git.fdmanana@suse.com?part=3
+

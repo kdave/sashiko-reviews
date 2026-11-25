@@ -1,0 +1,81 @@
+From sashiko-bot@kernel.org Thu Nov 19 22:50:58 2026
+Message-ID: <sashiko-outbox-224109@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/4] btrfs: zoned: take the RAID1 zone capacity from a
+ present stripe
+Date: Thu, 19 Nov 2026 21:50:56 +0000
+
+Thank you for your contribution! Sashiko AI review found no new issues
+in this patch, but noticed 1 related pre-existing issue it does not
+introduce:
+- [High] btrfs: active zone leak in btrfs_load_block_group_zone_info()
+  [1]
+--
+
+commit 765a5fff545020284a1deacbd931ce384fbb425d
+Author: Miroslav Cimerman <mc@raidlab.org>
+
+btrfs: zoned: take the RAID1 zone capacity from a present stripe
+
+This commit falls back to the remaining stripes when calculating the zone
+capacity of a RAID1C3 or RAID1C4 block group whose first two stripes are
+on missing devices.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 8bd44dd260a48..5722e16a5432e 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -1535,6 +1535,12 @@ static int btrfs_load_block_group_raid1(struct btrfs_block_group *bg,
+>  
+>  	/* In case a device is missing we have a cap of 0, so don't use it. */
+>  	bg->zone_capacity = min_not_zero(zone_info[0].capacity, zone_info[1].capacity);
+> +	/* RAID1C3 and RAID1C4 can miss both of them, take the others then. */
+> +	if (!bg->zone_capacity) {
+> +		for (i = 2; i < map->num_stripes; i++)
+> +			bg->zone_capacity = min_not_zero(bg->zone_capacity,
+> +							 zone_info[i].capacity);
+> +	}
+>  
+>  	/*
+>  	 * When the last extent is removed, last_alloc can be smaller than the other write
+
+[Severity: High]
+This problem wasn't introduced by this patch, but can
+btrfs_load_block_group_zone_info() leave cache linked on
+fs_info->zone_active_bgs with cache->physical_map set to NULL when post-load
+validation fails [1]?
+
+btrfs_load_block_group_raid1() and the other RAID loaders can call
+btrfs_zone_activate(), which increments the block group refcount and adds
+it to fs_info->zone_active_bgs.  If a later check in
+btrfs_load_block_group_zone_info() fails, such as cache->alloc_offset >
+cache->zone_capacity, the error path clears cache->physical_map without
+removing the block group from fs_info->zone_active_bgs:
+
+fs/btrfs/zoned.c:btrfs_load_block_group_zone_info() {
+    ...
+	if (unlikely(cache->alloc_offset > cache->zone_capacity)) {
+		...
+		ret = -EIO;
+	}
+	...
+	if (!ret) {
+		...
+	} else {
+		btrfs_free_chunk_map(cache->physical_map);
+		cache->physical_map = NULL;
+	}
+}
+
+When do_zone_finish() later walks fs_info->zone_active_bgs, it
+dereferences block_group->physical_map and hits a NULL pointer
+dereference.  In addition, if btrfs_zone_activate() fails mid-loop when
+btrfs_dev_set_active_zone() returns false, it returns without clearing the
+active zone reservations taken on earlier stripes in the loop, leaking
+active zone accounting on those devices.
+
+[1] https://sashiko.dev/#/bug/linux-ac307851-47b1-4a8f-bc62-c9d8fd0e870a
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261119213835.103131-1-mc@raidlab.org?part=3
+

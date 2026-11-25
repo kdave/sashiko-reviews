@@ -1,0 +1,100 @@
+From sashiko-bot@kernel.org Sun Nov 22 23:29:46 2026
+Message-ID: <sashiko-outbox-228410@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: remove btrfs_is_free_space_inode()
+Date: Sun, 22 Nov 2026 22:29:43 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: delayed tree_root free-space inode updates in
+  btrfs_update_inode()
+--
+
+commit 0e6e886b01a58a37142dc78b5a6ed2744e3f129b
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: remove btrfs_is_free_space_inode()
+
+This commit removes btrfs_is_free_space_inode() and the
+BTRFS_INODE_FREE_SPACE_INODE runtime flag along with their checks in
+inode initialization, file extent tree setup, inode updates, and
+eviction.
+
+> diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+> index 19b1eba2dd845..eee53088c0f5c 100644
+> --- a/fs/btrfs/inode.c
+> +++ b/fs/btrfs/inode.c
+> @@ -3931,8 +3931,6 @@ static int btrfs_init_file_extent_tree(struct btrfs_inode *inode)
+>  		return 0;
+>  	if (!S_ISREG(inode->vfs_inode.i_mode))
+>  		return 0;
+> -	if (btrfs_is_free_space_inode(inode))
+> -		return 0;
+>  
+>  	inode->file_extent_tree = kmalloc_obj(struct extent_io_tree);
+>  	if (!inode->file_extent_tree)
+> @@ -4288,14 +4286,9 @@ int btrfs_update_inode(struct btrfs_trans_handle *trans,
+>  	int ret;
+>  
+>  	/*
+> -	 * If the inode is a free space inode, we can deadlock during commit
+> -	 * if we put it into the delayed code.
+> -	 *
+> -	 * The data relocation inode should also be directly updated
+> -	 * without delay
+> +	 * The data relocation inode should be directly updated without delay.
+>  	 */
+> -	if (!btrfs_is_free_space_inode(inode)
+> -	    && !btrfs_is_data_reloc_root(root)
+> +	if (!btrfs_is_data_reloc_root(root)
+>  	    && !test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags)) {
+>  		btrfs_update_root_times(trans, root);
+
+[Severity: High]
+Can routing v1 free-space inode updates in fs_info->tree_root through
+btrfs_delayed_update_inode() cause premature -ENOSPC transaction aborts
+during v1 space cache cleanup or relocation?
+
+Although creating and loading v1 space caches is disabled, existing
+on-disk v1 free-space inodes in fs_info->tree_root are still updated via
+btrfs_update_inode() during mount cleanup and block group deletion or
+relocation:
+
+fs/btrfs/free-space-cache.c:btrfs_cleanup_free_space_cache_v1() {
+	trans = btrfs_start_transaction(fs_info->tree_root, 0);
+	...
+	for (node = rb_first_cached(&fs_info->block_group_cache_tree); node;
+	     node = rb_next(node)) {
+		...
+		ret = btrfs_remove_free_space_inode(trans, NULL, block_group);
+		if (unlikely(ret)) {
+			btrfs_abort_transaction(trans, ret);
+}
+
+Both btrfs_cleanup_free_space_cache_v1() and delete_block_group_cache()
+start or join a transaction with 0 reserved items (trans->block_rsv == NULL),
+relying on btrfs_update_inode_item() to update tree_root directly using
+tree_root->block_rsv (fs_info->global_block_rsv).
+
+With !btrfs_is_free_space_inode(inode) removed, btrfs_update_inode()
+calls btrfs_delayed_update_inode() -> btrfs_delayed_inode_reserve_metadata().
+Because trans->block_rsv is NULL, this ignores global_block_rsv and tries
+to reserve metadata in fs_info->delayed_block_rsv using
+BTRFS_RESERVE_NO_FLUSH for every block group's free-space inode.  If
+unreserved metadata space cannot satisfy BTRFS_RESERVE_NO_FLUSH without
+flushing, btrfs_update_inode() returns -ENOSPC without falling back to
+btrfs_update_inode_item(), and the callers abort the transaction, failing
+the read-write mount or forcing the filesystem read-only.
+
+Even when the reservation succeeds, committing a delayed node on
+tree_root sets trans->block_rsv to delayed_block_rsv, which
+get_block_rsv() ignores because BTRFS_ROOT_SHAREABLE is not set on
+tree_root, draining global_block_rsv instead.  In addition, on !NO_HOLES
+filesystems btrfs_init_file_extent_tree() now allocates file_extent_tree
+for free-space inodes that are only being removed, and
+btrfs_evict_inode() commits the delayed inode item to tree_root right
+before btrfs_truncate_inode_items() deletes it.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/4d3a1d10aff29e6b65ee681cbd7e82e306e69d6e.1795385532.git.wqu@suse.com?part=1
+

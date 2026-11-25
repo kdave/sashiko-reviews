@@ -1,0 +1,88 @@
+From sashiko-bot@kernel.org Thu Nov 19 22:59:53 2026
+Message-ID: <sashiko-outbox-224114@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 2/4] btrfs: zoned: use the highest RAID1 write pointer
+ on degraded mounts
+Date: Thu, 19 Nov 2026 21:59:51 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [High] btrfs: zoned: inconsistent active state in
+  btrfs_load_block_group_raid1()
+--
+
+commit 2055cba4dc749d8546607ac337fb8116e85f396f
+Author: Miroslav Cimerman <mc@raidlab.org>
+
+btrfs: zoned: use the highest RAID1 write pointer on degraded mounts
+
+This commit updates btrfs_load_block_group_raid1() to compare write
+pointers against the first present stripe and use the highest write
+pointer as the block group allocation offset on degraded mounts.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 8eac6e2283a26..8bd44dd260a48 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+
+> @@ -1577,10 +1590,15 @@ static int btrfs_load_block_group_raid1(struct btrfs_block_group *bg,
+>  		}
+>  	}
+>  
+> -	if (zone_info[0].alloc_offset != WP_MISSING_DEV)
+> -		bg->alloc_offset = zone_info[0].alloc_offset;
+> +	if (mismatch)
+> +		btrfs_warn(fs_info,
+> +		"zoned: write pointer mismatch in %s block group %llu, using the highest",
+> +			   btrfs_bg_type_to_raid_name(map->type), bg->start);
+> +
+> +	if (first >= 0)
+> +		bg->alloc_offset = highest;
+>  	else
+> -		bg->alloc_offset = zone_info[i - 1].alloc_offset;
+> +		bg->alloc_offset = WP_MISSING_DEV;
+>  
+>  	return 0;
+>  }
+
+[Severity: High]
+Does taking bg->alloc_offset from highest leave
+BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE out of sync with the write pointer when
+the stripes' active states differ on a degraded mount?
+
+On a degraded mount, btrfs_zone_activate() is skipped when
+test_bit(first, active) != test_bit(i, active), and
+BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE is only set when test_bit(first, active)
+is true.  If the first present stripe is behind at offset 0
+(BLK_ZONE_COND_EMPTY, inactive) while another stripe is partially written
+(0 < alloc_offset < capacity, active), bg->alloc_offset is set to highest
+(> 0), so btrfs_load_block_group_zone_info() sets
+bg->meta_write_pointer = bg->start + highest while leaving
+BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE clear and omitting the block group from
+fs_info->zone_active_bgs:
+
+fs/btrfs/zoned.c:btrfs_zone_activate() {
+	...
+	if (block_group->flags & BTRFS_BLOCK_GROUP_DATA) {
+		...
+	} else {
+		/* Since it is already written, it should have been active. */
+		WARN_ON_ONCE(block_group->meta_write_pointer != block_group->start);
+	}
+}
+
+For a metadata block group, the next btrfs_zone_activate() call triggers
+that WARN_ON_ONCE, and btrfs_check_active_zone_reservation() fails to
+account for the active zone on the ahead stripe.  For a data block group
+(or when the first stripe is full and another stripe is partially
+written), relocating the block group during balance skips do_zone_finish()
+because BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE is clear, leaking the active zone
+on the partially written stripe.  Conversely, if the first stripe is
+active and a later stripe is empty, iteration i == first sets
+BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE without activating the empty stripe's
+zone in device->zone_info, so subsequent writes open that zone in
+hardware without decrementing active_zones_left.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261119213835.103131-1-mc@raidlab.org?part=2
+

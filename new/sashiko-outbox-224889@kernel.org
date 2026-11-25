@@ -1,0 +1,107 @@
+From sashiko-bot@kernel.org Fri Nov 20 10:50:10 2026
+Message-ID: <sashiko-outbox-224889@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v2 3/3] btrfs: qgroup: show the "qgroup scan cancelled"
+ message correctly
+Date: Fri, 20 Nov 2026 09:50:05 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: qgroup: cancelled updated when stopped is false in
+  btrfs_qgroup_rescan_worker()
+- [Low] btrfs: qgroup: missing Fixes trailer for commit e562a8bdf652
+--
+
+commit 6522ea5e778867e7f5c162e1a22e3ed996cbdb49
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: qgroup: show the "qgroup scan cancelled" message correctly
+>
+> There are several reasons why we won't output the "qgroup scan cancelled"
+> message:
+>
+> - We always clear BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN before the
+>   message check
+>   So that test_bit() will never return true.
+>
+> - @stopped has a higher priority
+>   When a rescan is cancelled, it has a high chance to be caught by
+>   rescan_should_stop(), so in that case @stopped is also true.
+>
+>   Then when checking which message to output, @stopped has a higher
+>   priority, thus it shows the rescan as paused instead.
+>
+> Fix the problem by:
+>
+> - Save the previous CANCEL_RESCAN flag into @cancelled, and check that
+>   variable instead
+>   And @cancelled is only updated if the rescan is stopped.
+>
+>   This is to handle finished-then-cancelled rescan a little better.
+>   This won't completely solve the cancel race with rescan though.
+>
+>   But the cancel-race is already there, not caused by this commit, and I
+>   don't think we should bother too much on the mostly cosmetic error
+>
+> - Change the message priority so that cancelled has a higher priority
+>   The new priority list is:
+>   - Error (ret < 0)
+>   - Cancelled
+>   - Stopped
+>   - Finished
+>
+>   And we no longer go the complex "if () else if ()" way, instead each
+>   hit branch will return, so only one branch will hit.
+>
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+This fixes the unreachable "qgroup scan cancelled" log message.  Should
+this include:
+
+  Fixes: e562a8bdf652 ("btrfs: introduce BTRFS_QGROUP_RUNTIME_FLAG_CANCEL_RESCAN")
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index 915ae134fda40..e5447397e7089 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -3900,6 +3900,7 @@ static void btrfs_qgroup_rescan_worker(struct btrfs_work *work)
+>  	struct btrfs_path *path;
+>  	struct btrfs_trans_handle *trans = NULL;
+>  	int ret = 0;
+> +	bool cancelled = false;
+>  	bool stopped = false;
+>  	bool did_leaf_rescans = false;
+>  
+> @@ -3971,8 +3972,11 @@ static void btrfs_qgroup_rescan_worker(struct btrfs_work *work)
+>  
+>  	mutex_lock(&fs_info->qgroup_rescan_lock);
+>  	if (!stopped || test_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN,
+> -				 &fs_info->qgroup_flags))
+> +				 &fs_info->qgroup_flags)) {
+> +		cancelled = test_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN,
+> +				     &fs_info->qgroup_flags);
+>  		clear_bit(BTRFS_QGROUP_STATUS_BIT_RESCAN, &fs_info->qgroup_flags);
+> +	}
+
+[Severity: Medium]
+Does this still set cancelled to true when stopped is false?
+
+The commit message notes that cancelled should only be updated if the
+rescan is stopped, to handle a finished-then-cancelled rescan.  However,
+because the outer condition starts with !stopped, this block is entered
+whenever the scan loop finishes the last leaf (ret > 0 and stopped is
+false).  If qgroup_mark_inconsistent() sets
+BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN before qgroup_rescan_lock is
+taken here, btrfs_qgroup_rescan_worker() clears
+BTRFS_QGROUP_STATUS_BIT_INCONSISTENT for ret > 0, but still sets
+cancelled = true and logs "qgroup scan cancelled" instead of completion.
+
+Setting cancelled = stopped &&
+test_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN, &fs_info->qgroup_flags)
+before the if (!stopped || cancelled) check would avoid the duplicate
+test_bit() and only record cancellation when the loop actually stopped.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795167390.git.wqu@suse.com?part=3
+

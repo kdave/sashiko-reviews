@@ -1,0 +1,108 @@
+From sashiko-bot@kernel.org Wed Nov 25 00:06:14 2026
+Message-ID: <sashiko-outbox-232196@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: abort the transaction to avoid half deleted
+ qgroup relationship
+Date: Tue, 24 Nov 2026 23:06:10 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: missing Fixes: trailer for __del_qgroup_relation() fix
+It also noticed 1 related pre-existing issue this patch does not
+introduce:
+- [Critical] btrfs: missing transaction abort on failure in
+  btrfs_remove_qgroup() [1]
+--
+
+commit 781e35ed277da84a3e5f67f1a5dd6d5a12c6d39d
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: abort the transaction to avoid half deleted qgroup relationship
+>
+> In __del_qgroup_relation(), if the relationship item for (src, dst) was
+> deleted successfully, but the item for (dst, src) failed to be deleted
+> due to other reasons (EIO, ENOMEM etc), we just return the error without
+> updating the in-memory relationship.
+>
+> This can lead to minor inconsistency between in-memory structures and
+> on-disk metadata.
+>
+> E.g. the second deletion failed with ENOMEM, but the on-disk metadata
+> has no such item. In this particular case we can continue deleting
+> in-memory structure.
+>
+> Fix it by aborting the transaction if the first deletion succeeded, and
+> the second deletion failed for reasons other than ENOENT.
+>
+> By this we still keep the best-effert deletion attempt. E.g if one
+> relationship item is not found, we can still continue delete whatever
+> left and remove the relationship completely.
+>
+> Link: https://sashiko.dev/#/bug/linux-8878868a-a948-4f35-a459-2ba8be379061
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+Should this bug fix include a Fixes: trailer for the commit that introduced
+the partial deletion behavior in __del_qgroup_relation()?
+
+  Fixes: 73798c465b66 ("btrfs: qgroup: Try our best to delete qgroup relations")
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index ab382f41957fe..eef012d340feb 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -1688,8 +1688,15 @@ static int __del_qgroup_relation(struct btrfs_trans_handle *trans, u64 src,
+>  	if (ret < 0 && ret != -ENOENT)
+>  		return ret;
+>  	ret2 = del_qgroup_relation_item(trans, dst, src);
+> -	if (ret2 < 0 && ret2 != -ENOENT)
+> +	if (ret2 < 0 && ret2 != -ENOENT) {
+> +		/*
+> +		 * Abort to avoid inconsistency caused by
+> +		 * half deleted relationship.
+> +		 */
+> +		if (unlikely(!ret))
+> +			btrfs_abort_transaction(trans, ret2);
+>  		return ret2;
+> +	}
+>  
+>  	/* At least one deletion succeeded, return 0 */
+>  	if (!ret || !ret2)
+
+[Severity: Critical]
+This problem wasn't introduced by this patch, but can its caller
+btrfs_remove_qgroup() similarly leave a half-deleted qgroup on disk and leak
+the in-memory struct btrfs_qgroup [1]?
+
+fs/btrfs/qgroup.c:btrfs_remove_qgroup() {
+    ...
+	ret = del_qgroup_item(trans, qgroupid);
+	if (ret && ret != -ENOENT)
+		goto out;
+	ret = 0;
+
+	while (!list_empty(&qgroup->groups)) {
+		list = list_first_entry(&qgroup->groups,
+					struct btrfs_qgroup_list, next_group);
+		ret = __del_qgroup_relation(trans, qgroupid,
+					    list->group->qgroupid);
+		if (ret < 0)
+			goto out;
+	}
+    ...
+}
+
+If del_qgroup_item() succeeds (or an earlier iteration of the loop removes a
+relation) and __del_qgroup_relation() then fails on its first
+del_qgroup_relation_item() call, __del_qgroup_relation() returns the error
+without aborting the transaction.  btrfs_remove_qgroup() jumps to out,
+skipping del_qgroup_rb() and kfree(qgroup), and btrfs_ioctl_qgroup_create()
+closes the transaction with btrfs_end_transaction(), allowing the partial
+quota tree deletion to be committed while leaving the in-memory qgroup out
+of sync.
+
+[1] https://sashiko.dev/#/bug/linux-49503099-3027-4259-ade0-57450d2363f6
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/4d1b2d669194cb324213637bc6c6d38a2ecdb7d6.1795561094.git.wqu@suse.com?part=1
+

@@ -1,0 +1,151 @@
+From sashiko-bot@kernel.org Wed Nov 25 12:15:30 2026
+Message-ID: <sashiko-outbox-233210@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8 23/27] btrfs: zoned: reuse block groups emptied by
+ reclaim as relocation target
+Date: Wed, 25 Nov 2026 11:15:23 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: zoned: data_reloc_bg check in
+  btrfs_zoned_reuse_reclaimed_bg() skips reuse
+- [Medium] btrfs: zoned: race promoting reset bg in
+  btrfs_zoned_reuse_reclaimed_bg()
+--
+
+commit 714bb2489d290e58f97fab0a07631fcce4862d25
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: reuse block groups emptied by reclaim as relocation target
+
+This commit marks data block groups being reclaimed with
+BLOCK_GROUP_FLAG_ZONED_RECLAIM and resets their zones in place after
+relocation so they can be promoted to the next data relocation target
+instead of being removed.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 7111b55d4abae..a8da6f6592f6b 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> @@ -3229,6 +3235,79 @@ static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, bool promote,
+>  	return 0;
+>  }
+[ ... ]
+> +bool btrfs_zoned_reuse_reclaimed_bg(struct btrfs_block_group *bg)
+> +{
+> +	struct btrfs_fs_info *fs_info = bg->fs_info;
+> +	struct btrfs_space_info *space_info = bg->space_info;
+> +	u64 reclaimed;
+> +	bool reuse;
+> +	int ret;
+> +
+> +	if (!test_bit(BLOCK_GROUP_FLAG_ZONED_RECLAIM, &bg->runtime_flags))
+> +		return false;
+> +
+> +	if (space_info != fs_info->data_sinfo)
+> +		return false;
+> +
+> +	if (READ_ONCE(fs_info->data_reloc_bg))
+> +		return false;
+
+[Severity: Medium]
+Does checking fs_info->data_reloc_bg here cause
+btrfs_zoned_reuse_reclaimed_bg() to almost always return false?
+
+During btrfs_relocate_block_group(), do_allocation_zoned() sets
+fs_info->data_reloc_bg to the destination relocation block group, and
+btrfs_zone_finish_endio() only clears it via do_zone_finish() when that
+destination block group reaches zone_capacity:
+
+fs/btrfs/zoned.c:btrfs_zone_finish_endio() {
+    ...
+	/* Bail out if we can allocate more data from this block group. */
+	if (logical + length + min_alloc_bytes <=
+	    block_group->start + block_group->zone_capacity)
+		goto out;
+
+	ret = do_zone_finish(block_group, true);
+    ...
+}
+
+Unless the relocated extents happen to fill the destination block group to
+zone_capacity on the final extent of bg, fs_info->data_reloc_bg is still
+non-zero when btrfs_relocate_chunk_finish() runs.  As a result,
+btrfs_zoned_reuse_reclaimed_bg() bails out and
+btrfs_relocate_chunk_finish() discards and deletes bg via
+btrfs_remove_chunk() instead of reusing it.
+
+> +
+> +	if ((bg->flags & BTRFS_BLOCK_GROUP_PROFILE_MASK) !=
+> +		(btrfs_data_alloc_profile(fs_info) & BTRFS_BLOCK_GROUP_PROFILE_MASK))
+> +		return false;
+> +
+> +	spin_lock(&space_info->lock);
+> +	spin_lock(&bg->lock);
+> +	reuse = btrfs_zoned_can_reuse_bg(bg);
+> +	spin_unlock(&bg->lock);
+> +	spin_unlock(&space_info->lock);
+> +	if (!reuse)
+> +		return false;
+> +
+> +	spin_lock(&fs_info->unused_bgs_lock);
+> +	if (!list_empty(&bg->bg_list)) {
+> +		list_del_init(&bg->bg_list);
+> +		btrfs_put_block_group(bg);
+> +	}
+> +	spin_unlock(&fs_info->unused_bgs_lock);
+> +
+> +	/*
+> +	 * Drop the read-only references taken by reclaim and relocation. The
+> +	 * block-group is full and empty, so this leaves it entirely
+> +	 * zone_unusable, just like the block groups that
+> +	 * btrfs_reset_unused_block_groups() resets in place.
+> +	 */
+> +	btrfs_dec_block_group_ro(bg);
+> +	btrfs_dec_block_group_ro(bg);
+> +
+> +	ret = zoned_reset_bg_in_place(bg, data_race(!fs_info->data_reloc_bg),
+> +			&reclaimed);
+
+[Severity: Medium]
+Can concurrent data writes claim the reset block group or its space before
+zoned_reset_bg_in_place() promotes it to fs_info->data_reloc_bg?
+
+Dropping both read-only references leaves bg->ro == 0 on data_sinfo.
+Inside zoned_reset_bg_in_place(), bg->alloc_offset is reset to 0 and
+*reclaimed is subtracted from data_sinfo->bytes_zone_unusable before
+bg->lock and space_info->lock are unlocked to call
+btrfs_set_data_reloc_bg():
+
+CPU0                                  CPU1
+btrfs_zoned_reuse_reclaimed_bg()
+  btrfs_dec_block_group_ro(bg) (x2)
+  zoned_reset_bg_in_place()
+    spin_lock(&space_info->lock)
+    spin_lock(&bg->lock)
+    bg->alloc_offset = 0
+    btrfs_space_info_update_bytes_zone_unusable(
+        space_info, -*reclaimed)
+    spin_unlock(&bg->lock)
+    spin_unlock(&space_info->lock)
+                                      btrfs_reserve_data_bytes()
+                                        reserve_bytes()
+                                          /* claims freed space in
+                                             data_sinfo->bytes_may_use */
+                                      find_free_extent()
+                                        do_allocation_zoned()
+                                          /* or allocates from bg */
+    btrfs_set_data_reloc_bg(fs_info, bg)
+      btrfs_inc_block_group_ro_notrans(bg)
+        --> fails (-ENOSPC)
+
+If a concurrent writer reserves the newly available space in data_sinfo
+(or find_free_extent() allocates directly from bg) during that window,
+btrfs_set_data_reloc_bg() fails, leaving bg in data_sinfo and
+fs_info->data_reloc_bg unset so the next relocation in the reclaim run can
+fail with -ENOSPC.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261125102956.266389-1-johannes.thumshirn@wdc.com?part=23
+

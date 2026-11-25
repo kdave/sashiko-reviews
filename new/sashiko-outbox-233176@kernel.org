@@ -1,0 +1,130 @@
+From sashiko-bot@kernel.org Wed Nov 25 11:57:11 2026
+Message-ID: <sashiko-outbox-233176@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8 25/27] btrfs: zoned: keep a zone free for relocation
+ when allocating data chunks
+Date: Wed, 25 Nov 2026 10:57:08 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [High] btrfs: zoned: unbounded RAID profiles exhaust relocation zones
+  in chunk alloc
+- [High] btrfs: zoned: raw 64-bit division in
+  btrfs_zoned_data_chunk_allowed()
+- [Medium] btrfs: zoned: btrfs_zoned_dev_avail_bytes() overwrites avail
+  argument
+--
+
+commit 715fbb53d0b0cb4605149c72a2eec6795b1afdac
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: keep a zone free for relocation when allocating data chunks
+
+This commit adds btrfs_zoned_data_chunk_allowed() to check that enough
+zones remain free for a relocation target before allocating a new data
+chunk on a zoned filesystem.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index a8da6f6592f6b..8db1e058e178a 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -3838,3 +3838,50 @@ void btrfs_show_zoned_stats(struct btrfs_fs_info *fs_info, struct seq_file *seq)
+>  	}
+>  	spin_unlock(&fs_info->zone_active_bgs_lock);
+>  }
+> +
+> +bool btrfs_zoned_data_chunk_allowed(struct btrfs_space_info *space_info, u64 flags)
+> +{
+> +	struct btrfs_fs_info *fs_info = space_info->fs_info;
+> +	const int index = btrfs_bg_flags_to_raid_index(flags);
+> +	const struct btrfs_raid_attr *raid = &btrfs_raid_array[index];
+> +	const u64 stripe_size = fs_info->zone_size * raid->dev_stripes;
+> +	struct btrfs_device *device;
+> +	int nr_two = 0;
+> +	int nr_one = 0;
+> +
+> +	ASSERT(btrfs_is_zoned(fs_info));
+> +
+> +	if (space_info != fs_info->data_sinfo)
+> +		return true;
+> +
+> +	lockdep_assert_held(&fs_info->chunk_mutex);
+> +
+> +	list_for_each_entry(device, &fs_info->fs_devices->alloc_list, dev_alloc_list) {
+> +		u64 total;
+> +		u64 used;
+> +		u64 avail_bytes;
+> +		u64 dev_stripes;
+> +
+> +		if (!test_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state) ||
+> +		    test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state) ||
+> +		    !test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state))
+> +			continue;
+> +
+> +		total = btrfs_device_get_total_bytes(device);
+> +		used = max(btrfs_device_get_bytes_used(device), device->commit_bytes_used);
+> +		if (total <= used)
+> +			continue;
+> +
+> +		avail_bytes = btrfs_zoned_dev_avail_bytes(device, total - used);
+
+[Severity: Medium]
+Does btrfs_zoned_dev_avail_bytes() discard the total - used argument
+passed here?
+
+btrfs_zoned_dev_avail_bytes() overwrites its avail parameter with
+total - device->bytes_used:
+
+fs/btrfs/zoned.c:btrfs_zoned_dev_avail_bytes() {
+	...
+	avail = total - device->bytes_used;
+	if (avail <= sb_bytes)
+		return 0;
+
+	return avail - sb_bytes;
+}
+
+When a chunk is removed in the current transaction, device->bytes_used is
+smaller than device->commit_bytes_used while the freed device extents
+remain in the commit root until transaction commit.  Ignoring
+device->commit_bytes_used counts those uncommitted zones as available and
+allows a data chunk allocation to consume the last committed free zone.
+
+> +		dev_stripes = avail_bytes / stripe_size;
+
+[Severity: High]
+Both avail_bytes and stripe_size are u64, so will this plain division
+fail to link with an undefined reference to __udivdi3 on 32-bit builds?
+Using div64_u64(avail_bytes, stripe_size) avoids the 64-bit division
+helper.
+
+> +		if (dev_stripes >= 2)
+> +			nr_two++;
+> +		else if (dev_stripes == 1)
+> +			nr_one++;
+> +	}
+> +
+> +	if (nr_two + nr_one < raid->devs_min)
+> +		return false;
+> +
+> +	return (2 * nr_two + nr_one) >= 2 * raid->devs_min;
+> +}
+
+[Severity: High]
+Can this check still allow a data chunk allocation to consume the last
+free zone across all devices on striped RAID profiles where
+raid->devs_max is 0 (RAID0, RAID10, RAID5, RAID6)?
+
+Comparing against 2 * raid->devs_min assumes the new chunk will only
+allocate from raid->devs_min devices.  For profiles with
+raid->devs_max == 0, init_alloc_chunk_ctl() sets ctl->devs_max to
+BTRFS_MAX_DEVS(fs_info), and do_chunk_alloc() stripes the chunk across
+all writable devices with free space.  For example, on a 2-device RAID0
+filesystem (devs_min == 1) where each device has 1 free zone left
+(nr_two == 0, nr_one == 2), (2 * nr_two + nr_one) >= 2 * raid->devs_min
+is true, and do_chunk_alloc() then consumes the last zone on both
+devices, leaving no free zones for relocation.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261125102956.266389-1-johannes.thumshirn@wdc.com?part=25
+

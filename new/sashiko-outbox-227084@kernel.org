@@ -1,0 +1,86 @@
+From sashiko-bot@kernel.org Sat Nov 21 14:57:40 2026
+Message-ID: <sashiko-outbox-227084@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v5] btrfs: tree-checker: add more checks for file extent
+ items
+Date: Sat, 21 Nov 2026 13:57:38 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Medium] btrfs: tree-checker: wrong uncompressed bound in
+  check_extent_data_item()
+--
+
+commit 4f23aac966d9bbae7b859883e8843536fcaecfab
+Author: Cheng Yongkang <teel4res@gmail.com>
+
+btrfs: tree-checker: add more checks for file extent items
+
+This commit adds validation checks in check_extent_data_item() for explicit
+hole file extents, preallocated extent compression, disk_num_bytes and
+ram_bytes bounds, and offset + num_bytes bounds.
+
+> diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+> index f021ac14babfa..0a99e628d37c3 100644
+> --- a/fs/btrfs/tree-checker.c
+> +++ b/fs/btrfs/tree-checker.c
+[ ... ]
+> @@ -377,6 +380,67 @@ static int check_extent_data_item(struct extent_buffer *leaf,
+>  		     CHECK_FE_ALIGNED(leaf, slot, fi, num_bytes, sectorsize)))
+>  		return -EUCLEAN;
+>  
+> +	if (!btrfs_file_extent_disk_bytenr(leaf, fi)) {
+[ ... ]
+> +	} else {
+[ ... ]
+> +		if (unlikely(check_add_overflow(btrfs_file_extent_offset(leaf, fi),
+> +						btrfs_file_extent_num_bytes(leaf, fi),
+> +						&ram_end) ||
+> +			     ram_end > btrfs_file_extent_ram_bytes(leaf, fi))) {
+> +			file_extent_err(leaf, slot,
+> +	"invalid offset + num_bytes for file extent, have %llu + %llu expect <= ram_bytes %llu",
+> +					btrfs_file_extent_offset(leaf, fi),
+> +					btrfs_file_extent_num_bytes(leaf, fi),
+> +					btrfs_file_extent_ram_bytes(leaf, fi));
+> +			return -EUCLEAN;
+> +		}
+> +	}
+
+[Severity: Medium]
+Should uncompressed extents check offset + num_bytes against
+disk_num_bytes instead of ram_bytes?
+
+For uncompressed extents, btrfs_extent_item_to_extent_map() ignores the
+on-disk ram_bytes field and sets em->ram_bytes from disk_num_bytes:
+
+fs/btrfs/file-item.c:btrfs_extent_item_to_extent_map() {
+    ...
+		if (compress_type == BTRFS_COMPRESS_NONE) {
+			/*
+			 * Older kernels can create regular non-hole data
+			 * extents with ram_bytes smaller than disk_num_bytes.
+			 * Not a big deal, just always use disk_num_bytes
+			 * for ram_bytes.
+			 */
+			em->ram_bytes = em->disk_num_bytes;
+    ...
+}
+
+Because check_extent_data_item() does not enforce ram_bytes ==
+disk_num_bytes on non-debug builds (and only warns under
+CONFIG_BTRFS_DEBUG), checking against ram_bytes causes two problems for
+uncompressed extents:
+
+1. An uncompressed extent with disk_num_bytes < offset + num_bytes <=
+   ram_bytes passes check_extent_data_item(), and then triggers ASSERT(0)
+   in validate_extent_map() -> dump_extent_map() (or reads past
+   disk_num_bytes on non-debug builds).
+
+2. Valid uncompressed extents written by older kernels with
+   ram_bytes < offset + num_bytes <= disk_num_bytes (which the comment in
+   btrfs_extent_item_to_extent_map() notes can exist on disk) will be
+   rejected with -EUCLEAN.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261121132519.2182511-1-teel4res@gmail.com?part=1
+

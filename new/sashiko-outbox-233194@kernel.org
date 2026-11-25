@@ -1,0 +1,259 @@
+From sashiko-bot@kernel.org Wed Nov 25 12:06:49 2026
+Message-ID: <sashiko-outbox-233194@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8 21/27] btrfs: zoned: promote reset data block groups
+ to the relocation target
+Date: Wed, 25 Nov 2026 11:06:40 +0000
+
+Thank you for your contribution! Sashiko AI review found 6 potential
+issues to consider:
+- [High] btrfs: zoned: unchecked RO inc in btrfs_set_data_reloc_bg()
+  hits BUG_ON
+- [Medium] btrfs: zoned: unlocked window in zoned_reset_bg_in_place()
+  exposes free space
+- [Medium] btrfs: zoned: stale space_info pointer in
+  zoned_reset_bg_in_place()
+- [Medium] btrfs: zoned: reloc_sinfo block groups skipped in
+  zoned_reset_bg_in_place()
+- [Medium] btrfs: zoned: reset reloc_sinfo block group stranded in
+  zoned_reset_bg_in_place()
+- [Medium] btrfs: zoned: promoting data bg in zoned_reset_bg_in_place()
+  causes ENOSPC
+--
+
+commit 222864ff7dc8f75fe78e57ae023d29d6a078c8bb
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: promote reset data block groups to the relocation target
+
+This commit promotes data block groups reset in place by
+btrfs_reset_unused_block_groups() directly to the data relocation block
+group when no data relocation target is currently set.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index ddf4ab5301685..6c99c28bbb456 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+> @@ -3121,7 +3121,8 @@ static bool btrfs_set_data_reloc_bg(struct btrfs_fs_info *fs_info,
+>  	return true;
+>  }
+>  
+> -static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+> +static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, bool promote,
+> +				   u64 *reclaimed)
+>  {
+>  	struct btrfs_fs_info *fs_info = bg->fs_info;
+>  	struct btrfs_space_info *space_info = bg->space_info;
+> @@ -3181,9 +3182,43 @@ static int zoned_reset_bg_in_place(struct btrfs_block_group *bg, u64 *reclaimed)
+>  	bg->free_space_ctl->free_space += *reclaimed;
+>  	btrfs_space_info_update_bytes_zone_unusable(space_info, -*reclaimed);
+>  	spin_unlock(&bg->lock);
+> -	btrfs_return_free_space(space_info, *reclaimed);
+> +
+> +	/*
+> +	 * If we need a data relocation target, promote this just
+> +	 * evacuated and reset zone to be it directly, instead of
+> +	 * returning its free space to the data space_info. Otherwise the
+> +	 * returned space could be handed out to a waiting data write and
+> +	 * then yanked away by the migration into the relocation
+> +	 * space_info.
+> +	 */
+> +	promote = promote && (space_info->flags & BTRFS_BLOCK_GROUP_DATA);
+> +	if (!promote)
+> +		btrfs_return_free_space(space_info, *reclaimed);
+>  	spin_unlock(&space_info->lock);
+
+[Severity: Medium]
+Can a concurrent data reservation or extent allocation still claim the
+reset block group's space after spin_unlock(&space_info->lock) and before
+btrfs_set_data_reloc_bg() marks bg read-only?
+
+Even when btrfs_return_free_space() is skipped, subtracting *reclaimed
+from space_info->bytes_zone_unusable lowers btrfs_space_info_used() while
+bg->ro is 0 and bg->alloc_offset is 0.
+
+CPU0                                  CPU1
+zoned_reset_bg_in_place()
+  bg->alloc_offset = 0
+  bg->free_space_ctl->free_space += *reclaimed
+  btrfs_space_info_update_bytes_zone_unusable(
+      data_sinfo, -*reclaimed)
+  spin_unlock(&bg->lock)
+  spin_unlock(&data_sinfo->lock)
+                                      btrfs_reserve_data_bytes()
+                                        reserve_bytes(data_sinfo, ...)
+                                          btrfs_space_info_update_bytes_may_use()
+  btrfs_set_data_reloc_bg()
+    btrfs_inc_block_group_ro_notrans(bg)
+      <-- fails with -ENOSPC
+
+For BTRFS_RESERVE_FLUSH_DATA, reserve_bytes() only checks
+priority_tickets for pending_tickets, so a concurrent data writer (or any
+btrfs_space_info_free_bytes_may_use() call running
+btrfs_try_granting_tickets(), or find_free_extent() allocating directly
+from bg) can consume the space in the unlocked window and cause promotion
+to fail.
+
+> +
+> +	if (promote) {
+> +		struct btrfs_space_info *sinfo = bg->space_info;
+> +
+> +		if (btrfs_set_data_reloc_bg(fs_info, bg)) {
+
+[Severity: High]
+Can calling btrfs_set_data_reloc_bg() at runtime hit BUG_ON(!cache->ro) in
+btrfs_dec_block_group_ro() if fs_info->data_reloc_bg was set concurrently?
+
+fs/btrfs/zoned.c:btrfs_set_data_reloc_bg() {
+	if (migrate) {
+		if (btrfs_inc_block_group_ro_notrans(bg))
+			return false;
+
+		if (!zoned_move_bg_to_space_info(fs_info, bg, data_sinfo, reloc_sinfo)) {
+			zoned_dec_bg_ro(bg);
+			return false;
+		}
+		ASSERT(bg->bytes_super == 0, "bg->bytes_super=%llu", bg->bytes_super);
+		zoned_dec_bg_ro(bg);
+	}
+
+	spin_lock(&fs_info->relocation_bg_lock);
+	if (fs_info->data_reloc_bg) {
+		spin_unlock(&fs_info->relocation_bg_lock);
+
+		if (migrate) {
+			btrfs_inc_block_group_ro_notrans(bg);
+			zoned_move_bg_to_space_info(fs_info, bg, reloc_sinfo,
+					data_sinfo);
+			zoned_dec_bg_ro(bg);
+		}
+		return false;
+	}
+}
+
+When migrate is true, btrfs_set_data_reloc_bg() moves bg to reloc_sinfo
+and calls zoned_dec_bg_ro(bg) (clearing bg->ro to 0 and granting tickets
+on reloc_sinfo) before locking fs_info->relocation_bg_lock:
+
+CPU0                                  CPU1
+zoned_reset_bg_in_place()
+  btrfs_set_data_reloc_bg()
+    zoned_move_bg_to_space_info(..., reloc_sinfo)
+    zoned_dec_bg_ro(bg)
+      /* bg->ro == 0, grants tickets */
+                                      /* reloc_sinfo reservation uses
+                                       * bg's space; data_reloc_bg set */
+    spin_lock(&fs_info->relocation_bg_lock)
+    if (fs_info->data_reloc_bg)
+      btrfs_inc_block_group_ro_notrans(bg)
+        /* fails (-ENOSPC), bg->ro stays 0 */
+      zoned_move_bg_to_space_info(...)
+      zoned_dec_bg_ro(bg)
+        btrfs_dec_block_group_ro(bg)
+          BUG_ON(!cache->ro)  <-- kernel panic
+
+Because the rollback path ignores the return value of
+btrfs_inc_block_group_ro_notrans(bg), zoned_dec_bg_ro(bg) is called with
+bg->ro == 0.  Keeping bg read-only across the fs_info->relocation_bg_lock
+check until after fs_info->data_reloc_bg is claimed (or rolled back to
+data_sinfo) would avoid exposing bg in reloc_sinfo prematurely.
+
+> +			spin_lock(&sinfo->lock);
+> +			btrfs_try_granting_tickets(sinfo);
+> +			spin_unlock(&sinfo->lock);
+> +		} else {
+> +			spin_lock(&sinfo->lock);
+> +			btrfs_return_free_space(sinfo, *reclaimed);
+> +			spin_unlock(&sinfo->lock);
+> +		}
+
+[Severity: Medium]
+Does sinfo point to the old space_info after btrfs_set_data_reloc_bg()
+migrates bg?
+
+sinfo is initialized from bg->space_info (data_sinfo) before calling
+btrfs_set_data_reloc_bg(), which moves bg to reloc_sinfo and updates
+bg->space_info = reloc_sinfo.  On success, btrfs_try_granting_tickets()
+is then called on data_sinfo instead of reloc_sinfo.
+
+> +	} else if (space_info->flags & BTRFS_BLOCK_GROUP_DATA) {
+> +		struct btrfs_space_info *data_sinfo = fs_info->data_sinfo;
+> +		struct btrfs_space_info *reloc_sinfo = data_sinfo->sub_group[0];
+> +
+> +		if (space_info == reloc_sinfo &&
+> +		    !btrfs_inc_block_group_ro_notrans(bg)) {
+> +			zoned_move_bg_to_space_info(fs_info, bg, reloc_sinfo, data_sinfo);
+> +			zoned_dec_bg_ro(bg);
+> +		}
+> +	}
+
+[Severity: Medium]
+Can a reset block group in reloc_sinfo ever be moved back to data_sinfo by
+this branch when btrfs_reset_unused_block_groups() runs for data_sinfo?
+
+In btrfs_reset_unused_block_groups(), the loop skips any entry on
+fs_info->unused_bgs where bg->space_info != space_info:
+
+fs/btrfs/zoned.c:btrfs_reset_unused_block_groups() {
+    ...
+		list_for_each_entry(bg, &fs_info->unused_bgs, bg_list) {
+			if ((bg->flags & BTRFS_BLOCK_GROUP_TYPE_MASK) != space_info->flags)
+				continue;
+
+			if (bg->space_info != space_info)
+				continue;
+    ...
+}
+
+When RESET_ZONES runs for data_sinfo, any unused block group whose
+bg->space_info is still reloc_sinfo is skipped and its zone capacity is
+not reclaimed for data_sinfo.
+
+[Severity: Medium]
+If zoned_reset_bg_in_place() is called on a block group in reloc_sinfo
+and it does not become data_reloc_bg, does bg remain stranded in
+reloc_sinfo?
+
+When promote is false, btrfs_return_free_space(space_info, *reclaimed)
+above has already granted the reclaimed space to any tickets waiting on
+reloc_sinfo before reaching this else-if block, so
+btrfs_inc_block_group_ro_notrans(bg) fails with -ENOSPC and bg cannot be
+moved to data_sinfo.  Similarly, when promote is true on a reloc_sinfo
+block group and btrfs_set_data_reloc_bg() returns false because
+fs_info->data_reloc_bg was set concurrently, migrate is false inside
+btrfs_set_data_reloc_bg() and this else-if branch is skipped, leaving bg
+with bg->alloc_offset == 0 stranded in reloc_sinfo where neither regular
+data writes nor relocation (while another data_reloc_bg is active) can
+use it.
+
+> +
+>  	return 0;
+>  }
+>  
+> @@ -3582,7 +3617,8 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+>  		list_del_init(&bg->bg_list);
+>  		spin_unlock(&fs_info->unused_bgs_lock);
+>  
+> -		ret = zoned_reset_bg_in_place(bg, data_race(!fs_info->data_reloc_bg),
+> +		ret = zoned_reset_bg_in_place(bg, data_race(!fs_info->data_reloc_bg),
+> +				&reclaimed);
+>  		if (ret || !reclaimed)
+>  			goto requeue;
+
+[Severity: Medium]
+When zoned_reset_bg_in_place() promotes the reset block group to
+data_reloc_bg, should its bytes still be subtracted from num_bytes in
+btrfs_reset_unused_block_groups()?
+
+Promoting bg moves it out of data_sinfo into reloc_sinfo without returning
+any free space to data_sinfo or advancing data_sinfo->tickets_id.  If bg
+was the only unused block group (or satisfied num_bytes), RESET_ZONES
+finishes without granting any data_sinfo tickets, and because RESET_ZONES
+runs after RECLAIM_ZONES in data_flush_states[],
+do_async_reclaim_data_space() when data_sinfo->full is true proceeds
+to maybe_fail_all_tickets() and fails waiting data writes with -ENOSPC
+without retrying RECLAIM_ZONES using the new data_reloc_bg.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261125102956.266389-1-johannes.thumshirn@wdc.com?part=21
+

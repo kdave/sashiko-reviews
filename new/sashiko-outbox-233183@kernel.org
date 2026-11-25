@@ -1,0 +1,156 @@
+From sashiko-bot@kernel.org Wed Nov 25 12:00:50 2026
+Message-ID: <sashiko-outbox-233183@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8 04/27] btrfs: zoned: don't use active zones for
+ conventional stripes
+Date: Wed, 25 Nov 2026 11:00:47 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: zoned: WP_MISSING_DEV counted as sequential in
+  btrfs_load_block_group_zone_info()
+- [Low] btrfs: zoned: double counting of WP_MISSING_DEV stripe in
+  nr_active
+--
+
+commit 166d8f273930a1b8fdfa88b3424b3c1fa88cbb8f
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+btrfs: zoned: don't use active zones for conventional stripes
+
+This commit avoids taking and releasing active zone resources for
+conventional stripes in zoned block groups, centralizes stripe activation
+checks when loading block groups, and skips non-sequential data block
+groups in btrfs_zone_finish_one_bg().
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 4623ebe5dbd34..0b29d15b9faba 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> @@ -1865,27 +1828,35 @@ int btrfs_load_block_group_by_raid_type(struct btrfs_block_group *bg,
+>  					unsigned long *active, u64 last_alloc)
+>  {
+>  	struct btrfs_fs_info *fs_info = bg->fs_info;
+> +	const unsigned int nr_active = bitmap_weight(active, map->num_stripes);
+> +	unsigned int nr_missing = 0;
+>  	u64 profile;
+>  	int ret;
+>  
+> +	/* Missing stripes are never active, ignore them when activating. */
+> +	for (int i = 0; i < map->num_stripes; i++) {
+> +		if (zone_info[i].alloc_offset == WP_MISSING_DEV)
+> +			nr_missing++;
+> +	}
+[ ... ]
+> @@ -1895,6 +1866,16 @@ int btrfs_load_block_group_by_raid_type(struct btrfs_block_group *bg,
+>  		return -EINVAL;
+>  	}
+>  
+> +	if (!ret && nr_active) {
+> +		if (nr_active + nr_missing == map->num_stripes) {
+> +			set_bit(BLOCK_GROUP_FLAG_ZONE_IS_ACTIVE, &bg->runtime_flags);
+> +		} else if (bg->alloc_offset < bg->zone_capacity) {
+> +			bg->meta_write_pointer = bg->start;
+> +			if (!btrfs_zone_activate(bg))
+> +				ret = -EIO;
+> +		}
+> +	}
+
+[Severity: Low]
+Can a stripe with WP_MISSING_DEV be counted in both nr_active and
+nr_missing when device->zone_info->max_active_zones is 0?
+
+In btrfs_load_zone_info(), __set_bit(zone_idx, active) runs when
+!device->zone_info->max_active_zones before querying the zone state, and
+later failure paths (btrfs_get_dev_zone() returning -EIO or -EOPNOTSUPP, or
+BLK_ZONE_COND_OFFLINE / BLK_ZONE_COND_READONLY) set info->alloc_offset to
+WP_MISSING_DEV without clearing zone_idx in active:
+
+fs/btrfs/zoned.c:btrfs_load_zone_info() {
+    ...
+	if (!device->zone_info->max_active_zones)
+		__set_bit(zone_idx, active);
+    ...
+	case BLK_ZONE_COND_OFFLINE:
+	case BLK_ZONE_COND_READONLY:
+		...
+		info->alloc_offset = WP_MISSING_DEV;
+		break;
+    ...
+}
+
+Double-counting that stripe in nr_active + nr_missing can make
+nr_active + nr_missing == map->num_stripes true while another present
+sequential stripe is still inactive (marking the block group active without
+calling btrfs_zone_activate()), or make nr_active + nr_missing exceed
+map->num_stripes when all present stripes are already active.
+
+> @@ -1970,6 +1951,23 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  	if (num_sequential > 0)
+>  		set_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &cache->runtime_flags);
+>  
+> +	if (num_conventional > 0 && num_sequential > 0) {
+> +		bool any_active = false;
+> +
+> +		for (i = 0; i < map->num_stripes; i++) {
+> +			if (zone_info[i].alloc_offset != WP_CONVENTIONAL &&
+> +			    test_bit(i, active)) {
+> +				any_active = true;
+> +				break;
+> +			}
+> +		}
+> +
+> +		for (i = 0; i < map->num_stripes; i++) {
+> +			if (zone_info[i].alloc_offset == WP_CONVENTIONAL)
+> +				assign_bit(i, active, any_active);
+> +		}
+> +	}
+> +
+>  	if (num_conventional > 0) {
+>  		ret = calculate_alloc_pointer(cache, &last_alloc, new);
+>  		if (ret) {
+> @@ -2013,6 +2011,13 @@ int btrfs_load_block_group_zone_info(struct btrfs_block_group *cache, bool new)
+>  		ret = -EIO;
+>  	}
+>  
+> +	if (!ret && num_conventional && num_sequential &&
+> +	    cache->alloc_offset > 0 && cache->alloc_offset < cache->zone_capacity) {
+> +		cache->meta_write_pointer = cache->start;
+> +		if (!btrfs_zone_activate(cache))
+> +			ret = -EIO;
+> +	}
+
+[Severity: Medium]
+Does btrfs_load_block_group_zone_info() misclassify a conventional block
+group as mixed sequential/conventional when one of its stripes is
+WP_MISSING_DEV?
+
+Just above this hunk, any stripe whose alloc_offset is not WP_CONVENTIONAL
+increments num_sequential:
+
+fs/btrfs/zoned.c:btrfs_load_block_group_zone_info() {
+    ...
+		if (zone_info[i].alloc_offset == WP_CONVENTIONAL)
+			num_conventional++;
+		else
+			num_sequential++;
+	}
+
+	if (num_sequential > 0)
+		set_bit(BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE, &cache->runtime_flags);
+    ...
+}
+
+When a block group has only conventional present stripe(s) and a missing
+stripe (WP_MISSING_DEV), num_sequential is incremented and
+BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE is set even though no sequential zone is
+present.  The new mixed-zone logic then clears the active bit on the
+conventional stripe(s) and calls btrfs_zone_activate(), placing the block
+group on fs_info->zone_active_bgs without reserving any active zone.
+Because BLOCK_GROUP_FLAG_SEQUENTIAL_ZONE is set, btrfs_zone_finish_one_bg()
+can pick and finish this block group without freeing any active zone.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261125102956.266389-1-johannes.thumshirn@wdc.com?part=4
+

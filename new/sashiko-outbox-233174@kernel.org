@@ -1,0 +1,249 @@
+From sashiko-bot@kernel.org Wed Nov 25 11:54:29 2026
+Message-ID: <sashiko-outbox-233174@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v4 2/4] btrfs: zoned: recover active non-data block
+ group roles on mount
+Date: Wed, 25 Nov 2026 10:54:24 +0000
+
+Thank you for your contribution! Sashiko AI review found 5 potential
+issues to consider:
+- [High] btrfs: zoned: zone finish on ro mount in
+  btrfs_restore_active_nondata_bgs()
+- [High] btrfs: zoned: unused or ro bg chosen in
+  btrfs_restore_active_nondata_bgs()
+- [High] btrfs: zoned: zone_unusable overflow in do_zone_finish() before
+  log replay
+- [Medium] btrfs: zoned: missing unused or reclaim bg scheduling in
+  do_zone_finish()
+- [Low] btrfs: zoned: missing Fixes trailer for write-time metadata bg
+  activation
+--
+
+commit c9c78dd49bdb211b4398fcc51a244ab0ca8fa993
+Author: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+> btrfs: zoned: recover active non-data block group roles on mount
+> 
+> Mount restores active sequential non-data block groups and their
+> reservations, but leaves active_meta_bg and active_system_bg unset.
+> Writing to a recovered block group does not set its role pointer:
+> check_bg_is_active() returns early because ZONE_IS_ACTIVE is already
+> set, skipping the role assignment.
+> 
+> These block groups can still be finished through other paths, but
+> metadata/system write-time switching cannot identify the previous
+> block group when the corresponding role pointer is NULL.
+> 
+> Restore these roles during mount so write-time switching can identify
+> and finish the previous non-data block group.
+> 
+> Keep the active block group with the largest writable tail for each
+> metadata/system role and finish the others. Since the tree-log role
+> is not persisted, leave a reservation for a new tree-log block group.
+> 
+> Account for the abandoned tails in do_zone_finish().
+> 
+> Assisted-by: LLM
+> Tested-by: Jochen Philipp <a2jphilipp@gmail.com>
+> Signed-off-by: Dongjiang Zhu <zhudongjiang@fygo.io>
+
+[Severity: Low]
+Since this fixes a bug in write-time metadata and system block group
+activation, should it include:
+
+  Fixes: 13bb483d32ab ("btrfs: zoned: activate metadata block group on write time")
+
+> diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+> index d8d433ac458b9..97972752dea6a 100644
+> --- a/fs/btrfs/disk-io.c
+> +++ b/fs/btrfs/disk-io.c
+> @@ -3768,7 +3768,12 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
+>  
+>  	btrfs_free_zone_cache(fs_info);
+>  
+> -	btrfs_check_active_zone_reservation(fs_info);
+> +	ret = btrfs_restore_active_nondata_bgs(fs_info);
+> +	if (ret) {
+> +		btrfs_err(fs_info, "failed to restore active non-data block groups: %pe",
+> +			  ERR_PTR(ret));
+> +		goto fail_sysfs;
+> +	}
+
+[Severity: High]
+Does calling btrfs_restore_active_nondata_bgs() before the sb_rdonly(sb)
+check cause read-only mounts to issue REQ_OP_ZONE_FINISH to the block
+device?
+
+After any workload that used fsync, both a normal metadata block group and
+a dedicated tree-log metadata block group are active on disk.  During a
+read-only mount, btrfs_restore_active_nondata_bgs() ->
+finish_extra_active_nondata_bgs() -> do_zone_finish() ->
+call_zone_finish() calls blkdev_zone_mgmt(..., REQ_OP_ZONE_FINISH, ...).
+On a read-only block device (bdev_read_only(bdev)), blkdev_zone_mgmt()
+returns -EPERM and aborts the mount; on a writable block device, a
+read-only mount permanently finishes zones on disk.
+
+> diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+> index 3475e7785f58d..3853bc23d9bd1 100644
+> --- a/fs/btrfs/zoned.c
+> +++ b/fs/btrfs/zoned.c
+[ ... ]
+> @@ -2648,11 +2659,23 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+>  		    test_bit(BLOCK_GROUP_FLAG_ZONED_DATA_RELOC,
+>  			     &block_group->runtime_flags)) {
+>  			spin_unlock(&block_group->lock);
+> +			spin_unlock(&space_info->lock);
+>  			btrfs_dec_block_group_ro(block_group);
+>  			return -EAGAIN;
+>  		}
+>  	}
+>  
+> +	/*
+> +	 * For read-only block groups, the tail is already accounted as
+> +	 * bytes_readonly.
+> +	 */
+> +	if (!block_group->ro) {
+> +		u64 tail_unusable = block_group->zone_capacity - block_group->alloc_offset;
+> +
+> +		block_group->zone_unusable += tail_unusable;
+> +		btrfs_space_info_update_bytes_zone_unusable(space_info, tail_unusable);
+> +	}
+
+[Severity: Medium]
+When adding tail_unusable to block_group->zone_unusable here, should
+do_zone_finish() also check whether the block group is now completely
+unusable or above bg_reclaim_threshold, as __btrfs_add_free_space_zoned()
+does?
+
+If all extents in [0, alloc_offset) were already freed and unpinned before
+do_zone_finish() runs (or if the abandoned tail pushes reclaimable
+unusable bytes over bg_reclaim_threshold), __btrfs_add_free_space_zoned()
+will not run on this block group again, so it will never be queued via
+btrfs_mark_bg_unused() or btrfs_mark_bg_to_reclaim().
+
+[ ... ]
+
+> @@ -3128,22 +3152,58 @@ int btrfs_zoned_activate_one_bg(struct btrfs_space_info *space_info, bool do_fin
+>  	return 0;
+>  }
+>  
+> +static int finish_extra_active_nondata_bgs(struct btrfs_fs_info *fs_info)
+> +{
+> +	struct btrfs_block_group *block_group;
+> +	struct btrfs_block_group *next;
+> +	int ret;
+> +
+> +	list_for_each_entry_safe(block_group, next, &fs_info->zone_active_bgs,
+> +				 active_bg_list) {
+> +		if (!(block_group->flags &
+> +		      (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)))
+> +			continue;
+> +
+> +		if (block_group == fs_info->active_meta_bg ||
+> +		    block_group == fs_info->active_system_bg)
+> +			continue;
+> +
+> +		ret = do_zone_finish(block_group, true);
+> +		if (ret)
+> +			return ret;
+> +	}
+> +
+> +	return 0;
+> +}
+
+[Severity: High]
+Can finishing a former tree-log block group here before btrfs_replay_log()
+overflow block_group->zone_unusable past block_group->length when log
+replay commits?
+
+Tree-log extent allocations do not increment block_group->used on disk, so
+btrfs_calc_zone_unusable() during btrfs_read_block_groups() initializes
+zone_unusable to alloc_offset + (length - zone_capacity), which already
+includes the [0, alloc_offset) region containing live log tree blocks.
+When do_zone_finish() adds tail_unusable = zone_capacity - alloc_offset,
+block_group->zone_unusable becomes equal to block_group->length.
+
+Later in open_ctree(), btrfs_replay_log() pins the log extent buffers via
+btrfs_pin_extent_for_log_replay() and commits the transaction, which
+unpins them through unpin_extent_range() ->
+__btrfs_add_free_space_zoned():
+
+fs/btrfs/free-space-cache.c:__btrfs_add_free_space_zoned() {
+	...
+	if (!block_group->ro) {
+		block_group->zone_unusable += to_unusable;
+		WARN_ON(block_group->zone_unusable > block_group->length);
+	}
+	...
+}
+
+That double-counts the log extents into block_group->zone_unusable and
+space_info->bytes_zone_unusable, triggering the WARN_ON() and underflowing
+btrfs_block_group_available_space().
+
+[ ... ]
+
+> @@ -3165,14 +3225,38 @@ void btrfs_check_active_zone_reservation(struct btrfs_fs_info *fs_info)
+>  	}
+>  	mutex_unlock(&fs_devices->device_list_mutex);
+>  
+> -	/* Release reservation for currently active block groups. */
+> +	/*
+> +	 * Account all active non-data block groups before selecting one for each role.
+> +	 * Finishing the extra block groups releases their reservations again.
+> +	 */
+>  	spin_lock(&fs_info->zone_active_bgs_lock);
+>  	list_for_each_entry(block_group, &fs_info->zone_active_bgs, active_bg_list) {
+>  		struct btrfs_chunk_map *map = block_group->physical_map;
+> +		struct btrfs_block_group **active_bg;
+> +		u64 *active_avail;
+> +		u64 avail;
+>  
+> -		if (!(block_group->flags &
+> -		      (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)))
+> +		if (block_group->flags & BTRFS_BLOCK_GROUP_METADATA) {
+> +			active_bg = &active_meta_bg;
+> +			active_avail = &active_meta_avail;
+> +		} else if (block_group->flags & BTRFS_BLOCK_GROUP_SYSTEM) {
+> +			active_bg = &active_system_bg;
+> +			active_avail = &active_system_avail;
+> +		} else {
+>  			continue;
+> +		}
+> +
+> +		spin_lock(&block_group->lock);
+> +		avail = block_group->zone_capacity - block_group->alloc_offset;
+> +		spin_unlock(&block_group->lock);
+> +
+> +		if (!*active_bg || avail > *active_avail) {
+> +			if (*active_bg)
+> +				btrfs_put_block_group(*active_bg);
+> +			*active_bg = block_group;
+> +			*active_avail = avail;
+> +			btrfs_get_block_group(*active_bg);
+> +		}
+
+[Severity: High]
+Can this select an unused former tree-log block group (used == 0) or a
+read-only block group (ro > 0) as active_meta_bg or active_system_bg and
+finish the live writable block group instead?
+
+A dedicated tree-log block group from the previous mount has used == 0 on
+disk and typically has a smaller alloc_offset (larger avail) than the
+normal metadata block group (used > 0).  Earlier in open_ctree(),
+btrfs_read_block_groups() -> read_one_block_group() already queues any
+writable block group with used == 0 && remap_bytes == 0 onto
+fs_info->unused_bgs (or discard_ctl) and marks non-writable or deprecated
+SINGLE/RAID0 block groups read-only via inc_block_group_ro().
+
+Because the selection here only compares avail without checking
+block_group->used == 0 or block_group->ro, it picks the unused former
+tree-log block group (or a read-only block group) as active_meta_bg and
+finish_extra_active_nondata_bgs() finishes the live used > 0 metadata
+block group.  Meanwhile, the selected used == 0 active_meta_bg remains on
+fs_info->unused_bgs, so btrfs_delete_unused_bgs() can zone-finish and
+delete it while fs_info->active_meta_bg still points to it.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795600611.git.zhudongjiang@fygo.io?part=2
+

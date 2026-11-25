@@ -1,0 +1,96 @@
+From sashiko-bot@kernel.org Wed Nov 25 11:51:17 2026
+Message-ID: <sashiko-outbox-233169@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v8 15/27] btrfs: zoned: wait for a running block group
+ reclaim in RECLAIM_ZONES
+Date: Wed, 25 Nov 2026 10:51:14 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [Medium] btrfs: zoned: unbounded flush_work() stall and extra reclaim
+  in flush_space()
+- [Low] btrfs: zoned: missing Fixes trailer for commit ad0c23c97b4e
+- [Low] btrfs: zoned: unexplained sb_start_write_trylock() change in
+  btrfs_reclaim_block_groups()
+--
+
+commit d385658d6e32e8f6f234e1a60fd47404f588b4a6
+Author: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+> btrfs: zoned: wait for a running block group reclaim in RECLAIM_ZONES
+>
+> If the reclaim worker is relocating right now,
+> btrfs_reclaim_block_groups() bails out, because it can't either grab
+> the reclaim_bgs_lock or blocks on the exclusive operation.
+>
+> Wait for it instead of failing the tickets while it is about to free a
+> zone.
+>
+> Reviewed-by: Boris Burkov <boris@bur.io>
+> Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+[Severity: Low]
+Ad0c23c97b4e ("btrfs: zoned: limit number of zones reclaimed in
+flush_space()") removed flush_work(&fs_info->reclaim_bgs_work) from the
+RECLAIM_ZONES flush state.  Should this include:
+
+  Fixes: ad0c23c97b4e ("btrfs: zoned: limit number of zones reclaimed in flush_space()")
+
+> diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+> index 622b9abbb2d8e..b7b1fabeb081f 100644
+> --- a/fs/btrfs/block-group.c
+> +++ b/fs/btrfs/block-group.c
+> @@ -2102,10 +2102,13 @@ void btrfs_reclaim_block_groups(struct btrfs_fs_info *fs_info, unsigned int limi
+>  	if (!btrfs_should_reclaim(fs_info))
+>  		return;
+>  
+> -	guard(super_write)(fs_info->sb);
+> +	if (!sb_start_write_trylock(fs_info->sb))
+> +		return;
+>  
+> -	if (!btrfs_exclop_start(fs_info, BTRFS_EXCLOP_BALANCE))
+> +	if (!btrfs_exclop_start(fs_info, BTRFS_EXCLOP_BALANCE)) {
+> +		sb_end_write(fs_info->sb);
+>  		return;
+> +	}
+
+[Severity: Low]
+This isn't a bug, but the commit message does not explain why
+guard(super_write)(fs_info->sb) in btrfs_reclaim_block_groups() is replaced
+with sb_start_write_trylock(fs_info->sb).  Could the changelog mention the
+reason for switching to a trylock on SB_FREEZE_WRITE?
+
+[ ... ]
+
+> diff --git a/fs/btrfs/space-info.c b/fs/btrfs/space-info.c
+> index d5a84fa97462c..bb08294cbf9af 100644
+> --- a/fs/btrfs/space-info.c
+> +++ b/fs/btrfs/space-info.c
+> @@ -913,6 +913,7 @@ static void flush_space(struct btrfs_space_info *space_info, u64 num_bytes,
+>  		break;
+>  	case RECLAIM_ZONES:
+>  		if (btrfs_is_zoned(fs_info)) {
+> +			flush_work(&fs_info->reclaim_bgs_work);
+>  			btrfs_reclaim_sweep(fs_info);
+>  			btrfs_delete_unused_bgs(fs_info);
+>  			btrfs_reclaim_block_groups(fs_info,
+
+[Severity: Medium]
+Can flush_work(&fs_info->reclaim_bgs_work) stall
+btrfs_async_reclaim_data_space until the entire fs_info->reclaim_bgs list is
+drained, and then relocate up to BTRFS_ZONED_SYNC_RECLAIM_BATCH more block
+groups unconditionally?
+
+btrfs_reclaim_bgs_work() calls btrfs_reclaim_block_groups(fs_info, -1) with
+no batch limit, so waiting for the work item to finish reintroduces the
+unbounded __flush_work() stall that ad0c23c97b4e ("btrfs: zoned: limit
+number of zones reclaimed in flush_space()") removed.  When flush_work()
+returns, RECLAIM_ZONES also does not check whether the worker already freed
+zones or satisfied pending tickets before running btrfs_reclaim_sweep()
+(replaced by btrfs_zoned_reclaim_sweep() in commit "btrfs: zoned: provide
+zoned specific reclaim sweep" later in the series) and synchronous
+btrfs_reclaim_block_groups(fs_info, BTRFS_ZONED_SYNC_RECLAIM_BATCH).
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/20261125102956.266389-1-johannes.thumshirn@wdc.com?part=15
+

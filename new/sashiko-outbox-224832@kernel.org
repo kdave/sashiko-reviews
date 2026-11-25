@@ -1,0 +1,114 @@
+From sashiko-bot@kernel.org Fri Nov 20 10:19:29 2026
+Message-ID: <sashiko-outbox-224832@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH 3/3] btrfs: qgroup: show the "qgroup scan cancelled"
+ message correctly
+Date: Fri, 20 Nov 2026 09:19:24 +0000
+
+Thank you for your contribution! Sashiko AI review found 2 potential
+issues to consider:
+- [Medium] btrfs: qgroup: cancelled check masks errors in
+  btrfs_qgroup_rescan_worker()
+- [Medium] btrfs: qgroup: late CANCEL_RESCAN check in
+  btrfs_qgroup_rescan_worker()
+--
+
+commit c26fca101cb7b5df29d0092320b7f4da631875a4
+Author: Qu Wenruo <wqu@suse.com>
+
+btrfs: qgroup: show the "qgroup scan cancelled" message correctly
+
+This commit saves the result of clearing BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN
+into a local boolean and checks it before @stopped and @ret so that the
+cancellation message is printed when a qgroup rescan is cancelled.
+
+> diff --git a/fs/btrfs/qgroup.c b/fs/btrfs/qgroup.c
+> index 915ae134fda40..caa83bc4575ab 100644
+> --- a/fs/btrfs/qgroup.c
+> +++ b/fs/btrfs/qgroup.c
+> @@ -3900,6 +3900,7 @@ static void btrfs_qgroup_rescan_worker(struct btrfs_work *work)
+>  	struct btrfs_path *path;
+>  	struct btrfs_trans_handle *trans = NULL;
+>  	int ret = 0;
+> +	bool cancelled = false;
+>  	bool stopped = false;
+>  	bool did_leaf_rescans = false;
+>  
+> @@ -3982,18 +3983,24 @@ static void btrfs_qgroup_rescan_worker(struct btrfs_work *work)
+>  		}
+>  	}
+>  	fs_info->qgroup_rescan_running = false;
+> -	clear_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN, &fs_info->qgroup_flags);
+> +	cancelled = test_and_clear_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN,
+> +				       &fs_info->qgroup_flags);
+
+[Severity: Medium]
+Can sampling BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN here report "qgroup scan
+cancelled" after btrfs_qgroup_rescan_worker() has already cleared
+BTRFS_QGROUP_STATUS_BIT_INCONSISTENT and written the cleared status to disk?
+
+When qgroup_rescan_leaf() finishes the last leaf (ret == 1), the loop
+condition
+
+	while (!ret && !(stopped = rescan_should_stop(fs_info)))
+
+short-circuits on !ret without calling rescan_should_stop().  If
+qgroup_mark_inconsistent() runs concurrently during that final leaf scan or
+btrfs_commit_transaction(), it sets INCONSISTENT, CANCEL_RESCAN, and
+NO_ACCOUNTING (causing remaining extents to be skipped).  Because ret > 0 and
+CANCEL_RESCAN is not checked before updating the status flags,
+btrfs_qgroup_rescan_worker() clears BTRFS_QGROUP_STATUS_BIT_INCONSISTENT and
+persists it via update_qgroup_status_item(), then sees cancelled == true here
+and logs "qgroup scan cancelled".
+
+Also, if stopped is true and qgroup_mark_inconsistent() sets CANCEL_RESCAN
+while update_qgroup_status_item() is running (after the earlier test_bit() that
+decides whether to clear BTRFS_QGROUP_STATUS_BIT_RESCAN), test_and_clear_bit()
+consumes CANCEL_RESCAN and logs "qgroup scan cancelled" while leaving
+BTRFS_QGROUP_STATUS_BIT_RESCAN set.
+
+>  	complete_all(&fs_info->qgroup_rescan_completion);
+>  	mutex_unlock(&fs_info->qgroup_rescan_lock);
+>  
+>  	if (trans)
+>  		btrfs_end_transaction(trans);
+>  
+> +	if (cancelled) {
+> +		btrfs_info(fs_info, "qgroup scan cancelled");
+> +		return;
+> +	}
+>  	if (stopped) {
+>  		btrfs_info(fs_info, "qgroup scan paused");
+> -	} else if (test_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN, &fs_info->qgroup_flags)) {
+> -		btrfs_info(fs_info, "qgroup scan cancelled");
+> -	} else if (ret >= 0) {
+> +		return;
+> +	}
+> +
+> +	if (ret >= 0) {
+>  		btrfs_info(fs_info, "qgroup scan completed%s",
+>  			ret > 0 ? " (inconsistency flag cleared)" : "");
+>  	} else {
+
+[Severity: Medium]
+Does returning early on cancelled or stopped before checking ret < 0 suppress
+the "qgroup scan failed with %pe" error message?
+
+Most qgroup failures call qgroup_mark_inconsistent(), which unconditionally
+sets BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN:
+
+fs/btrfs/qgroup.c:qgroup_mark_inconsistent() {
+	set_bit(BTRFS_QGROUP_STATUS_BIT_INCONSISTENT, &fs_info->qgroup_flags);
+	set_bit(BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN, &fs_info->qgroup_flags);
+	set_bit(BTRFS_QGROUP_RUNTIME_BIT_NO_ACCOUNTING, &fs_info->qgroup_flags);
+}
+
+If btrfs_commit_transaction() on the final leaf fails in btrfs_run_qgroups(),
+or if btrfs_start_transaction() or update_qgroup_status_item() fails with
+ret < 0 after a rescan is cancelled or paused, cancelled or stopped is true
+ alongside ret < 0, so the worker now logs an informational cancelled/paused
+message instead of btrfs_err().
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795165635.git.wqu@suse.com?part=3
+

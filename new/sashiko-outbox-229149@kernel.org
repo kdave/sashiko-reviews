@@ -1,0 +1,172 @@
+From sashiko-bot@kernel.org Mon Nov 23 12:37:49 2026
+Message-ID: <sashiko-outbox-229149@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH] btrfs: fix race between setting attributes and
+ writeback with compress attempt
+Date: Mon, 23 Nov 2026 11:37:45 +0000
+
+Thank you for your contribution! Sashiko AI review found 3 potential
+issues to consider:
+- [High] btrfs: btrfs_fileattr_set() loses BTRFS_INODE_NOCOMPRESS via
+  btrfs_set_prop()
+- [Medium] btrfs: btrfs_fileattr_set() leaves inode->flags mutated on
+  error paths
+- [Medium] btrfs: unlocked inode->flags updates in
+  prop_compression_apply() and prealloc
+--
+
+commit 145667121b3e4318b51387f21d222c8c7c2aae06
+Author: Filipe Manana <fdmanana@suse.com>
+
+btrfs: fix race between setting attributes and writeback with compress attempt
+
+This commit acquires inode->lock around updates to inode->flags in
+compress_file_range() and btrfs_fileattr_set() to prevent concurrent
+flag updates from overwriting each other.
+
+Link: https://sashiko.dev/#/bug/linux-249f973b-6e85-4fe0-80d5-5b42e7be3e22
+
+> diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+> index 651a780dd7b14..53d86f95614c5 100644
+> --- a/fs/btrfs/ioctl.c
+> +++ b/fs/btrfs/ioctl.c
+
+[ ... ]
+
+> @@ -426,30 +420,40 @@ int btrfs_fileattr_set(const struct mnt_idmap *idmap,
+>  		inode_flags &= ~(BTRFS_INODE_COMPRESS | BTRFS_INODE_NOCOMPRESS);
+>  	}
+>  
+> +	need_set_prop = true;
+> +
+> +update_flags:
+> +	inode->flags = inode_flags;
+> +	spin_unlock(&inode->lock);
+
+[Severity: Medium]
+Can concurrent writeback or fallocate still race with unlocked updates to
+inode->flags?
+
+Dropping inode->lock here publishes BTRFS_INODE_COMPRESS while
+inode->prop_compress is still 0, and btrfs_set_prop() subsequently calls
+prop_compression_apply(), which modifies inode->flags without holding
+inode->lock:
+
+CPU0                              CPU1
+btrfs_fileattr_set()
+  spin_lock(&inode->lock)
+  inode->flags = inode_flags
+  spin_unlock(&inode->lock)
+  btrfs_start_transaction()
+  btrfs_set_prop()
+    btrfs_setxattr()
+    prop_compression_apply()
+      inode->flags &=
+        ~BTRFS_INODE_NOCOMPRESS
+      inode->flags |=
+        BTRFS_INODE_COMPRESS
+                                  compress_file_range()
+                                    /* prop_compress is still 0 */
+                                    spin_lock(&inode->lock)
+                                    inode->flags |=
+                                      BTRFS_INODE_NOCOMPRESS
+                                    spin_unlock(&inode->lock)
+      inode->prop_compress = type
+  btrfs_update_inode()            <-- persists both COMPRESS and NOCOMPRESS
+
+When both flags are set, inode_need_compress() and
+btrfs_inode_flags_to_fsflags() treat the inode as incompressible, leaving
+a newly requested FS_COMPR_FL ineffective.  Similarly,
+btrfs_prealloc_file_range() sets BTRFS_INODE_PREALLOC on inode->flags
+without holding inode->lock while only locking the target range in
+io_tree, so compress_file_range() running on another range of the file can
+race with it and lose BTRFS_INODE_PREALLOC.
+
+>  	/*
+>  	 * 1 for inode item
+>  	 * 1 for property
+>  	 */
+> -	trans = btrfs_start_transaction(root, 2);
+> +	trans = btrfs_start_transaction(root, need_set_prop ? 2 : 1);
+>  	if (IS_ERR(trans))
+>  		return PTR_ERR(trans);
+
+[Severity: Medium]
+If btrfs_start_transaction() or btrfs_set_prop() fails below, does this
+leave inode->flags modified in memory while returning an error?
+
+Because inode->flags is overwritten at update_flags before starting the
+transaction and applying the property, an early failure skips
+btrfs_update_inode_mapping_flags(), btrfs_sync_inode_flags_to_i_flags()
+and btrfs_update_inode() without restoring the previous flags.  For
+example, setting FS_COMPR_FL on an inode with BTRFS_INODE_NODATASUM (and
+not BTRFS_INODE_NODATACOW) writes BTRFS_INODE_COMPRESS into inode->flags
+before prop_compression_validate() fails with -EINVAL, leaving in-memory
+inode->flags inconsistent with vfs_inode.i_flags, mapping flags and the
+on-disk inode item until a later btrfs_update_inode() persists the
+uncommitted flags.
+
+> -	if (comp) {
+> -		ret = btrfs_set_prop(trans, inode, "btrfs.compression",
+> -				     comp, strlen(comp), 0);
+> -		if (ret)
+> -			goto out_end_trans;
+> -		prop_set = true;
+> -	} else {
+> -		ret = btrfs_set_prop(trans, inode, "btrfs.compression", NULL, 0, 0);
+> -		prop_set = (ret == 0);
+> -		/* If ret == -ENODATA ignore and proceed to update inode item. */
+> -		if (ret && ret != -ENODATA)
+> -			goto out_end_trans;
+> +	if (need_set_prop) {
+> +		if (comp) {
+> +			ret = btrfs_set_prop(trans, inode, "btrfs.compression",
+> +					     comp, strlen(comp), 0);
+> +			if (ret)
+> +				goto out_end_trans;
+> +			prop_set = true;
+> +		} else {
+> +			ret = btrfs_set_prop(trans, inode, "btrfs.compression",
+> +					     NULL, 0, 0);
+> +			prop_set = (ret == 0);
+> +			/*
+> +			 * If ret == -ENODATA ignore and proceed to update inode
+> +			 * item.
+> +			 */
+> +			if (ret && ret != -ENODATA)
+> +				goto out_end_trans;
+> +		}
+>  	}
+>  
+> -update_flags:
+> -	inode->flags = inode_flags;
+
+[Severity: High]
+Does moving update_flags ahead of btrfs_set_prop() cause
+BTRFS_INODE_NOCOMPRESS to be lost when setting FS_NOCOMP_FL on an inode
+that has a btrfs.compression property?
+
+When FS_NOCOMP_FL is requested, comp is NULL and update_flags sets
+BTRFS_INODE_NOCOMPRESS in inode->flags.  Then btrfs_set_prop() deletes the
+existing btrfs.compression xattr and calls prop_compression_apply() with
+len == 0:
+
+fs/btrfs/props.c:prop_compression_apply() {
+	...
+	if (len == 0) {
+		inode->flags &= ~BTRFS_INODE_COMPRESS;
+		inode->flags &= ~BTRFS_INODE_NOCOMPRESS;
+		inode->prop_compress = BTRFS_COMPRESS_NONE;
+		return 0;
+	}
+	...
+}
+
+Previously update_flags ran after btrfs_set_prop() and wrote inode_flags
+into inode->flags.  With this regression, prop_compression_apply() clears
+BTRFS_INODE_NOCOMPRESS after update_flags has already run, so
+btrfs_update_inode() persists the inode without BTRFS_INODE_NOCOMPRESS.
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/1a3e3bed8b8bb64943745a02167b68c3f41d38e0.1795376976.git.fdmanana@suse.com?part=1
+

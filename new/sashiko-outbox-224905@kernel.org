@@ -1,0 +1,64 @@
+From sashiko-bot@kernel.org Fri Nov 20 11:04:46 2026
+Message-ID: <sashiko-outbox-224905@kernel.org>
+From: sashiko-bot@kernel.org
+Subject: Re: [PATCH v3 3/3] btrfs: qgroup: show the "qgroup scan cancelled"
+ message correctly
+Date: Fri, 20 Nov 2026 10:04:41 +0000
+
+Thank you for your contribution! Sashiko AI review found 1 potential
+issue to consider:
+- [Low] btrfs: qgroup: missing Fixes trailer for commit e562a8bdf652
+--
+
+commit c79d46885c2d7917e68ec290b449331f80053172
+Author: Qu Wenruo <wqu@suse.com>
+
+> btrfs: qgroup: show the "qgroup scan cancelled" message correctly
+>
+> There are several reasons why we won't output the "qgroup scan cancelled"
+> message:
+>
+> - We always clear BTRFS_QGROUP_RUNTIME_BIT_CANCEL_RESCAN before the
+>   message check
+>   So that test_bit() will never return true.
+>
+> - @stopped has a higher priority
+>   When a rescan is cancelled, it has a high chance to be caught by
+>   rescan_should_stop(), so in that case @stopped is also true.
+>
+>   Then when checking which message to output, @stopped has a higher
+>   priority, thus it shows the rescan as paused instead.
+>
+> Fix the problem by:
+>
+> - Save the previous CANCEL_RESCAN flag into @cancelled, and check that
+>   variable instead
+>   And @cancelled is only updated if the rescan is stopped.
+>
+>   This is to handle finished-then-cancelled rescan a little better.
+>   This won't completely solve the cancel race with rescan though.
+>
+>   But the cancel-race is already there, not caused by this commit, and I
+>   don't think we should bother too much on the mostly cosmetic error
+>
+> - Change the message priority so that cancelled has a higher priority
+>   The new priority list is:
+>   - Error (ret < 0)
+>   - Cancelled
+>   - Stopped
+>   - Finished
+>
+>   And we no longer go the complex "if () else if ()" way, instead each
+>   hit branch will return, so only one branch will hit.
+>
+> Signed-off-by: Qu Wenruo <wqu@suse.com>
+
+[Severity: Low]
+This fixes the unreachable "qgroup scan cancelled" message added with the
+cancel flag.  Should it include:
+
+  Fixes: e562a8bdf652 ("btrfs: introduce BTRFS_QGROUP_RUNTIME_FLAG_CANCEL_RESCAN")
+
+-- 
+Sashiko AI review · https://sashiko.dev/#/patchset/cover.1795168584.git.wqu@suse.com?part=3
+
